@@ -10,6 +10,7 @@ All operations run the original CLI via subprocess so behavior is identical
 to the existing .ps1 / .cmd launchers.
 """
 
+import json
 import os
 import queue
 import shutil
@@ -208,6 +209,30 @@ class OrganizerGUI:
         self.append_output(f"[Startup] Using organizer: {ORGANIZER_SCRIPT}")
         self.append_output(f"[Startup] Using config:    {DEFAULT_CONFIG}")
 
+        # xAI API key status (secure - value never printed, controlled by toggle)
+        if org is not None:
+            try:
+                config_path = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+                cfg = org.load_config(config_path)
+
+                # Respect the per-config auto-load toggle
+                auto_load = getattr(cfg, "auto_load_xai_key", True)
+                if hasattr(self, "auto_load_xai_key_var"):
+                    self.auto_load_xai_key_var.set(auto_load)
+
+                if auto_load:
+                    xai_key = org.get_xai_api_key(cfg, config_path=config_path)
+                    status = "present (loaded from env or r34_xai_key.txt)" if xai_key else "not configured"
+                    self.append_output(f"[Startup] xAI API key: {status}")
+                    if hasattr(self, "xai_key_status"):
+                        self.xai_key_status.set("Configured" if xai_key else "Not set")
+                else:
+                    self.append_output("[Startup] xAI API key: auto-load disabled (per config)")
+                    if hasattr(self, "xai_key_status"):
+                        self.xai_key_status.set("Auto-load disabled")
+            except Exception as e:
+                self.append_output(f"[Startup] xAI API key: error checking configuration ({e})")
+
         self._poll_output_queue()
 
     def _build_ui(self):
@@ -219,6 +244,7 @@ class OrganizerGUI:
         ttk.Label(path_frame, text="Config:").grid(row=0, column=0, sticky="e", padx=5)
         self.config_var = tk.StringVar(value=str(DEFAULT_CONFIG))
         ttk.Entry(path_frame, textvariable=self.config_var, width=70).grid(row=0, column=1, sticky="we", padx=5)
+        self.config_var.trace_add("write", lambda *args: self._refresh_xai_key_status())
         btn_cfg = ttk.Button(path_frame, text="Browse...", command=self._browse_config)
         btn_cfg.grid(row=0, column=2)
         Tooltip(btn_cfg, "Select the r34_config.json file that defines your destination library root, character-to-franchise mappings, audio credits to strip (audiodude, evilaudio, multiaudio, etc.), junk tokens, AI/Grok settings, and the learned franchises file. This file is passed with --config to every preview/apply/undo operation so the organizer uses exactly the rules you maintain.")
@@ -238,6 +264,25 @@ class OrganizerGUI:
         btn_dst = ttk.Button(path_frame, text="Browse...", command=self._browse_dest)
         btn_dst.grid(row=2, column=2)
         Tooltip(btn_dst, "Optional override for the root of your organized library (where clips will be moved as 'Artist - Character - Title [Res].mp4'). Leave blank to use the destination_root value from the selected config file. Handy when testing against a copy of your real collection without editing the JSON.")
+
+        # xAI / Grok API Key management (secure - for AI-assisted result generation)
+        ttk.Label(path_frame, text="xAI API Key:").grid(row=3, column=0, sticky="e", padx=5)
+        self.xai_key_status = tk.StringVar(value="Not set")
+        ttk.Label(path_frame, textvariable=self.xai_key_status, foreground="#666666").grid(row=3, column=1, sticky="w", padx=5)
+        btn_xai = ttk.Button(path_frame, text="Set / Update...", command=self._set_xai_api_key)
+        btn_xai.grid(row=3, column=2)
+        Tooltip(btn_xai, "Securely set your xAI API key (the one used for Grok calls during preview for unknown characters/franchises). Stored only in r34_xai_key.txt next to your config. Never displayed after saving, never in config JSON, gitignored so it cannot leak in releases or shared builds.")
+
+        # Optional toggle to control auto-loading the xAI key on startup (user privacy preference)
+        self.auto_load_xai_key_var = tk.BooleanVar(value=True)
+        chk = ttk.Checkbutton(
+            path_frame,
+            text="Auto-load xAI API key",
+            variable=self.auto_load_xai_key_var,
+            command=self._on_auto_load_xai_key_toggled
+        )
+        chk.grid(row=4, column=1, sticky="w", padx=5, pady=(2, 0))
+        Tooltip(chk, "When enabled, the GUI will automatically attempt to load the xAI API key from the configured env var or r34_xai_key.txt on startup and show its status. Disable this if you prefer to never have the GUI read the key file automatically.")
 
         path_frame.columnconfigure(1, weight=1)
 
@@ -351,6 +396,91 @@ class OrganizerGUI:
         path = filedialog.askdirectory(title="Select destination root (optional override)")
         if path:
             self.dest_var.set(path)
+
+    def _set_xai_api_key(self):
+        """Securely set or update the xAI API key used for Grok calls during preview.
+
+        The key is written ONLY to r34_xai_key.txt next to the config.
+        It is never stored in the JSON config, never shown in the UI after saving,
+        and the file is gitignored so it cannot leak into releases.
+        This is the auth token the tool uses to call X AI for help with result generation.
+        """
+        if org is None:
+            messagebox.showerror("Error", "Organizer module not available.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Set xAI / Grok API Key")
+        dialog.geometry("480x170")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Paste your xAI API key (starts with xai- or sk-):").pack(padx=10, pady=(10, 5), anchor="w")
+
+        key_var = tk.StringVar()
+        entry = ttk.Entry(dialog, textvariable=key_var, width=55, show="*")
+        entry.pack(padx=10, pady=5)
+        entry.focus_set()
+
+        def save_key():
+            key = key_var.get().strip()
+            if not key:
+                messagebox.showwarning("Empty", "No key entered.")
+                return
+
+            try:
+                cfg_path = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+                key_file = cfg_path.with_name("r34_xai_key.txt")
+                key_file.write_text(key + "\n", encoding="utf-8")
+                self.xai_key_status.set("Configured")
+                messagebox.showinfo("Saved", "xAI API key saved securely to r34_xai_key.txt\n\nThis file is gitignored and will not be included in any releases or shared builds.")
+                dialog.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save key: {e}")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Save Securely", command=save_key).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
+
+        # When user sets a key, it's reasonable to turn auto-load back on
+        self.auto_load_xai_key_var.set(True)
+        self._refresh_xai_key_status()
+
+    def _on_auto_load_xai_key_toggled(self):
+        """Called when the user toggles the Auto-load xAI API key checkbox."""
+        enabled = self.auto_load_xai_key_var.get()
+        self._refresh_xai_key_status()
+
+        # Persist preference to the current config JSON (best effort)
+        try:
+            config_path = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+            if config_path.exists():
+                try:
+                    data = json.loads(config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+                data["auto_load_xai_key"] = enabled
+                config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass  # Non-fatal
+
+    def _refresh_xai_key_status(self):
+        """Re-check and update the xAI key status label based on current toggle + config."""
+        if org is None or not hasattr(self, "xai_key_status"):
+            return
+        try:
+            config_path = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+            cfg = org.load_config(config_path)
+
+            if not self.auto_load_xai_key_var.get():
+                self.xai_key_status.set("Auto-load disabled")
+                return
+
+            key = org.get_xai_api_key(cfg, config_path=config_path)
+            self.xai_key_status.set("Configured" if key else "Not set")
+        except Exception:
+            self.xai_key_status.set("Error checking")
 
     def _get_base_command(self) -> list[str]:
         """Return the python + script prefix used by the existing launchers.

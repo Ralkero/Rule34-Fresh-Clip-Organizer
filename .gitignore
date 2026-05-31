@@ -1,4 +1,4 @@
-# Sensitive files
+# Sensitive files (never commit keys)
 r34_xai_key.txt
 *.key
 .env

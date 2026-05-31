@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 CSV_COLUMNS = [
     "approved",
@@ -151,6 +151,7 @@ class Config:
     use_ai_for_unknown_characters: bool
     ai_model: str
     ai_api_key_env_var: str
+    auto_load_xai_key: bool
     # New production hardening options
     original_character_subfoldering: bool
     learned_franchises_file: str
@@ -282,6 +283,7 @@ def load_config(path: Path) -> Config:
         use_ai_for_unknown_characters=bool(raw.get("use_ai_for_unknown_characters", False)),
         ai_model=str(raw.get("ai_model", "grok-3")),
         ai_api_key_env_var=str(raw.get("ai_api_key_env_var", "XAI_API_KEY")),
+        auto_load_xai_key=bool(raw.get("auto_load_xai_key", True)),
         original_character_subfoldering=bool(raw.get("original_character_subfoldering", False)),
         learned_franchises_file=str(raw.get("learned_franchises_file", "learned_character_franchises.json")),
         extract_embedded_titles=bool(raw.get("extract_embedded_titles", False)),
@@ -1291,12 +1293,16 @@ def infer_folder_from_artist(artist: str, artist_conf: float, config: Config, re
     return "", 0.0, ""
 
 
-def get_xai_api_key(config: Config) -> str:
+def get_xai_api_key(config: Config, config_path: Optional[Path] = None) -> str:
     """Resolve the xAI API key from environment or local key file.
 
     Priority:
     1. Environment variable (as configured in ai_api_key_env_var)
-    2. r34_xai_key.txt file next to the main config file (for convenience)
+    2. r34_xai_key.txt next to the provided config_path (if given), otherwise
+       next to the main config file resolved via default_config_path().
+
+    The explicit config_path is important for the GUI when the user selects
+    a custom r34_config.json in a different directory.
     """
     import os
     from pathlib import Path
@@ -1307,9 +1313,11 @@ def get_xai_api_key(config: Config) -> str:
     if key:
         return key
 
-    # 2. Local key file next to the config (convenience for this user)
+    # 2. Local key file next to the actual config being used
     try:
-        config_path = default_config_path()
+        if config_path is None:
+            config_path = default_config_path()
+
         key_file = config_path.with_name("r34_xai_key.txt")
         if key_file.exists():
             content = key_file.read_text(encoding="utf-8").strip()
@@ -1835,6 +1843,7 @@ def replace_config(config: Config, **updates: object) -> Config:
         "use_ai_for_unknown_characters": getattr(config, "use_ai_for_unknown_characters", False),
         "ai_model": getattr(config, "ai_model", "grok-3"),
         "ai_api_key_env_var": getattr(config, "ai_api_key_env_var", "XAI_API_KEY"),
+        "auto_load_xai_key": getattr(config, "auto_load_xai_key", True),
         "original_character_subfoldering": getattr(config, "original_character_subfoldering", False),
         "learned_franchises_file": getattr(config, "learned_franchises_file", "learned_character_franchises.json"),
         "extract_embedded_titles": getattr(config, "extract_embedded_titles", False),

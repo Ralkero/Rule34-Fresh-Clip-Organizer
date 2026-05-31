@@ -15,6 +15,12 @@ It does not talk to Stash. After files are moved, rescan/import in Stash separat
 - `ffprobe` on PATH
 - A curated destination library folder
 
+**Security note for API keys**:
+Never put keys (xAI/Grok) in `r34_config.json`. Instead use:
+- Environment variable (XAI_API_KEY by default), **or**
+- `r34_xai_key.txt` placed next to your config file.
+The file is listed in `.gitignore` and is never included in source or built releases.
+
 Default destination root:
 
 ```text

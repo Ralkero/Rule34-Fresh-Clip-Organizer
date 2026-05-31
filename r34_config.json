@@ -344,6 +344,7 @@
   "use_ai_for_unknown_characters": true,
   "ai_model": "grok-3",
   "ai_api_key_env_var": "XAI_API_KEY",
+  "auto_load_xai_key": true,
   "original_character_subfoldering": false,
   "learned_franchises_file": "learned_character_franchises.json",
   "extract_embedded_titles": false
