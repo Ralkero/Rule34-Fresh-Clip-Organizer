@@ -19,3 +19,7 @@ analysis/akiryo-*
 # OS
 .DS_Store
 Thumbs.db
+
+# PyInstaller / build artifacts (the portable GUI exe + folder are provided as assets on GitHub Releases, not in the repo)
+build/
+dist/

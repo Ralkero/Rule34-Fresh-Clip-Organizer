@@ -132,6 +132,16 @@ python r34_organizer.py apply --plan "C:\path\to\r34_preview_YYYYMMDD-HHMMSS.csv
 - Approved rows with destination conflicts are moved to `_r34_review/<run-id>` inside the source folder.
 - Apply writes `r34_apply_<run-id>.csv` with one result per row.
 
+## Apply-Driven Learning (Reversible)
+
+Apply on approved rows that result in a successful move ("satisfactory result") now commits the character → target_folder pairs to your `learned_character_franchises.json`. These become first-class signals loaded by future previews (used for detection and folder classification), so the script "learns" from your approvals to handle similar clips better.
+
+- Only non-"Original Character" mappings are persisted this way.
+- The Undo command (and GUI **Undo Last Apply** button) automatically reverses both the file operations *and* the exact learning deltas recorded for that apply run.
+- Old apply logs (pre-feature) remain fully compatible with undo (no learning revert is attempted).
+
+This gives you the requested behavior: Apply teaches the system; Undo can roll it back if you change your mind.
+
 ## Development Checks
 
 Run tests:
@@ -145,3 +155,51 @@ Run syntax check:
 ```powershell
 python -m py_compile r34_organizer.py
 ```
+
+## GUI (Windows)
+
+A simple Tkinter GUI wrapper is provided in `r34_gui.py`.
+
+### Running the GUI
+
+```powershell
+python r34_gui.py
+```
+
+The GUI lets you:
+- Choose source folder and (optionally) override destination root
+- Run Preview (live output)
+- Automatically offers to open the generated CSV + MD after preview
+- Select a reviewed CSV
+- Run Apply (live output + opens the apply log)
+
+All operations invoke the exact same `r34_organizer.py` CLI commands used by the existing PowerShell/.cmd launchers.
+
+### Building a Portable GUI (PyInstaller)
+
+From the project directory:
+
+```powershell
+build_gui.bat
+```
+
+Or manually:
+
+```powershell
+pyinstaller --noconfirm --clean --onedir --windowed `
+  --name "Rule34Organizer" `
+  --add-data "r34_organizer.py;." `
+  --add-data "r34_config.json;." `
+  r34_gui.py
+```
+
+The portable folder will be at `dist\Rule34Organizer\`.
+
+**Note:** ffprobe is **not** bundled. The GUI will warn at startup if `ffprobe` is not on PATH.
+
+Every button has a detailed hover tooltip (pause the mouse cursor over any button for ~0.6 seconds). The tooltips explain exactly what the button does, the two-phase safety model, learning effects on Apply, and how Undo reverses both files and learned data.
+
+### Requirements for the GUI
+
+- Same as the CLI (Python 3.10+, ffprobe on PATH)
+- The GUI itself has no extra runtime dependencies beyond the standard library (Tkinter is included with Python on Windows).

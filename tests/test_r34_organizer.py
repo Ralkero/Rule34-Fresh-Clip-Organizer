@@ -785,6 +785,132 @@ class GrokAndProductionHardeningTests(unittest.TestCase):
         # In real it would parse; here the mock is simplistic but structure tested in other places
         self.assertIsInstance(title, str)
 
+    def test_write_and_revert_learned_franchises_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            cfg = make_config(dest)
+            learned_path = Path(tmp) / "learned_character_franchises.json"
+            cfg = org.replace_config(cfg, learned_franchises_file=str(learned_path))
+
+            # Write initial
+            org.write_learned_franchises({"sinia": "King of Fighters", "testchar": "Some Game"}, cfg)
+            loaded = org.load_learned_franchises(cfg)
+            self.assertEqual(loaded.get("sinia"), "King of Fighters")
+
+            # Revert one
+            ok = org.revert_learned_franchise("sinia", "King of Fighters", "", cfg)
+            self.assertTrue(ok)
+            loaded2 = org.load_learned_franchises(cfg)
+            self.assertNotIn("sinia", loaded2)
+            self.assertEqual(loaded2.get("testchar"), "Some Game")
+
+            # Idempotent / stale no-op
+            ok2 = org.revert_learned_franchise("sinia", "King of Fighters", "", cfg)
+            self.assertFalse(ok2)
+
+    def test_apply_commits_learning_and_undo_reverts_it(self):
+        """End-to-end: approved row with character+target_folder on apply -> persisted learned,
+        successful file move, apply log has snapshot cols; undo restores file + removes the learned entry.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            dest = base / "dest"
+            source.mkdir()
+            dest.mkdir()
+            cfg_path = base / "cfg.json"
+            learned_path = base / "learned_character_franchises.json"
+
+            # Minimal config for the test run
+            cfg = make_config(dest)
+            cfg = org.replace_config(
+                cfg,
+                learned_franchises_file=str(learned_path),
+                allow_create_destination_folders=True,
+            )
+            cfg_path.write_text(json.dumps({
+                "destination_root": str(dest),
+                "learned_franchises_file": str(learned_path),
+            }))
+
+            # Dummy source file (apply only cares about existence + .mp4)
+            video = source / "Mai 210422 multiaudio.mp4"
+            video.write_bytes(b"fake")
+
+            # Build a minimal approved preview CSV that would produce a learnable mapping
+            plan_csv = base / "r34_preview_test-applylearn.csv"
+            row = {c: "" for c in org.CSV_COLUMNS}
+            row.update({
+                "approved": "yes",
+                "source_path": str(video),
+                "original_name": video.name,
+                "artist": "Mai",
+                "character": "Sinia",
+                "target_folder": "King of Fighters",
+                "target_filename": "King of Fighters - Sinia [1080P].mp4",
+                "target_path": str(dest / "King of Fighters" / "King of Fighters - Sinia [1080P].mp4"),
+                "status": "ready",
+                "reason": "test",
+                "resolution": "1080P",
+            })
+            with plan_csv.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=org.CSV_COLUMNS)
+                w.writeheader()
+                w.writerow({k: row.get(k, "") for k in org.CSV_COLUMNS})
+
+            # Run apply via the command entry (exercises snapshot, commit, logging)
+            class _Args:
+                pass
+            args = _Args()
+            args.config = cfg_path
+            args.plan = str(plan_csv)
+            args.source_root = str(source)
+            args.quarantine_unapproved = False
+
+            rc = org.command_apply(args)
+            self.assertEqual(rc, 0)
+
+            # File moved
+            target = dest / "King of Fighters" / "King of Fighters - Sinia [1080P].mp4"
+            self.assertTrue(target.exists())
+            self.assertFalse(video.exists())
+
+            # Learned committed
+            self.assertTrue(learned_path.exists())
+            learned = json.loads(learned_path.read_text())
+            self.assertEqual(learned.get("sinia"), "King of Fighters")
+
+            # Apply log has the new columns and values for the row
+            apply_log = base / f"r34_apply_{org.plan_run_id(plan_csv)}.csv"  # may not match exactly, find it
+            apply_logs = list(base.glob("r34_apply_*.csv"))
+            self.assertTrue(apply_logs, "apply log should have been written")
+            apply_log = apply_logs[0]
+            with apply_log.open(newline="", encoding="utf-8") as fh:
+                rdr = list(csv.DictReader(fh))
+            self.assertEqual(len(rdr), 1)
+            logrow = rdr[0]
+            self.assertEqual(logrow.get("apply_result"), "moved")
+            self.assertEqual(logrow.get("learned_character"), "Sinia")
+            self.assertEqual(logrow.get("learned_franchise"), "King of Fighters")
+            self.assertEqual(logrow.get("pre_learned_franchise"), "")  # was absent before
+
+            # Now undo using the apply log
+            undo_args = _Args()
+            undo_args.config = cfg_path
+            undo_args.log = str(apply_log)
+            undo_args.source_root = str(source)
+
+            rc2 = org.command_undo(undo_args)
+            self.assertEqual(rc2, 0)
+
+            # File restored
+            self.assertTrue(video.exists())
+            self.assertFalse(target.exists())
+
+            # Learning reverted (key removed since pre was empty)
+            learned_after = json.loads(learned_path.read_text()) if learned_path.exists() else {}
+            self.assertNotIn("sinia", learned_after)
+
 
 if __name__ == "__main__":
     unittest.main()

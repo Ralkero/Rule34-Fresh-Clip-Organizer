@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 CSV_COLUMNS = [
     "approved",
@@ -322,6 +322,81 @@ def write_pending_learned_franchises(new_mappings: Dict[str, str], config: Confi
     existing.update({k: v for k, v in new_mappings.items() if k not in existing})
     p.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
+
+
+def _is_learnable_franchise(char: str, folder: str) -> bool:
+    """Only persist non-OC character->franchise mappings as learned signals.
+
+    Apply of approved rows with these is treated as explicit human confirmation
+    that the classification is satisfactory for future operations.
+    """
+    if not char or not folder:
+        return False
+    if folder.strip().lower() == "original character":
+        return False
+    return True
+
+
+def write_learned_franchises(mappings: Dict[str, str], config: Config) -> Path:
+    """Persist approved (character_norm -> franchise folder) mappings from successful applies.
+
+    These are loaded by build_reference_data and used in classification/detection for
+    future previews, improving accuracy without re-running Grok or heuristics.
+    Keys are normalized; values preserve the folder name casing from the apply row.
+    """
+    if not mappings:
+        return Path()
+    p = Path(config.learned_franchises_file)
+    if not p.parent.exists() or not p.parent.is_dir():
+        p = default_config_path().with_name(p.name)
+    existing: Dict[str, str] = {}
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            existing = {normalize(k): v for k, v in raw.items()}
+        except Exception:
+            existing = {}
+    changed = False
+    for k, v in mappings.items():
+        nk = normalize(k)
+        if existing.get(nk) != v:
+            existing[nk] = v
+            changed = True
+    if changed or not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        to_write = {k: v for k, v in existing.items()}
+        p.write_text(json.dumps(to_write, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def revert_learned_franchise(char_norm: str, applied_franchise: str, pre_franchise: str, config: Config) -> bool:
+    """Safely undo a single learned mapping written by a prior apply.
+
+    Only reverts if the on-disk value still exactly matches what apply committed
+    (defensive against manual edits to the learned json between apply and undo).
+    If pre_franchise is falsy, the key is removed.
+    Returns True if the file was modified.
+    """
+    if not char_norm:
+        return False
+    p = Path(config.learned_franchises_file)
+    if not p.exists():
+        p = default_config_path().with_name(p.name)
+    if not p.exists():
+        return False
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    current = data.get(char_norm, "")
+    if current != applied_franchise:
+        return False
+    if pre_franchise:
+        data[char_norm] = pre_franchise
+    else:
+        data.pop(char_norm, None)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return True
 
 
 def run_id() -> str:
@@ -1908,7 +1983,15 @@ def apply_row(
 
 def write_apply_log(plan: Path, rows: Sequence[Dict[str, str]], run: str) -> Path:
     log_path = plan.with_name(f"r34_apply_{run}.csv")
-    fieldnames = CSV_COLUMNS + ["apply_result", "apply_message"]
+    # Include learning snapshot columns for reversible apply-driven learning.
+    # Old apply logs without them remain readable for undo (read_csv sets defaults to "").
+    fieldnames = CSV_COLUMNS + [
+        "apply_result",
+        "apply_message",
+        "learned_character",
+        "learned_franchise",
+        "pre_learned_franchise",
+    ]
     with log_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -1935,6 +2018,22 @@ def command_apply(args: argparse.Namespace) -> int:
     rows = read_csv(plan)
     source_root = Path(args.source_root).resolve() if args.source_root else infer_source_root(rows)
     run = plan_run_id(plan)
+
+    # Snapshot pre-apply learned state for any learnable (char, target_folder) in approved rows.
+    # This enables exact reversal on undo even if the same char appears in multiple rows.
+    current_learned = load_learned_franchises(config)
+    pre_snapshots: Dict[str, str] = {}
+    to_commit: Dict[str, str] = {}
+    for row in rows:
+        if approved_value(row.get("approved", "")):
+            char = (row.get("character") or "").strip()
+            folder = (row.get("target_folder") or "").strip()
+            if _is_learnable_franchise(char, folder):
+                n = normalize(char)
+                if n not in pre_snapshots:
+                    pre_snapshots[n] = current_learned.get(n, "")
+                to_commit[n] = folder  # last approved value in the plan wins for the batch
+
     applied: List[Dict[str, str]] = []
     total = len(rows)
     if total == 0:
@@ -1948,11 +2047,38 @@ def command_apply(args: argparse.Namespace) -> int:
             args.quarantine_unapproved,
             config.content_review_folder_name,
         )
+        # Attach reversible learning metadata to EVERY row (populated for those that qualified).
+        # Only rows with apply_result=="moved" will actually cause a write to the learned file.
+        char = (row.get("character") or "").strip()
+        folder = (row.get("target_folder") or "").strip()
+        n = normalize(char) if char else ""
+        if _is_learnable_franchise(char, folder) and n in pre_snapshots:
+            result["learned_character"] = char
+            result["learned_franchise"] = folder
+            result["pre_learned_franchise"] = pre_snapshots[n]
+        else:
+            result["learned_character"] = ""
+            result["learned_franchise"] = ""
+            result["pre_learned_franchise"] = ""
         applied.append(result)
         percent = round((index / total) * 100) if total else 100
         outcome = result.get("apply_result", "unknown")
         label = apply_progress_label(result)
         print(f"Apply progress: {index}/{total} ({percent}%) - {outcome}: {label}", flush=True)
+
+    # Commit learning ONLY for rows that actually moved (satisfactory human-approved result executed).
+    # This tells the script "these classifications were good; use them to judge future ops."
+    final_commits: Dict[str, str] = {}
+    for res in applied:
+        if res.get("apply_result") == "moved":
+            lc = res.get("learned_character", "").strip()
+            lf = res.get("learned_franchise", "").strip()
+            if _is_learnable_franchise(lc, lf):
+                final_commits[normalize(lc)] = lf
+    learned_log_path = Path()
+    if final_commits:
+        learned_log_path = write_learned_franchises(final_commits, config)
+        print(f"Learned {len(final_commits)} character->franchise mapping(s) from satisfactory apply: {learned_log_path}")
 
     log_path = write_apply_log(plan, applied, run)
     counts: Dict[str, int] = {}
@@ -1963,6 +2089,137 @@ def command_apply(args: argparse.Namespace) -> int:
     for key, count in sorted(counts.items()):
         print(f"  {key}: {count}")
     print(f"Apply log: {log_path}")
+    if learned_log_path:
+        print(f"  (learning committed to {learned_log_path.name})")
+    return 0
+
+
+def undo_row(
+    row: Dict[str, str],
+    source_root: Path,
+    run: str,
+    review_folder_name: str,
+    config: Optional[Config] = None,
+) -> Dict[str, str]:
+    """Attempt to reverse one applied row (file move + any learning committed by that apply)."""
+    result = dict(row)
+    result["undo_result"] = ""
+    result["undo_message"] = ""
+    result["learning_reverted"] = ""
+
+    original_source = Path(row.get("source_path", ""))
+    apply_result = row.get("apply_result", "")
+    apply_message = row.get("apply_message", "")
+
+    if apply_result != "moved":
+        result["undo_result"] = "skipped_non_move"
+        result["undo_message"] = f"apply_result was {apply_result}"
+        return result
+
+    # The file is currently at the target location recorded in apply_message
+    current_location = Path(apply_message) if apply_message else Path(row.get("target_path", ""))
+
+    if not current_location.exists():
+        result["undo_result"] = "missing_at_target"
+        result["undo_message"] = str(current_location)
+        return result
+
+    # Destination for undo = original source location (with original name)
+    original_name = row.get("original_name", current_location.name)
+    restore_path = original_source if str(original_source).endswith(original_name) else (original_source.parent / original_name)
+
+    if restore_path.exists():
+        # Conflict at original location — quarantine the file we're trying to restore
+        quarantine_dest = quarantine_path(current_location, source_root, review_folder_name, f"undo_{run}")
+        shutil.move(str(current_location), str(quarantine_dest))
+        result["undo_result"] = "quarantined_conflict_on_undo"
+        result["undo_message"] = str(quarantine_dest)
+        # Still attempt learning revert: the apply had committed it as part of the original move
+        _maybe_revert_learning(row, config, result)
+        return result
+
+    # Safe to restore
+    restore_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(current_location), str(restore_path))
+    result["undo_result"] = "restored"
+    result["undo_message"] = str(restore_path)
+    _maybe_revert_learning(row, config, result)
+    return result
+
+
+def _maybe_revert_learning(row: Dict[str, str], config: Optional[Config], result: Dict[str, str]) -> None:
+    """Internal: if row has learning snapshot and config, attempt safe revert."""
+    if not config:
+        return
+    learned_char = (row.get("learned_character") or "").strip()
+    learned_f = (row.get("learned_franchise") or "").strip()
+    pre_f = row.get("pre_learned_franchise", "") or ""
+    n = normalize(learned_char) if learned_char else ""
+    if n and learned_f and _is_learnable_franchise(learned_char, learned_f):
+        if revert_learned_franchise(n, learned_f, pre_f, config):
+            result["learning_reverted"] = f"{learned_char}->{pre_f or '(removed)'}"
+        else:
+            result["learning_reverted"] = "no_change_or_stale"
+
+
+def write_undo_log(plan: Path, rows: Sequence[Dict[str, str]], run: str) -> Path:
+    log_path = plan.with_name(f"r34_undo_{run}.csv")
+    fieldnames = list(rows[0].keys()) if rows else CSV_COLUMNS + ["undo_result", "undo_message"]
+    with log_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return log_path
+
+
+def command_undo(args: argparse.Namespace) -> int:
+    log_path = Path(args.log).resolve()
+    if not log_path.exists():
+        raise SystemExit(f"Undo log not found: {log_path}")
+
+    applied_rows = read_csv(log_path)
+
+    # Try to infer source root from the log
+    source_root = Path(args.source_root).resolve() if args.source_root else infer_source_root(applied_rows)
+
+    run = plan_run_id(log_path)  # reuse the function, it will extract the timestamp
+
+    # Load config so we can revert any learning that was committed during the original apply
+    config = load_config(args.config)
+
+    undone: List[Dict[str, str]] = []
+    total = len(applied_rows)
+
+    print(f"Undoing apply from log: {log_path}")
+    print(f"Source root for restore: {source_root}")
+
+    for index, row in enumerate(applied_rows, start=1):
+        result = undo_row(row, source_root, run, "_r34_review", config)
+        undone.append(result)
+
+        percent = round((index / total) * 100) if total else 100
+        outcome = result.get("undo_result", "unknown")
+        msg = result.get("undo_message", "")
+        learn = result.get("learning_reverted", "")
+        extra = f" | learning: {learn}" if learn else ""
+        print(f"Undo progress: {index}/{total} ({percent}%) - {outcome}: {msg}{extra}", flush=True)
+
+    undo_log = write_undo_log(log_path, undone, run)
+
+    counts: Dict[str, int] = {}
+    for row in undone:
+        key = row.get("undo_result", "unknown")
+        counts[key] = counts.get(key, 0) + 1
+
+    learning_reverts = sum(1 for r in undone if r.get("learning_reverted") and "no_change" not in r.get("learning_reverted", ""))
+    print("\nUndo complete:")
+    for key, count in sorted(counts.items()):
+        print(f"  {key}: {count}")
+    if learning_reverts:
+        print(f"  learning_reverted: {learning_reverts}")
+    print(f"Undo log: {undo_log}")
+
     return 0
 
 
@@ -1988,6 +2245,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Move unapproved rows to review folder instead of leaving them in place.",
     )
     apply.set_defaults(func=command_apply)
+
+    undo = sub.add_parser("undo", help="Undo a previous apply using its log file.")
+    undo.add_argument("--log", required=True, help="Path to an r34_apply_*.csv log file from a previous apply.")
+    undo.add_argument("--source-root", help="Override source root for restoring files (usually not needed).")
+    undo.set_defaults(func=command_undo)
+
     return parser
 
 
