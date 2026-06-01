@@ -1,3 +1,5 @@
+<img width="902" height="652" alt="Screenshot 2026-05-31 190501" src="https://github.com/user-attachments/assets/07c3c4e7-f254-4317-a06b-5f0c9cf03518" />
+
 # Rule34 Fresh Clip Organizer
 
 Local Python CLI for previewing and applying safe renames/moves for freshly downloaded Rule34 clips.
@@ -5,6 +7,7 @@ Local Python CLI for previewing and applying safe renames/moves for freshly down
 The tool is intentionally two-step:
 
 1. `preview` recursively scans one source folder and writes an editable CSV plan plus a Markdown summary.
+
 2. `apply` reads the reviewed CSV and moves only approved rows.
 
 It does not talk to Stash. After files are moved, rescan/import in Stash separately.
