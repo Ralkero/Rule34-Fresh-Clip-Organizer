@@ -1,4 +1,5 @@
-<img width="902" height="652" alt="Screenshot 2026-05-31 190501" src="https://github.com/user-attachments/assets/07c3c4e7-f254-4317-a06b-5f0c9cf03518" />
+<img width="902" height="652" alt="Screenshot 2026-05-31 190501" src="https://github.com/user-attachments/assets/65ec04c4-0470-45bc-a3e7-4e7d2e5e7f8b" />
+
 
 # Rule34 Fresh Clip Organizer
 
