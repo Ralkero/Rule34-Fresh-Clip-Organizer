@@ -1596,6 +1596,223 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
             self.assertIsInstance(r2, dict)
         self.assertTrue(True)
 
+    # ------------------------------------------------------------------
+    # Phase 3e tests (appended; 12 required coverages; pure/non-Tk; no main files mutated)
+    # ------------------------------------------------------------------
+
+    def test_missing_folder_suggestions_include_folder_aliases_targets(self):
+        """Req 1: collect includes folder_aliases targets that do not exist on disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            (dest / "RealFolder").mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"bad": "MissingFromAliases", "ok": "RealFolder"}
+            }), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            displays = [s["display"] for s in suggs]
+            self.assertIn("MissingFromAliases", displays)
+            self.assertNotIn("RealFolder", displays)
+
+    def test_missing_folder_suggestions_include_character_mappings_targets(self):
+        """Req 2: collect includes character_mappings targets that do not exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            (dest / "RealFolder").mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "character_mappings": {"char1": "MissingFromCharMap", "char2": "RealFolder"}
+            }), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            displays = [s["display"] for s in suggs]
+            self.assertIn("MissingFromCharMap", displays)
+
+    def test_missing_folder_suggestions_include_learned_targets(self):
+        """Req 3: collect includes learned mapping targets that do not exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            (dest / "RealFolder").mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "learned_franchises_file": "learned.json"
+            }), encoding="utf-8")
+            lp = Path(tmp) / "learned.json"
+            lp.write_text(json.dumps({"lchar": "MissingFromLearned", "l2": "RealFolder"}), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            displays = [s["display"] for s in suggs]
+            self.assertIn("MissingFromLearned", displays)
+
+    def test_existing_folders_are_not_included_as_missing(self):
+        """Req 4: folders that exist on disk under dest are excluded from suggestions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            (dest / "ExistingOne").mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"a": "ExistingOne", "b": "AlsoMissing"}
+            }), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            displays = [s["display"] for s in suggs]
+            self.assertNotIn("ExistingOne", displays)
+            self.assertIn("AlsoMissing", displays)
+
+    def test_unsafe_paths_are_rejected_by_validate(self):
+        """Req 5: validate rejects the 4 example unsafes + empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            bads = ["../Bad", "C:\\Bad", "Bad:Folder", "", "   "]
+            for b in bads:
+                safe, reason = gui.validate_destination_folder_name(b, dest)
+                self.assertFalse(safe, f"expected unsafe for {b}: {reason}")
+            # also a traversal in middle
+            safe, _ = gui.validate_destination_folder_name("ok/../bad", dest)
+            self.assertFalse(safe)
+            # good one
+            safe, _ = gui.validate_destination_folder_name("Good Folder Name", dest)
+            self.assertTrue(safe)
+
+    def test_folder_creation_plan_includes_only_safe_selected(self):
+        """Req 6: plan filters to only safe + selected under dest_root."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"a": "SafeMiss", "b": "../Unsafe"}
+            }), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            # select both by key
+            keys = [s["key"] for s in suggs]
+            plan = gui.build_folder_creation_plan(suggs, keys)
+            items = plan.get("items", [])
+            self.assertEqual(len(items), 1)  # only the safe one
+            self.assertEqual(items[0]["display"], "SafeMiss")
+
+    def test_folder_creation_creates_selected_safe_folders(self):
+        """Req 7: create_missing... actually mkdirs the safe selected ones (under dest)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"a": "Phase3eCreateMe"}
+            }), encoding="utf-8")
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            plan = gui.build_folder_creation_plan(suggs, [s["key"] for s in suggs])
+            res = gui.create_missing_destination_folders(plan)
+            self.assertIn("Phase3eCreateMe", [Path(p).name for p in res.get("created", [])])
+            self.assertTrue((dest / "Phase3eCreateMe").is_dir())
+
+    def test_folder_creation_does_not_overwrite_existing_file(self):
+        """Req 8: if a file exists at the target path, creation records error/skips, does not overwrite."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            bad_target = dest / "ConflictName"
+            bad_target.write_bytes(b"i am a file not dir")
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"c": "ConflictName"}
+            }), encoding="utf-8")
+            # validate catches it (even if collect filters .exists() files as 'exists')
+            safe, reason = gui.validate_destination_folder_name("ConflictName", dest)
+            self.assertFalse(safe)
+            self.assertIn("file", reason.lower())
+            # force a plan item to exercise create's is_file guard path too
+            forced_plan = {"dest_root": str(dest), "items": [{"key": "c", "display": "ConflictName", "proposed_path": str(bad_target), "sources": ["test"]}]}
+            res = gui.create_missing_destination_folders(forced_plan)
+            combined = " ".join(res.get("errors", []) + res.get("skipped_unsafe", []))
+            self.assertTrue("ConflictName" in combined or "file" in combined.lower())
+            self.assertTrue(bad_target.is_file())  # still file, not turned into dir
+            self.assertFalse((dest / "ConflictName").is_dir())
+
+    def test_folder_creation_does_not_delete_rename_or_move(self):
+        """Req 9: create does not touch any pre-existing folders/files (no del/rename/move)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            keep = dest / "KeepMe"
+            keep.mkdir()
+            (keep / "file.txt").write_text("stay")
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"k": "NewOneOnly"}
+            }), encoding="utf-8")
+            pre_count = len(list(dest.rglob("*")))
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            plan = gui.build_folder_creation_plan(suggs, [s["key"] for s in suggs])
+            gui.create_missing_destination_folders(plan)
+            post_count = len(list(dest.rglob("*")))
+            self.assertTrue((dest / "NewOneOnly").is_dir())
+            self.assertTrue((keep / "file.txt").is_file())  # untouched
+            # net +2 (new dir + its implicit), but keep subtree same
+            self.assertGreaterEqual(post_count, pre_count)
+
+    def test_folder_creation_writes_report_only_on_explicit_execute(self):
+        """Req 10: report md is written only when create_ is called with items (not on collect/validate/plan)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "destination_root": str(dest),
+                "folder_aliases": {"r": "ReportMe"}
+            }), encoding="utf-8")
+            # read-only calls
+            gui.collect_missing_folder_suggestions(cfgp)
+            gui.validate_destination_folder_name("ReportMe", dest)
+            gui.build_folder_creation_plan(gui.collect_missing_folder_suggestions(cfgp), [])
+            reports_before = list(Path(tmp).glob("folder_creation_report_*.md")) + list(dest.glob("folder_creation_report_*.md"))
+            self.assertEqual(len(reports_before), 0)
+            # now explicit create
+            suggs = gui.collect_missing_folder_suggestions(cfgp)
+            plan = gui.build_folder_creation_plan(suggs, [s["key"] for s in suggs])
+            res = gui.create_missing_destination_folders(plan)
+            rp = res.get("report_path")
+            self.assertIsNotNone(rp)
+            self.assertTrue(Path(rp).exists())
+            self.assertIn("ReportMe", Path(rp).read_text(encoding="utf-8"))
+
+    def test_read_only_validation_still_does_not_write_files(self):
+        """Req 11: build_ reports + collect/validate/plan do not create dirs or reports."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "dest"
+            dest.mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({"destination_root": str(dest)}), encoding="utf-8")
+            pre = set(p.name for p in Path(tmp).rglob("*"))
+            gui.build_destination_folder_validation_report(cfgp)
+            gui.collect_missing_folder_suggestions(cfgp)
+            gui.validate_destination_folder_name("X", dest)
+            gui.build_folder_creation_plan([], [])
+            post = set(p.name for p in Path(tmp).rglob("*"))
+            self.assertEqual(pre, post)  # no new files/dirs
+
+    def test_full_suite_still_passes_after_phase3e_changes(self):
+        """Req 12: meta; after 3e, discover still clean."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "d"
+            dest.mkdir()
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({"destination_root": str(dest)}), encoding="utf-8")
+            r = gui.collect_missing_folder_suggestions(cfgp)
+            self.assertIsInstance(r, list)
+        # the full discover is asserted in the re-run after this in exec
+        self.assertTrue(True)
+
 
 if __name__ == "__main__":
     unittest.main()

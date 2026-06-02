@@ -426,6 +426,242 @@ def build_resolution_validation_report(config_path: Path) -> dict:
         return {"error": str(e), "resolutions": {}, "issues": [f"error: {e}"], "sample_count": 0}
 
 
+# Phase 3e pure (non-Tk) helpers for safe missing destination folder suggestions + explicit creation.
+# - collect/validate/plan are read-only (no mkdir, no writes, no side effects).
+# - create_missing... performs the mkdirs (parents=True, exist_ok=False) + writes report ONLY on explicit execute.
+# - Limited to folders referenced by folder_aliases / character_mappings / learned.
+# - Hard safety: no .. / absolute / bad Windows chars / outside dest_root / existing file at target.
+# - Never deletes, renames, moves, or overwrites files. Continues on per-folder errors.
+# Reuses build_destination_folder_validation_report (3d) + resolve_learned (3c) + org.build_reference_data.
+
+def _norm_key(x: object) -> str:
+    """Internal norm fallback (matches apply_known / 3d pures)."""
+    if x is None:
+        return ""
+    if org is not None and hasattr(org, "normalize"):
+        try:
+            return org.normalize(x)
+        except Exception:
+            pass
+    value = str(x).lower()
+    value = value.replace("&", " and ")
+    value = value.replace("'", "")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def collect_missing_folder_suggestions(config_path: Path) -> list:
+    """Pure: return list of missing folder suggestion dicts from the 3 sources only.
+
+    Each: {"key": norm, "display": original_target, "sources": list[str], "exists": bool,
+           "proposed": str(full under dest), "is_safe": bool}.
+    Existing (on disk) are excluded. Uses 3d validation report internally (no duplication).
+    """
+    if config_path is None:
+        return []
+    try:
+        rep = build_destination_folder_validation_report(config_path)
+        if "error" in rep:
+            return []
+        dest_str = rep.get("dest_root", ".")
+        dest = Path(dest_str) if dest_str else Path(".")
+        suggestions = []
+        for it in rep.get("folders", []):
+            if it.get("exists"):
+                continue  # only missing
+            display = it.get("display") or it.get("norm") or ""
+            key = it.get("norm") or _norm_key(display)
+            srcs = it.get("sources", [])
+            proposed = str((dest / display).resolve()) if display else ""
+            # quick safe check (full validate below in plan)
+            is_safe = False
+            try:
+                is_safe = validate_destination_folder_name(display, dest)[0]
+            except Exception:
+                is_safe = False
+            suggestions.append({
+                "key": key,
+                "display": display,
+                "sources": list(srcs),
+                "exists": False,
+                "proposed": proposed,
+                "is_safe": is_safe,
+            })
+        return suggestions
+    except Exception:
+        return []
+
+
+def validate_destination_folder_name(folder_name: str, destination_root: Path) -> tuple:
+    r"""Pure: (is_safe: bool, reason: str). Rejects per 3e hard rules.
+
+    Rejects:
+    - empty / whitespace-only
+    - absolute paths (or starting with / \ or drive:)
+    - paths containing ".."
+    - invalid Windows chars: < > : " | ? *
+    - paths that resolve outside destination_root (or to dest_root itself)
+    - paths that point to an existing file (not dir)
+    """
+    if not folder_name or not str(folder_name).strip():
+        return (False, "empty name")
+    name = str(folder_name).strip()
+    # absolute or drive or leading sep
+    if Path(name).is_absolute() or name[0] in ("/", "\\") or (len(name) > 1 and name[1] == ":"):
+        return (False, "absolute path not allowed")
+    # traversal
+    parts = Path(name).parts
+    if ".." in parts:
+        return (False, "path traversal '..' not allowed")
+    # bad Windows chars
+    bad = set('<>:"|?*')
+    if any(ch in name for ch in bad):
+        return (False, "contains reserved Windows path characters < > : \" | ? *")
+    try:
+        dest = Path(destination_root).resolve()
+        candidate = (dest / name).resolve()
+        # must be strictly under dest (parent chain starts with dest)
+        if not str(candidate).startswith(str(dest) + os.sep) and candidate != dest:
+            # also allow direct child even on same string
+            if candidate.parent != dest:
+                return (False, "resolves outside destination_root")
+        # do not mkdir over a file
+        if candidate.exists() and candidate.is_file():
+            return (False, "target exists as a file (not a directory)")
+        # also reject if it would be the dest_root itself
+        if candidate == dest:
+            return (False, "cannot create the destination_root itself")
+        return (True, "ok")
+    except Exception as e:
+        return (False, f"validation error: {e}")
+
+
+def build_folder_creation_plan(suggestions: list, selected_keys: list) -> dict:
+    """Pure: build in-memory plan from selected safe suggestions. No creation.
+
+    Returns {"dest_root": str, "items": [ {"key", "display", "proposed_path": str, "sources": list}, ... ]}
+    Only includes items where is_safe and key in selected_keys.
+    """
+    if not suggestions or not selected_keys:
+        return {"dest_root": "", "items": []}
+    # derive dest from first proposed if present
+    dest_root = ""
+    if suggestions and suggestions[0].get("proposed"):
+        try:
+            dest_root = str(Path(suggestions[0]["proposed"]).parent.resolve())
+        except Exception:
+            dest_root = ""
+    items = []
+    sel = set(str(k) for k in selected_keys if str(k).strip())
+    for s in suggestions:
+        if not s.get("is_safe"):
+            continue
+        k = s.get("key") or ""
+        if k not in sel:
+            continue
+        items.append({
+            "key": k,
+            "display": s.get("display", ""),
+            "proposed_path": s.get("proposed", ""),
+            "sources": list(s.get("sources", [])),
+        })
+    return {"dest_root": dest_root, "items": items}
+
+
+def create_missing_destination_folders(plan: dict) -> dict:
+    """Execute creation for a plan built by build_folder_creation_plan.
+
+    Uses Path.mkdir(parents=True, exist_ok=False) for each.
+    Records created / already_exists / skipped_unsafe / errors.
+    Writes a folder_creation_report_*.md ONLY if any creation was attempted (explicit user action).
+    Never deletes, renames, moves, or overwrites files. Continues on errors.
+    Returns {"created": [paths], "already_exists": [...], "skipped_unsafe": [...], "errors": [str], "report_path": str|None }
+    """
+    created = []
+    already = []
+    skipped = []
+    errors = []
+    report_path = None
+    if not plan or not plan.get("items"):
+        return {"created": created, "already_exists": already, "skipped_unsafe": skipped, "errors": errors, "report_path": None}
+
+    dest_root = plan.get("dest_root", "")
+    items = plan.get("items", [])
+    attempted = False
+
+    for item in items:
+        pstr = item.get("proposed_path") or ""
+        if not pstr:
+            skipped.append("(no path)")
+            continue
+        p = Path(pstr)
+        # re-validate at exec time (belt+suspenders)
+        parent = p.parent if p.parent else Path(".")
+        safe, reason = validate_destination_folder_name(item.get("display") or p.name, parent)
+        if not safe:
+            skipped.append(f"{pstr} ({reason})")
+            continue
+        try:
+            p.mkdir(parents=True, exist_ok=False)
+            created.append(str(p))
+            attempted = True
+        except FileExistsError:
+            already.append(str(p))
+            attempted = True  # still record as we considered it
+        except Exception as e:
+            errors.append(f"{pstr}: {e}")
+            attempted = True
+
+    # write report ONLY when explicit creation was executed (per query: "Do not require this report for read-only validation. Only write it when the user explicitly runs folder creation.")
+    if attempted:
+        try:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # place report sibling to a config if we can infer, else next to dest or cwd
+            base = Path(dest_root) if dest_root else Path.cwd()
+            report_path = str(base / f"folder_creation_report_{ts}.md")
+            lines = []
+            lines.append(f"# Folder Creation Report {ts}")
+            lines.append("")
+            lines.append(f"Timestamp: {datetime.now().isoformat()}")
+            lines.append(f"Destination root: {dest_root or '(unknown)'}")
+            lines.append(f"Folders requested: {len(items)}")
+            lines.append("")
+            if created:
+                lines.append("## Created")
+                for c in created:
+                    lines.append(f"- {c}")
+                lines.append("")
+            if already:
+                lines.append("## Already existed (no-op)")
+                for a in already:
+                    lines.append(f"- {a}")
+                lines.append("")
+            if skipped:
+                lines.append("## Skipped (unsafe or invalid)")
+                for s in skipped:
+                    lines.append(f"- {s}")
+                lines.append("")
+            if errors:
+                lines.append("## Errors")
+                for e in errors:
+                    lines.append(f"- {e}")
+                lines.append("")
+            if not created and not already and not skipped and not errors:
+                lines.append("(no-op)")
+            Path(report_path).write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            # do not fail the create because report failed; just note in errors
+            errors.append(f"report write failed: {e}")
+
+    return {
+        "created": created,
+        "already_exists": already,
+        "skipped_unsafe": skipped,
+        "errors": errors,
+        "report_path": report_path,
+    }
+
+
 # ------------------------------------------------------------------
 # Configuration / Helpers
 # ------------------------------------------------------------------
@@ -1754,12 +1990,12 @@ class OrganizerGUI:
             self.status_var.set(f"Refresh failed: {e}")
 
     def _open_known_values_manager(self):
-        # Phase 3d limited (per directive): 5 editable sections (3a/3b/3c: artist+folder aliases, char mappings, canon aliases, learned) + dest folders/resolutions as view-only validation tabs (3d only; no writes/FS/edit/save for them).
-        # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly. No config writes or FS ops from 3d views.
-        # Refresh validation buttons rebuild in-memory reports only (reuse org.build_reference_data + 3c resolve_learned + new pure val helpers).
-        # Do not implement full Phase 3 / dest management / res editing. Keep all prior editable behavior 100% unchanged.
+        # Phase 3e (per directive): 5 editable sections (3a/3b/3c) + learned + dest folders as view-only validation tab EXTENDED with safe missing-folder creation suggestions (collect from 3 sources, Generate plan in-mem only, explicit Create Selected with askyesno listing *exact* paths, mkdir only for safe under dest_root, report md only on execute).
+        # Resolutions + characters remain view-only. No auto-create on open/refresh/validate/Generate. No del/rename/move. validate rejects unsafe. r34_config + learned json untouched by 3e create tools.
+        # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
+        # Do not implement full Phase 3 / folder rename/delete/move / res editing. Keep all prior editable behavior 100% unchanged.
         win = tk.Toplevel(self.root)
-        win.title("Known Values Manager (Phase 3d limited: 5 editable + dest_folders/res view-only validation + %f backups for editable; stop per directive)")
+        win.title("Known Values Manager (Phase 3e: 5 editable + learned + dest_folders view+safe explicit missing-folder creation suggestions (Generate then Create with confirm dialog) + res view-only; %f backups for editable; stop per directive)")
         win.geometry("820x600")
 
         # Load structured dicts (not the flattened correction_known lists) for schema edit of the 4 allowed (3a/3b) + learned (3c only).
@@ -1798,9 +2034,9 @@ class OrganizerGUI:
             ("character_mappings", "Character Mappings (character_mappings - editable Phase 3b)"),
             ("canonical_character_aliases", "Canonical Character Aliases (canonical_character_aliases - editable Phase 3b)"),
             ("learned", "Learned Mappings (learned_character_franchises.json - editable Phase 3c)"),
-            ("dest_folders", "Destination Folders (view-only Phase 3d)"),
-            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3d)"),
-            ("resolutions", "Resolutions (naming style - view-only Phase 3d)")
+            ("dest_folders", "Destination Folders (view-only + safe missing-folder creation suggestions Phase 3e)"),
+            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3d/3e)"),
+            ("resolutions", "Resolutions (naming style - view-only Phase 3d/3e)")
         ]:
             f = ttk.Frame(nb)
             nb.add(f, text=label)
@@ -1885,18 +2121,20 @@ class OrganizerGUI:
                             pass
                     ttk.Button(frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
 
-                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res views in 3d) untouched."
+                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res views in 3d/3e - 3e adds controlled suggestions+create) untouched."
                 ttk.Label(f, text=note).pack(pady=2)
             else:
-                # Phase 3d view-only tabs: dest_folders (new dedicated with validation) + characters + resolutions (improved).
-                # No Add/Edit/Remove/Save for these; labels "View-only in Phase 3d"; refresh only rebuilds in-memory report (no FS/config writes).
+                # Phase 3d/3e view-only tabs: dest_folders (extended with 3e suggestions + explicit create) + characters + resolutions (improved).
+                # No Add/Edit/Remove/Save for these; labels "View-only in Phase 3d/3e"; refresh only rebuilds in-memory (no FS/config writes). 3e create is button-driven after dialog only.
                 if cat == "dest_folders":
-                    # Two lists: folders + validation issues. Refresh button rebuilds via pure helper.
-                    lst_folders = tk.Listbox(f, height=8)
+                    # Phase 3e: keep the 3d validation lists + refresh (view-only, no auto create).
+                    # Add controlled "Missing Folder Suggestions" section (from 3 sources only), Generate Plan (in-mem, no mkdir),
+                    # and explicit "Create Selected Missing Folders" (shows askyesno with *exact* paths, then mkdir only for safe).
+                    # Report written *only* on explicit create execution. No del/rename/move. Unsafe rejected.
+                    lst_folders = tk.Listbox(f, height=6)
                     lst_folders.pack(fill="both", expand=True, padx=4, pady=2)
-                    lst_issues = tk.Listbox(f, height=6)
+                    lst_issues = tk.Listbox(f, height=4)
                     lst_issues.pack(fill="both", expand=True, padx=4, pady=2)
-                    # store for refresh (closure over these)
                     self._dest_folders_lst = lst_folders
                     self._dest_issues_lst = lst_issues
 
@@ -1918,10 +2156,112 @@ class OrganizerGUI:
 
                     def _refresh_dest():
                         _repop_dest()
-                        self.status_var.set("Destination folder validation refreshed (view-only, no writes).")
+                        self.status_var.set("Destination folder validation refreshed (view-only, no writes, no auto-create).")
 
                     ttk.Button(f, text="Refresh Folder Validation", command=_refresh_dest).pack(pady=2)
-                    ttk.Label(f, text="View-only in Phase 3d. Shows scanned dest folders (from ref) + cross-ref validation for missing targets from aliases/char_maps/learned. No FS ops, no config writes. 'Refresh' rebuilds in-memory only.").pack(pady=2)
+
+                    # Phase 3e Missing Folder Suggestions (read-only collect until explicit Create)
+                    ttk.Label(f, text="Missing Folder Suggestions (from folder_aliases + character_mappings + learned targets only; existing excluded):").pack(pady=(6,2))
+                    lst_sugg = tk.Listbox(f, height=5, selectmode="multiple")
+                    lst_sugg.pack(fill="both", expand=True, padx=4, pady=2)
+                    self._missing_sugg_lst = lst_sugg
+                    self._current_suggestions = []
+
+                    lst_plan = tk.Listbox(f, height=3)
+                    lst_plan.pack(fill="both", expand=True, padx=4, pady=2)
+                    self._plan_lst = lst_plan
+
+                    lst_create_res = tk.Listbox(f, height=3)
+                    lst_create_res.pack(fill="both", expand=True, padx=4, pady=2)
+                    self._create_results_lst = lst_create_res
+
+                    def _repop_suggestions():
+                        lst_sugg.delete(0, "end")
+                        self._current_suggestions = []
+                        try:
+                            suggs = collect_missing_folder_suggestions(cpath)
+                            self._current_suggestions = [s for s in suggs if not s.get("exists")]
+                            for s in self._current_suggestions:
+                                safe_flag = "SAFE" if s.get("is_safe") else "UNSAFE"
+                                lst_sugg.insert("end", f"{s.get('display','?')} | key:{s.get('key','?')} | srcs:{', '.join(s.get('sources',[]))[:60]} | {safe_flag} | -> {s.get('proposed','?')}")
+                        except Exception as ex:
+                            lst_sugg.insert("end", f"ERR collecting suggestions: {ex}")
+
+                    _repop_suggestions()
+
+                    def _generate_plan():
+                        lst_plan.delete(0, "end")
+                        try:
+                            sel_idxs = lst_sugg.curselection()
+                            sel_keys = []
+                            for i in sel_idxs:
+                                line = lst_sugg.get(i)
+                                # parse key from the display line we built
+                                if " | key:" in line:
+                                    kpart = line.split(" | key:", 1)[1].split(" | ", 1)[0].strip()
+                                    sel_keys.append(kpart)
+                            plan = build_folder_creation_plan(self._current_suggestions or collect_missing_folder_suggestions(cpath), sel_keys)
+                            self._current_plan = plan
+                            for it in plan.get("items", []):
+                                lst_plan.insert("end", f"PLAN: {it.get('display')} -> {it.get('proposed_path')}")
+                            if not plan.get("items"):
+                                lst_plan.insert("end", "(no safe selected items for plan; select SAFE entries above and Generate again)")
+                            self.status_var.set("Folder creation plan generated (in-memory only; no folders created yet). Review before Create.")
+                        except Exception as ex:
+                            lst_plan.insert("end", f"ERR: {ex}")
+
+                    ttk.Button(f, text="Generate Folder Creation Plan (no folders created)", command=_generate_plan).pack(pady=2)
+
+                    def _create_selected():
+                        lst_create_res.delete(0, "end")
+                        try:
+                            plan = getattr(self, "_current_plan", None)
+                            if not plan or not plan.get("items"):
+                                # fallback: build from current selection
+                                sel_idxs = lst_sugg.curselection()
+                                sel_keys = []
+                                for i in sel_idxs:
+                                    line = lst_sugg.get(i)
+                                    if " | key:" in line:
+                                        kpart = line.split(" | key:", 1)[1].split(" | ", 1)[0].strip()
+                                        sel_keys.append(kpart)
+                                plan = build_folder_creation_plan(self._current_suggestions or collect_missing_folder_suggestions(cpath), sel_keys)
+                            if not plan or not plan.get("items"):
+                                lst_create_res.insert("end", "No safe items selected. Nothing to create.")
+                                self.status_var.set("No-op: nothing selected for creation.")
+                                return
+                            # Show exact paths in confirmation dialog (required)
+                            paths_str = "\n".join(it.get("proposed_path", "?") for it in plan.get("items", []))
+                            confirm = messagebox.askyesno(
+                                "Confirm Create Missing Folders (Phase 3e)",
+                                f"Create these exact folders?\n\n{paths_str}\n\nAll are under destination_root, safe (no .. / abs / bad chars / file conflicts), and referenced by config/learned.\n\nThis is the ONLY action that creates folders. Cancel to review."
+                            )
+                            if not confirm:
+                                lst_create_res.insert("end", "Creation cancelled by user.")
+                                return
+                            results = create_missing_destination_folders(plan)
+                            for c in results.get("created", []):
+                                lst_create_res.insert("end", f"CREATED: {c}")
+                            for a in results.get("already_exists", []):
+                                lst_create_res.insert("end", f"ALREADY: {a}")
+                            for s in results.get("skipped_unsafe", []):
+                                lst_create_res.insert("end", f"SKIPPED: {s}")
+                            for e in results.get("errors", []):
+                                lst_create_res.insert("end", f"ERROR: {e}")
+                            rp = results.get("report_path")
+                            if rp:
+                                lst_create_res.insert("end", f"REPORT: {rp}")
+                            if not results.get("created") and not results.get("already_exists"):
+                                lst_create_res.insert("end", "(no-op or all skipped)")
+                            self.status_var.set("Folder creation complete (see results + report if written). Re-run Refresh to update missing list.")
+                            # refresh the main validation lists so newly created no longer show as missing
+                            _repop_dest()
+                        except Exception as ex:
+                            lst_create_res.insert("end", f"ERR during create: {ex}")
+
+                    ttk.Button(f, text="Create Selected Missing Folders (explicit confirm dialog; safe only)", command=_create_selected).pack(pady=2)
+
+                    ttk.Label(f, text="Phase 3e: Missing-folder creation is EXPLICIT ONLY. Generate builds plan in-memory (never creates). Create shows dialog with exact full paths and requires Yes. validate_destination_folder_name rejects empty/absolute/.. / <>:\"|?* / outside dest / existing-file. Report written ONLY on explicit execute. No auto-create on open/refresh/validate/Generate. No delete/rename/move. r34_config.json and learned_character_franchises.json are never modified by these tools.").pack(pady=2)
                 elif cat == "resolutions":
                     # Improved view: richer than simple known list; use pure report for labels + issues.
                     lst_res = tk.Listbox(f, height=8)
@@ -1964,15 +2304,16 @@ class OrganizerGUI:
                     for v in src:
                         lst.insert("end", v)
                     if cat == "characters":
-                        note = "View-only in Phase 3d. Do not edit character_mappings/canonical_character_aliases here (use dedicated tabs). Learned editable in its tab. Destination folders now have dedicated view+validation tab (Phase 3d)."
+                        note = "View-only in Phase 3d/3e. Do not edit character_mappings/canonical_character_aliases here (use dedicated tabs). Learned editable in its tab. Destination folders now have dedicated view+validation + safe explicit creation suggestions tab (Phase 3e)."
                     else:
-                        note = "View-only in Phase 3d. Do not edit destination folders or resolutions (dedicated view+validation tabs above; no editing in 3d). Use JSON directly with backups for advanced changes."
+                        note = "View-only in Phase 3d/3e. Do not edit destination folders or resolutions (dedicated view+validation tabs above; no editing in 3d/3e; 3e adds controlled creation suggestions only under dest_root after explicit confirm). Use JSON directly with backups for advanced changes."
                     ttk.Label(f, text=note).pack(pady=2)
 
         def _save_known_values_changes():
-            # Phase 3d save (extended from 3c/3b/3a): use pures for 4 config sections + learned (separate file).
+            # Phase 3e save (extended from 3d/3c/3b/3a): use pures for 4 config sections + learned (separate file).
             # Backups (collision-proof %f) created inside helpers before any write.
-            # Only the 5 allowed (3a/3b/3c) keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res views (3d) never edited or written.
+            # Only the 5 allowed (3a/3b/3c) keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res views (3d/3e) never edited or written by Save.
+            # 3e folder creation (if any) is side-effect under dest_root only via the explicit dest tab button after dialog; never mutates the json files.
             try:
                 cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
                 if not cpath or not cpath.exists():
@@ -2025,7 +2366,7 @@ class OrganizerGUI:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable sections + learned in Phase 3c; dest/res 3d views untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; dest/res 3d/3e views untouched - 3e creation is separate explicit button in dest tab)", command=_save_known_values_changes).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
     def _sort_tree(self, col):
