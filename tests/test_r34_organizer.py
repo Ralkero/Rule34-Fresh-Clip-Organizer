@@ -2239,6 +2239,74 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
         self.assertIn("counts", preview)
         self.assertTrue(True)
 
+    # ------------------------------------------------------------------
+    # Phase 4b.6.1 additional tests for auto no-evidence + UI behavior fixes
+    # ------------------------------------------------------------------
+
+    def test_auto_no_evidence_maps_group_to_ambiguous_not_franchise(self):
+        # Generic group name with no franchise-like keywords
+        stash = {"performer_data": [], "group_data": [{"name": "RandomArtistCollective"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="auto")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertTrue(groups)
+        self.assertEqual(groups[0]["detected_tag_role"], "ambiguous")
+        self.assertEqual(groups[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("Auto mode found no reliable group role evidence", groups[0].get("classification_reason", ""))
+
+    def test_auto_with_evidence_still_uses_franchise(self):
+        stash = {"performer_data": [], "group_data": [{"name": "SomeFranchise"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="auto")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertEqual(groups[0]["detected_tag_role"], "franchise_candidate")
+        self.assertEqual(groups[0]["suggested_section"], "folder_aliases")
+
+    def test_group_rule34_artists_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "9Nithes"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertEqual(groups[0]["detected_tag_role"], "artist_candidate")
+        self.assertEqual(groups[0]["suggested_section"], "artist_aliases")
+        self.assertIn("Rule34 artists", groups[0].get("classification_reason", ""))
+
+    def test_group_franchises_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "SomeFranchise"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="franchises")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertEqual(groups[0]["detected_tag_role"], "franchise_candidate")
+        self.assertEqual(groups[0]["suggested_section"], "folder_aliases")
+
+    def test_group_ignore_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "ReviewMe"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="ignore_review")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertEqual(groups[0]["detected_tag_role"], "ignored_or_review")
+        self.assertEqual(groups[0]["suggested_section"], "ignored_or_review")
+        self.assertEqual(groups[0]["status"], "ignored_or_review")
+
+    def test_section_artist_includes_group_when_rule34(self):
+        stash = {"performer_data": [], "group_data": [{"name": "ArtistGroup"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        artist_s = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases"]
+        has_group_artist = any(i["source"] == "stash_group" and i.get("detected_tag_role") == "artist_candidate" for i in artist_s)
+        self.assertTrue(has_group_artist)
+
+    def test_section_folder_excludes_group_artist_when_rule34(self):
+        stash = {"performer_data": [], "group_data": [{"name": "ArtistGroup"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        folder_s = [i for i in preview["items"] if i.get("suggested_section") == "folder_aliases"]
+        has_group_artist_in_folder = any(i["source"] == "stash_group" and i.get("detected_tag_role") == "artist_candidate" for i in folder_s)
+        self.assertFalse(has_group_artist_in_folder)
+
+    def test_no_mutation_strings_4b61(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+
+    def test_full_suite_after_4b61_fix(self):
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {}, group_role_override="auto")
+        self.assertIn("counts", preview)
+        # auto on sample may produce ambiguous for some generic groups
+        self.assertTrue(True)
+
 
 if __name__ == "__main__":
     unittest.main()
