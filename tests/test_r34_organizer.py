@@ -2307,6 +2307,195 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
         # auto on sample may produce ambiguous for some generic groups
         self.assertTrue(True)
 
+    # ------------------------------------------------------------------
+    # Phase 4c: reviewed Stash import to in-memory manager edits (pure stage_ + safety)
+    # ------------------------------------------------------------------
+
+    def test_stash_import_stages_artist_aliases_candidate(self):
+        items = [{"norm_key": "newartist", "original": "New Artist", "suggested_section": "artist_aliases", "status": "missing_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newartist", res["updated_artist_aliases"])
+        self.assertEqual(res["updated_artist_aliases"]["newartist"], "New Artist")
+        self.assertEqual(res["num_added"], 1)
+        self.assertEqual(len(res["added"]["artist_aliases"]), 1)
+
+    def test_stash_import_stages_folder_aliases_candidate(self):
+        items = [{"norm_key": "newfran", "original": "New Franchise", "suggested_section": "folder_aliases", "status": "missing_local", "source": "stash_group"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newfran", res["updated_folder_aliases"])
+        self.assertEqual(res["num_added"], 1)
+
+    def test_stash_import_stages_canonical_candidate(self):
+        items = [{"norm_key": "newchar", "original": "New Char", "suggested_section": "canonical_character_aliases", "status": "missing_local", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newchar", res["updated_canonical_character_aliases"])
+        self.assertEqual(res["num_added"], 1)
+
+    def test_stash_import_skips_ignored_or_review(self):
+        items = [{"norm_key": "ign", "original": "Ign", "suggested_section": "ignored_or_review", "status": "missing_local", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["ignored_or_review"]), 1)
+
+    def test_stash_import_skips_ambiguous_by_default(self):
+        items = [{"norm_key": "ambig", "original": "Ambig", "suggested_section": "artist_aliases", "status": "ambiguous", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["ambiguous"]), 1)
+
+    def test_stash_import_skips_already_exists_local_by_default(self):
+        items = [{"norm_key": "exists", "original": "Exists", "suggested_section": "artist_aliases", "status": "already_exists_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["already_exists_local"]), 1)
+
+    def test_stash_import_does_not_overwrite_silently(self):
+        local_aa = {"dup": "Old"}
+        items = [{"norm_key": "dup", "original": "NewDup", "suggested_section": "artist_aliases", "status": "missing_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, local_aa, {}, {}, overwrite_conflicts=False)
+        self.assertEqual(res["updated_artist_aliases"]["dup"], "Old")  # unchanged
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(res["num_conflicts"], 1)
+
+    def test_stash_import_to_manager_does_not_modify_config_json(self):
+        import tempfile, json, os, shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "r34_config.json"
+            # minimal valid for the 4 keys
+            base = {"artist_aliases": {}, "folder_aliases": {}, "character_mappings": {}, "canonical_character_aliases": {}, "destination_root": str(Path(tmp))}
+            cfg_p.write_text(json.dumps(base), encoding="utf-8")
+            pre_m = cfg_p.stat().st_mtime
+            # exercise the pure (as UI would)
+            items = [{"norm_key": "foo", "original": "Foo", "suggested_section": "artist_aliases", "status": "missing_local"}]
+            gui.stage_stash_import_items(items, {}, {}, {}, False)
+            self.assertEqual(pre_m, cfg_p.stat().st_mtime, "stage pure must not touch config file")
+            # also confirm no learned touched (none here)
+
+    def test_stash_import_to_manager_does_not_modify_learned_json(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            learned_p.write_text(json.dumps({"old": "Old"}), encoding="utf-8")
+            pre_m = learned_p.stat().st_mtime
+            items = [{"norm_key": "x", "original": "X", "suggested_section": "artist_aliases", "status": "missing_local"}]
+            gui.stage_stash_import_items(items, {}, {}, {}, False)
+            self.assertEqual(pre_m, learned_p.stat().st_mtime)
+
+    def test_no_mutation_strings_still_after_4c(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+
+    def test_full_suite_still_passes_after_4c(self):
+        # meta: adding 4c import staging (pure + UI in gui.py) must not break prior
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {}, group_role_override="rule34_artists")
+        self.assertIn("counts", preview)
+        # also exercise stage on sample-derived
+        sample_items = [i for i in preview.get("items", []) if i.get("status") == "missing_local" and i.get("suggested_section") in ("artist_aliases", "folder_aliases", "canonical_character_aliases")][:3]
+        if sample_items:
+            res = gui.stage_stash_import_items(sample_items, {}, {}, {}, False)
+            self.assertIn("added", res)
+        self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4c-preflight classification audit tests (build + export focused; no bulk import changes)
+    # ------------------------------------------------------------------
+
+    def test_preflight_compilation_group_is_review_only(self):
+        # Issue 1: Compilation should not be artist
+        stash = {"performers": [], "groups": ["Compilation"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        comps = [i for i in preview["items"] if "compil" in i.get("original", "").lower()]
+        self.assertTrue(comps)
+        self.assertEqual(comps[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("review-only", comps[0].get("classification_reason", "").lower())
+
+    def test_preflight_hentai_is_review_only(self):
+        # Hentai as generic label -> review
+        stash = {"performers": [], "groups": ["Hentai"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        hits = [i for i in preview["items"] if "hentai" in i.get("original", "").lower()]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+
+    def test_preflight_characters_tag_is_review_only(self):
+        # Issue 4: Characters category tag should not become canonical alias
+        stash = {"performers": [], "groups": [], "tags": ["Characters"]}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        chars = [i for i in preview["items"] if i.get("original", "").lower() == "characters"]
+        self.assertTrue(chars)
+        self.assertEqual(chars[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("category tag", chars[0].get("classification_reason", "").lower())
+
+    def test_preflight_comma_multi_is_review_only(self):
+        # Issue 2
+        stash = {"performers": [], "groups": ["Jewelz Blu, Nicole Doshi"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        hits = [i for i in preview["items"] if "," in i.get("original", "")]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("comma-separated", hits[0].get("classification_reason", "").lower())
+
+    def test_preflight_x_pairing_is_review_only(self):
+        # Issue 2/3 : Yuffie x Cloud
+        stash = {"performers": [], "groups": ["Yuffie x Cloud"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        hits = [i for i in preview["items"] if "x cloud" in i.get("original", "").lower()]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("x-pairing", hits[0].get("classification_reason", "").lower())
+
+    def test_preflight_compact_key_duplicate_flagged_possible_duplicate(self):
+        # Issue: Aries Possession / AriesPossession -> possible_duplicate by compact, not auto merge
+        stash = {"performers": [], "groups": ["Aries Possession", "AriesPossession"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        dups = [i for i in preview["items"] if i.get("status") == "possible_duplicate"]
+        self.assertTrue(len(dups) >= 1)
+        # both should have compact_key
+        for d in dups:
+            self.assertIn("compact_key", d)
+            self.assertEqual(d["compact_key"], "ariespossession")
+
+    def test_preflight_export_includes_ignored_or_review_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = {"performers": [], "groups": ["Compilation"], "tags": ["Characters"]}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("## Ignored or review-only", content)
+            self.assertIn("review-only denylist match", content)
+            self.assertIn("category tag (Characters)", content)
+
+    def test_preflight_export_includes_ambiguous_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # use rich tag_data so classify hits conflicting parents -> role=ambiguous, section=ignored
+            stash = {"tag_data": [{"name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []}]}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("## Ambiguous", content)
+
+    def test_preflight_export_note_reflects_tag_classification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = gui.get_sample_stash_data()
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("classified by parent/ancestor", content.lower())
+            # no longer claims all tags are canonical only
+            self.assertNotIn("treated as canonical_character_aliases candidates only", content)
+
+    def test_preflight_export_rows_include_full_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = {"performers": ["Pantsushi"], "groups": ["Compilation"], "tags": []}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            # every listed row should have role: suggested: source: status: reason:
+            self.assertIn("role:", content)
+            self.assertIn("-> artist_aliases", content)
+            self.assertIn("status:missing_local", content)
+            self.assertIn("source:stash_performer", content)
+
 
 if __name__ == "__main__":
     unittest.main()

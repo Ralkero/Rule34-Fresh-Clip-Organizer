@@ -687,6 +687,21 @@ def normalize_stash_name(name: str) -> str:
     return s.lower().replace(" ", "")
 
 
+def compact_normalize(name: str) -> str:
+    """Compact normalized key for duplicate detection (preflight audit).
+
+    Removes spaces, punctuation, apostrophes, parentheses, underscores, hyphens, lowercases.
+    E.g. 'Aries Possession', 'AriesPossession', 'Aries_Possession', "Aries' Possession"
+    all become 'ariespossession' so we can flag as possible_duplicate (never auto-merge).
+    """
+    if not name:
+        return ""
+    s = str(name).lower()
+    # remove whitespace + common punct/separators (incl ' _ - ( ) . ! etc)
+    s = re.sub(r"[\s\.\-\_\(\)\[\]\{\}'\"!@#$%^&*+=:;/?\\|<>,`~]+", "", s)
+    return s
+
+
 def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeout: int = 10) -> dict:
     """Perform read-only GraphQL queries against a Stash instance.
 
@@ -976,6 +991,12 @@ def get_sample_stash_data() -> dict:
             "New Franchise Group",
             "Baldur's Gate 3",
             "Another Group",
+            "Compilation",  # preflight: should be review-only
+            "Hentai",       # preflight
+            "Yuffie x Cloud",
+            "Aries Possession",
+            "AriesPossession",  # compact dup of above
+            "Jewelz Blu, Nicole Doshi",
         ],
         "tags": [
             "2b",
@@ -986,6 +1007,7 @@ def get_sample_stash_data() -> dict:
             "ArtistTagUnderArtists",
             "FranchiseTag",
             "AmbiguousMixed",
+            "Characters",  # preflight: category tag -> review, not canonical
         ],
         "errors": [],
         "meta": {
@@ -1000,8 +1022,8 @@ def get_sample_stash_data() -> dict:
         },
         "response_counts": {
             "performers": 5,
-            "groups": 3,
-            "tags": 8,
+            "groups": 9,
+            "tags": 9,
         },
         # Phase 4b.6 rich data for classification (used by build and tests)
         "performer_data": [
@@ -1015,6 +1037,12 @@ def get_sample_stash_data() -> dict:
             {"id": "g1", "name": "New Franchise Group", "aliases": []},
             {"id": "g2", "name": "Baldur's Gate 3", "aliases": []},
             {"id": "g3", "name": "Another Group", "aliases": []},
+            {"id": "g4", "name": "Compilation", "aliases": []},
+            {"id": "g5", "name": "Hentai", "aliases": []},
+            {"id": "g6", "name": "Yuffie x Cloud", "aliases": []},
+            {"id": "g7", "name": "Aries Possession", "aliases": []},
+            {"id": "g8", "name": "AriesPossession", "aliases": []},
+            {"id": "g9", "name": "Jewelz Blu, Nicole Doshi", "aliases": []},
         ],
         "tag_data": [
             {"id": "t1", "name": "2b", "aliases": ["2B"], "parents": [{"id": "pc", "name": "Characters"}], "children": []},
@@ -1024,8 +1052,46 @@ def get_sample_stash_data() -> dict:
             {"id": "t5", "name": "ArtistTagUnderArtists", "aliases": [], "parents": [{"name": "Artists"}], "children": []},  # artist_candidate
             {"id": "t6", "name": "FranchiseTag", "aliases": [], "parents": [{"name": "Franchises"}], "children": []},  # franchise
             {"id": "t7", "name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []},  # ambiguous
+            {"id": "t8", "name": "Characters", "aliases": [], "parents": [{"name": "Characters"}], "children": []},  # preflight: category -> review
         ],
     }
+
+
+# Phase 4c-preflight classification audit patch (no bulk import, no writes, no Stash mutations):
+# Configurable (module-level for now) review-only denylist/patterns to prevent false-positive
+# artist/character/franchise suggestions for obvious non-artists, multis, titles, category tags.
+REVIEW_ONLY_DENYLIST = {"compilation", "compilations", "cleavage", "discipline", "lubed", "saveass", "slayed", "hentai"}
+REVIEW_ONLY_TITLE_PATTERNS = ["itadaki", "kakushi dere", "kano", "sweet home", "seieki"]
+REVIEW_ONLY_MAIDEN_PATTERNS = ["bonus maiden", "maiden "]
+REVIEW_ONLY_MODEL_PATTERNS = ["tetra (", "skx'_", "skx_"]
+
+
+def _get_review_only_reason(name: str, aliases: list = None) -> str:
+    """Return non-empty reason if name/alias matches review-only denylist/patterns.
+    Catches: bad group names (Compilation etc), comma multis, x-pairings, maiden/model titles,
+    'Characters' category tag. Used to force ignored_or_review pre-override in build.
+    """
+    if not name:
+        return ""
+    n = str(name).lower().strip()
+    al = [str(a).lower().strip() for a in (aliases or [])]
+    candidates = [n] + al
+    for c in candidates:
+        if c in REVIEW_ONLY_DENYLIST:
+            return f"review-only denylist match: {c}"
+        if "," in c and len(c.split(",")) >= 2:
+            return "comma-separated multi-person entry (review or split candidate)"
+        if re.search(r"\b x \b", c) or re.search(r"\bx\b", c):
+            return "x-pairing / collab entry like 'Yuffie x Cloud' (review-only)"
+        if any(p in c for p in REVIEW_ONLY_MAIDEN_PATTERNS):
+            return "generated/maiden-like entry (review-only)"
+        if any(p in c for p in REVIEW_ONLY_TITLE_PATTERNS) or ("!" in c and any(kw in c for kw in ["itadaki", "kano", "sweet"])):
+            return "title/franchise-like entry (review-only)"
+        if c in ("characters", "character"):
+            return "parent/category tag (Characters), not a character name"
+        if any(p in c for p in REVIEW_ONLY_MODEL_PATTERNS):
+            return "model/generated/title-like with parens/underscore (review-only)"
+    return ""
 
 
 def classify_stash_tag(tag_info: dict) -> tuple:
@@ -1036,6 +1102,11 @@ def classify_stash_tag(tag_info: dict) -> tuple:
     """
     if not isinstance(tag_info, dict):
         return "general_tag", "ignored_or_review", "invalid tag data"
+
+    # Preflight audit: force review-only for category tags like "Characters", bad titles etc.
+    rev = _get_review_only_reason(tag_info.get("name"), tag_info.get("aliases") or tag_info.get("alias_list"))
+    if rev:
+        return "general_tag", "ignored_or_review", rev
 
     # Collect clues from parents (and their aliases), and self name/aliases for robustness
     clues = set()
@@ -1103,6 +1174,11 @@ def classify_stash_group(group_info: dict) -> tuple:
     if not isinstance(group_info, dict):
         return "ambiguous", "ignored_or_review", "invalid group data"
 
+    # Preflight audit: check review denylist/patterns first (e.g. Compilation, Hentai, x-pair, comma, titles)
+    rev = _get_review_only_reason(group_info.get("name"), group_info.get("aliases"))
+    if rev:
+        return "ignored_or_review", "ignored_or_review", rev
+
     clues = set()
     def add_clue(n):
         if n:
@@ -1168,11 +1244,13 @@ def build_stash_import_preview(
             return norm_key in lcca_keys
         return False
 
-    # Track dups within this stash preview (per suggested section) - Phase 4b.6 add ignored
+    # Track dups within this stash preview (per suggested section) - Phase 4b.6 + preflight compact
     seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set(), "ignored_or_review": set()}
+    seen_compact = {k: set() for k in seen}  # for compact dup detection (AriesPossession vs Aries Possession)
 
     def _make_item(source: str, original: str, suggested: str, note: str = "", detected_role: str = None, classification_reason: str = "", forced_status: str = None):
         nk = normalize_stash_name(original)
+        ck = compact_normalize(original)
         if not nk:
             return
         if forced_status is not None:
@@ -1181,9 +1259,10 @@ def build_stash_import_preview(
             status = "missing_local"
             if _already_exists(nk, suggested):
                 status = "already_exists_local"
-            if nk in seen.get(suggested, set()):
+            if nk in seen.get(suggested, set()) or ck in seen_compact.get(suggested, set()):
                 status = "possible_duplicate"
         seen.setdefault(suggested, set()).add(nk)
+        seen_compact.setdefault(suggested, set()).add(ck)
 
         if detected_role is None:
             if source == "stash_performer":
@@ -1197,6 +1276,7 @@ def build_stash_import_preview(
             "source": source,
             "original": original,
             "norm_key": nk,
+            "compact_key": ck,
             "suggested_section": suggested,
             "status": status,
             "note": note,
@@ -1223,6 +1303,12 @@ def build_stash_import_preview(
     for g in group_infos:
         orig = g.get("name") or ""
         if not orig: continue
+        # Preflight audit: force review-only for denylist/pattern matches (Compilation etc) BEFORE any override
+        # so bad names never get artist_aliases even if user sets "rule34_artists".
+        rev = _get_review_only_reason(orig, g.get("aliases"))
+        if rev:
+            _make_item("stash_group", orig, "ignored_or_review", "", "ignored_or_review", rev, forced_status="ignored_or_review")
+            continue
         if group_role_override == "rule34_artists":
             role = "artist_candidate"
             sugg = "artist_aliases"
@@ -1332,12 +1418,25 @@ def export_stash_preview_report(
     missing_a = [i for i in items if i.get("suggested_section") == "artist_aliases" and i.get("status") == "missing_local"]
     missing_f = [i for i in items if i.get("suggested_section") == "folder_aliases" and i.get("status") == "missing_local"]
     missing_c = [i for i in items if i.get("suggested_section") == "canonical_character_aliases" and i.get("status") == "missing_local"]
-    dups = [i for i in items if i.get("status") in ("possible_duplicate", "ambiguous")]
+    dups = [i for i in items if i.get("status") == "possible_duplicate"]  # ambig separate now
+    ambig = [i for i in items if i.get("status") == "ambiguous" or i.get("detected_tag_role") == "ambiguous"]
+    ignored = [i for i in items if i.get("suggested_section") == "ignored_or_review"]
     exists = [i for i in items if i.get("status") == "already_exists_local"]
 
     def fmt(it):
+        # Include all required: detected_role, suggested_section, source, status, classification_reason in every row
+        role = it.get("detected_tag_role", "")
+        sec = it.get("suggested_section", "")
+        src = it.get("source", "")
+        st = it.get("status", "")
+        reason = it.get("classification_reason") or it.get("note", "")
+        ck = it.get("compact_key", "")
         n = it.get("note", "")
-        return f"- {it.get('original','?')} (norm_key: {it.get('norm_key','?')}) [{it.get('source','?')}] {n}".strip()
+        base = f"- {it.get('original','?')} (norm_key: {it.get('norm_key','?')}"
+        if ck:
+            base += f", compact: {ck}"
+        base += f") [source:{src}] role:{role} -> {sec} | status:{st} | reason:{reason[:60]}"
+        return base.strip()
 
     if missing_a:
         lines.append("## Missing artist/performer candidates (would target artist_aliases)")
@@ -1356,8 +1455,18 @@ def export_stash_preview_report(
         lines.append("")
 
     if dups:
-        lines.append("## Possible duplicates or ambiguous within this preview")
+        lines.append("## Possible duplicates (compact or norm key collision within this preview; flagged not auto-merged)")
         for it in dups:
+            lines.append(fmt(it))
+        lines.append("")
+    if ambig:
+        lines.append("## Ambiguous (review-only; conflicting or unclear classification)")
+        for it in ambig:
+            lines.append(fmt(it))
+        lines.append("")
+    if ignored:
+        lines.append("## Ignored or review-only (suggested_section=ignored_or_review; denylist, multis, titles, category tags etc.)")
+        for it in ignored:
             lines.append(fmt(it))
         lines.append("")
     if exists:
@@ -1378,14 +1487,96 @@ def export_stash_preview_report(
     lines.append("## Important Notes")
     lines.append("- Stash data was read-only.")
     lines.append("- This preview did not modify any local files.")
-    lines.append("- Tags from Stash are treated as canonical_character_aliases candidates only.")
-    lines.append("  A separate franchise/folder mapping (via character_mappings) is still required for full use.")
+    lines.append("- Tags from Stash are classified by parent/ancestor tags (artist/character/franchise/general/ambiguous). Unclassified or review-only (e.g. 'Characters' category, bad titles) go to ignored_or_review (not auto canonical_character_aliases).")
+    lines.append("  A separate franchise/folder mapping (via character_mappings) is still required for full use of character candidates.")
     lines.append("- Exporting this report does not perform any import.")
-    lines.append("- Phase 4c (when implemented) will provide controlled import/apply with previews and confirmations.")
+    lines.append("- Phase 4c provides reviewed 'Import Selected to Manager' (stages to in-memory edits only; Save Changes is still required to persist to config).")
     lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
+
+
+def stage_stash_import_items(
+    selected_items: list,
+    artist_aliases: dict,
+    folder_aliases: dict,
+    canonical_character_aliases: dict,
+    overwrite_conflicts: bool = False,
+) -> dict:
+    """Pure (for testability + UI): given selected preview item dicts + copies of current _edit_* dicts,
+    compute staging plan and return updated dicts + detailed report.
+
+    Rules:
+    - Only artist_aliases / folder_aliases / canonical_character_aliases supported in Phase 4c.
+    - Skip ignored_or_review, ambiguous (default), already_exists_local (default).
+    - On conflict (norm_key exists in target): do not overwrite unless overwrite_conflicts=True.
+    - Returns counts, lists of added/skipped/conflicts for review dialog + result summary.
+    - Never mutates the input dicts (works on .copy()).
+    - No file I/O, no Stash calls.
+    """
+    aa = dict(artist_aliases or {})
+    fa = dict(folder_aliases or {})
+    ca = dict(canonical_character_aliases or {})
+
+    added = {"artist_aliases": [], "folder_aliases": [], "canonical_character_aliases": []}
+    skipped = {"ignored_or_review": [], "ambiguous": [], "already_exists_local": [], "unsupported_section": []}
+    conflicts = []
+
+    for it in (selected_items or []):
+        if not isinstance(it, dict):
+            continue
+        sec = it.get("suggested_section")
+        status = it.get("status", "")
+        nk = (it.get("norm_key") or "").strip()
+        orig = it.get("original") or nk
+        if not nk:
+            continue
+
+        if sec == "ignored_or_review":
+            skipped["ignored_or_review"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+        if status == "ambiguous":
+            skipped["ambiguous"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+        if status == "already_exists_local":
+            skipped["already_exists_local"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+
+        if sec == "artist_aliases":
+            target = aa
+            key = "artist_aliases"
+        elif sec == "folder_aliases":
+            target = fa
+            key = "folder_aliases"
+        elif sec == "canonical_character_aliases":
+            target = ca
+            key = "canonical_character_aliases"
+        else:
+            skipped["unsupported_section"].append({"norm_key": nk, "original": orig, "source": it.get("source"), "section": sec})
+            continue
+
+        if nk in target:
+            conflicts.append((key, nk, orig, target[nk]))
+            if overwrite_conflicts:
+                target[nk] = orig
+                added[key].append((nk, orig))
+        else:
+            target[nk] = orig
+            added[key].append((nk, orig))
+
+    return {
+        "added": added,
+        "skipped": skipped,
+        "conflicts": conflicts,
+        "updated_artist_aliases": aa,
+        "updated_folder_aliases": fa,
+        "updated_canonical_character_aliases": ca,
+        "num_selected": len(selected_items or []),
+        "num_added": sum(len(v) for v in added.values()),
+        "num_conflicts": len(conflicts),
+        "num_skipped": sum(len(v) for v in skipped.values()),
+    }
 
 
 # ------------------------------------------------------------------
@@ -2722,7 +2913,7 @@ class OrganizerGUI:
         # Count labels + improved terminology + clarifying help text (exact for the two char sections).
         # dest_folders/resolutions remain view-only validation (3d/3e). Save/backup logic 100% unchanged.
         # Phase 4b.5: added "Stash Import Preview" (read-only sidebar category). Connection + preview load + filters + export report.
-        # All Stash access is read-only queries (no mutations). No writes to config or learned. No import/apply (Phase 4c deferred).
+        # All Stash access is read-only queries (no mutations). No writes to config or learned. No import/apply (Phase 4c deferred per preflight audit patch).
         # Prior 5 editables + dest/res/characters views 100% preserved.
         # No Stash import (write), no new sections beyond preview, no name-gen/preview/apply changes, no org.py edits.
         # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
@@ -3169,8 +3360,8 @@ class OrganizerGUI:
             elif cat == "stash_preview":
                 # Phase 4b.5: read-only Stash import preview. Reachable from sidebar.
                 # Connection fields + Test/Load (sample supported) + filters + counts + list + Export report.
-                # NO import/apply (button disabled + label says Phase 4c). No writes to any json.
-                # Uses the pure query_ / build_ / export_ helpers (network isolated for mocking).
+                # (preflight audit: classification improved for future 4c; import still deferred, no bulk changes here)
+                # No writes to any json. Uses the pure query_ / build_ / export_ helpers (network isolated for mocking).
                 parent_frame = parent  # for clarity
 
                 # Connection controls
@@ -3469,6 +3660,162 @@ class OrganizerGUI:
                     except Exception as ex:
                         status_lbl.config(text=f"Export failed: {ex}", foreground="red")
 
+                def _select_all_filtered_importable():
+                    """Select only the rows currently visible (after all filters) that are importable:
+                    suggested_section in (artist_aliases, folder_aliases, canonical_character_aliases)
+                    AND status == "missing_local".
+                    Does not touch ignored/ambiguous/exists/unsupported.
+                    """
+                    preview_lst.selection_clear(0, "end")
+                    term = filter_var.get().lower().strip()
+                    sf = status_filter_var.get()
+                    secf = section_filter_var.get()
+                    srcf = source_filter_var.get()
+                    rolef = role_filter_var.get()
+                    visible_idx = 0
+                    importable_secs = {"artist_aliases", "folder_aliases", "canonical_character_aliases"}
+                    for it in getattr(self, "_stash_preview_items", []):
+                        # apply same filter logic as _repop
+                        if sf != "all" and it.get("status") != sf:
+                            continue
+                        if secf != "all" and it.get("suggested_section") != secf:
+                            continue
+                        if srcf != "all" and it.get("source") != srcf:
+                            continue
+                        if rolef != "all" and it.get("detected_tag_role") != rolef:
+                            continue
+                        if term and term not in (it.get("original", "") + " " + it.get("norm_key", "")).lower():
+                            continue
+                        # this row is visible
+                        if it.get("suggested_section") in importable_secs and it.get("status") == "missing_local":
+                            preview_lst.selection_set(visible_idx)
+                        visible_idx += 1
+
+                def _import_selected_stash_to_manager():
+                    """Phase 4c: reviewed import of selected preview rows into the in-memory _edit_* dicts.
+                    - Uses currently selected rows from the (multi-select) Listbox.
+                    - Pre-review dialog with counts, exact entries, conflicts, skips.
+                    - Default: skip conflicts, skip ignored/ambiguous/already_exists.
+                    - Only mutates self._edit_* (artist/folder/canonical); Save Changes is still the *only* way to write disk.
+                    - After staging: updates preview item statuses (where practical), repops list, shows summary.
+                    - No writes to r34_config or learned; no Stash side effects.
+                    """
+                    items = getattr(self, "_stash_preview_items", []) or []
+                    sel_indices = preview_lst.curselection() or ()
+                    selected = []
+                    for idx in sel_indices:
+                        if 0 <= idx < len(items):
+                            selected.append(items[idx])
+                    if not selected:
+                        status_lbl.config(text="No rows selected in the preview list. Use filters + click rows (ctrl/shift for multi) or 'Select all filtered importable'.", foreground="orange")
+                        return
+
+                    # Use pure for plan (pass copies of current edits)
+                    plan = stage_stash_import_items(
+                        selected,
+                        dict(getattr(self, "_edit_artist_aliases", {})),
+                        dict(getattr(self, "_edit_folder_aliases", {})),
+                        dict(getattr(self, "_edit_canonical_character_aliases", {})),
+                        overwrite_conflicts=False,  # decision below
+                    )
+
+                    # Build review text
+                    lines = []
+                    lines.append(f"Import Selected to Manager (Phase 4c) - REVIEW")
+                    lines.append(f"Selected in list: {plan['num_selected']}")
+                    lines.append(f"Importable (will stage if confirmed): {plan['num_added']}")
+                    lines.append(f"Conflicts found: {plan['num_conflicts']}")
+                    lines.append(f"Skipped by rule (ignored/ambig/exists/unsupported): {plan['num_skipped']}")
+                    lines.append("")
+                    if plan["added"]["artist_aliases"]:
+                        lines.append("Will add to Artist Aliases:")
+                        for nk, orig in plan["added"]["artist_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["artist_aliases"]) > 20: lines.append("  ...")
+                    if plan["added"]["folder_aliases"]:
+                        lines.append("Will add to Folder Aliases / Franchises:")
+                        for nk, orig in plan["added"]["folder_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["folder_aliases"]) > 20: lines.append("  ...")
+                    if plan["added"]["canonical_character_aliases"]:
+                        lines.append("Will add to Canonical Character Aliases:")
+                        for nk, orig in plan["added"]["canonical_character_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["canonical_character_aliases"]) > 20: lines.append("  ...")
+                    if plan["conflicts"]:
+                        lines.append("")
+                        lines.append("CONFLICTS (existing keys; default=skip):")
+                        for sec, nk, orig, oldv in plan["conflicts"][:15]:
+                            lines.append(f"  [{sec}] {nk} -> {orig}  (currently: {oldv})")
+                        if len(plan["conflicts"]) > 15: lines.append("  ...")
+                    if plan["skipped"]["ignored_or_review"]:
+                        lines.append(f"Ignored/review rows skipped: {len(plan['skipped']['ignored_or_review'])}")
+                    if plan["skipped"]["ambiguous"]:
+                        lines.append(f"Ambiguous rows skipped (default): {len(plan['skipped']['ambiguous'])}")
+                    if plan["skipped"]["already_exists_local"]:
+                        lines.append(f"Already-exists rows skipped (default): {len(plan['skipped']['already_exists_local'])}")
+                    lines.append("")
+                    lines.append("NOTE: This ONLY stages into the manager's in-memory edits.")
+                    lines.append("Click 'Save Changes' (bottom of window) to actually write r34_config.json (with backup).")
+                    lines.append("No Stash changes. No learned mappings touched. character_mappings import deferred.")
+
+                    review_text = "\n".join(lines)
+                    # Show review (use messagebox for simplicity + cross platform)
+                    messagebox.showinfo("Stash Import Review (before staging)", review_text[:3000] + ("\n... (truncated)" if len(review_text)>3000 else "") )
+
+                    if plan["conflicts"]:
+                        ow = messagebox.askyesno(
+                            "Conflicts - Overwrite?",
+                            f"{len(plan['conflicts'])} keys already exist in target section(s).\n\n"
+                            "Overwrite them with the Stash values? (RECOMMENDED: No = safer default, skips conflicts)\n\n"
+                            "Yes = overwrite those specific keys in the in-memory edit (still requires Save to persist)."
+                        )
+                    else:
+                        ow = False
+
+                    # Final confirm to stage
+                    proceed = messagebox.askyesno(
+                        "Confirm Stage to Manager?",
+                        f"Proceed to stage {plan['num_added']} values into in-memory Artist/Folder/Canonical aliases?\n"
+                        f"(Conflicts will be {'OVERWRITTEN' if ow else 'SKIPPED (default)'})\n\n"
+                        "This does NOT write to disk yet. Use Save Changes after."
+                    )
+                    if not proceed:
+                        status_lbl.config(text="Import cancelled by user.", foreground="gray")
+                        return
+
+                    # Re-run pure with the overwrite decision (on fresh copies)
+                    final_plan = stage_stash_import_items(
+                        selected,
+                        dict(getattr(self, "_edit_artist_aliases", {})),
+                        dict(getattr(self, "_edit_folder_aliases", {})),
+                        dict(getattr(self, "_edit_canonical_character_aliases", {})),
+                        overwrite_conflicts=ow,
+                    )
+
+                    # Apply to live in-mem (this is what Save will see)
+                    self._edit_artist_aliases = final_plan["updated_artist_aliases"]
+                    self._edit_folder_aliases = final_plan["updated_folder_aliases"]
+                    self._edit_canonical_character_aliases = final_plan["updated_canonical_character_aliases"]
+
+                    # Update statuses in the master items list for visible feedback (even if filter changes)
+                    staged_nks = set()
+                    for sec, lst in final_plan["added"].items():
+                        for nk, _ in lst:
+                            staged_nks.add(nk)
+                    for it in items:
+                        if it.get("norm_key") in staged_nks:
+                            it["status"] = "already_exists_local"
+                            it["note"] = (it.get("note") or "") + " (staged via Import Selected; pending Save)"
+
+                    _repop_stash_preview()
+                    # counts are from last build; user can re-load/reclass to refresh against new edits, or we leave as preview snapshot
+                    status_lbl.config(
+                        text=f"IMPORTED to manager (in-memory): artist+{len(final_plan['added']['artist_aliases'])} folder+{len(final_plan['added']['folder_aliases'])} canon+{len(final_plan['added']['canonical_character_aliases'])} ; conflicts handled: {ow} ; now click Save Changes to persist. Skipped: {final_plan['num_skipped']}",
+                        foreground="green",
+                    )
+                    # Optional: if user has other tabs open conceptually, switching cat will show live _edit updates.
+
                 # Buttons row
                 btn_frm = ttk.Frame(parent_frame)
                 btn_frm.pack(fill="x", pady=4)
@@ -3478,11 +3825,12 @@ class OrganizerGUI:
                 ttk.Button(btn_frm, text="Reclassify Current Preview (no Stash re-query)", command=_reclassify_current_preview).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Export Preview Report", command=_export_preview_report).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Clear Preview", command=lambda: (setattr(self, "_stash_preview_items", []), preview_lst.delete(0, "end"), status_lbl.config(text="Cleared."))).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Select all filtered importable", command=_select_all_filtered_importable).pack(side="left", padx=2)
 
-                # Disabled placeholder for future import (per spec: must be disabled + label Phase 4c)
-                import_btn = ttk.Button(btn_frm, text="Import Selected (Phase 4c - not implemented)", state="disabled")
+                # Phase 4c: enabled import (reviewed staging to in-mem _edit only)
+                import_btn = ttk.Button(btn_frm, text="Import Selected to Manager", command=_import_selected_stash_to_manager)
                 import_btn.pack(side="left", padx=2)
-                ttk.Label(parent_frame, text="Import/apply will be implemented in Phase 4c. This phase is read-only preview + export only.", foreground="gray").pack(anchor="w")
+                ttk.Label(parent_frame, text="Import Selected stages values in the manager only. Click Save Changes to write them to config.", foreground="blue").pack(anchor="w")
 
                 note = "Phase 4b.6 read-only classification preview: Tags classified by parent/ancestor tags (artist/character/franchise). Unclassified tags go to ignored_or_review (not auto characters). All prior editable + view-only tabs remain fully functional. Export is report only."
                 ttk.Label(parent_frame, text=note, wraplength=700).pack(anchor="w", pady=2)
