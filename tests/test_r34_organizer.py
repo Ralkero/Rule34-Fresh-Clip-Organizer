@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -1937,6 +1937,144 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
             )
             self.assertIsNotNone(b)
         self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4b.5 Stash GraphQL compatibility patch tests (mocked find* responses)
+    # These test the updated query_stash_readonly using findPerformers/findGroups/findTags
+    # with per_page:-1, alias collection, per-category errors, partial success, no mutations.
+    # ------------------------------------------------------------------
+
+    def test_mocked_findPerformers_response_parses_performers_correctly(self):
+        # Simulate Stash response shape for findPerformers including alias_list
+        def make_resp(json_data):
+            m = MagicMock()
+            m.read.return_value = json.dumps(json_data).encode("utf-8")
+            m.__enter__.return_value = m
+            return m
+
+        version_resp = {"data": {"version": {"version": "v0.25.0"}}}
+        perf_resp = {
+            "data": {
+                "findPerformers": {
+                    "count": 2,
+                    "performers": [
+                        {"id": "1", "name": "RealName", "alias_list": ["Alias1", "Alias2"]},
+                        {"id": "2", "name": "Another", "alias_list": []},
+                    ],
+                }
+            }
+        }
+        with patch("urllib.request.urlopen", side_effect=[make_resp(version_resp), make_resp(perf_resp)]):
+            res = gui.query_stash_readonly("http://mock/graphql", None, timeout=1)
+            # query returns original cased names (and aliases)
+            self.assertTrue(any(n == "RealName" for n in res.get("performers", [])))
+            self.assertIn("Alias1", res.get("performers", []))
+            self.assertIn("Alias2", res.get("performers", []))
+            self.assertEqual(res.get("query_status", {}).get("performers"), "success")
+            self.assertEqual(res.get("response_counts", {}).get("performers"), 2)
+            # other categories may produce "no data" in errors list because we only mocked perf; check no performer error
+            errs = " ".join(res.get("errors", [])).lower()
+            self.assertNotIn("performers", errs)
+
+    def test_mocked_findGroups_response_parses_groups_correctly(self):
+        def make_resp(json_data):
+            m = MagicMock()
+            m.read.return_value = json.dumps(json_data).encode("utf-8")
+            m.__enter__.return_value = m
+            return m
+
+        grp_resp = {
+            "data": {
+                "findGroups": {
+                    "count": 1,
+                    "groups": [{"id": "g1", "name": "FranchiseX", "aliases": ["FX", "Franch X"]}],
+                }
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=make_resp(grp_resp)):
+            res = gui.query_stash_readonly("http://mock/graphql", None, timeout=1)
+            self.assertIn("FranchiseX", res.get("groups", []))
+            self.assertIn("FX", res.get("groups", []))
+            self.assertEqual(res.get("query_status", {}).get("groups"), "success")
+            self.assertEqual(res.get("response_counts", {}).get("groups"), 1)
+
+    def test_mocked_findTags_response_parses_tags_correctly(self):
+        def make_resp(json_data):
+            m = MagicMock()
+            m.read.return_value = json.dumps(json_data).encode("utf-8")
+            m.__enter__.return_value = m
+            return m
+
+        tag_resp = {
+            "data": {
+                "findTags": {
+                    "count": 3,
+                    "tags": [{"id": "t1", "name": "CharA"}, {"id": "t2", "name": "CharB"}, {"id": "t3", "name": "CharC"}],
+                }
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=make_resp(tag_resp)):
+            res = gui.query_stash_readonly("http://mock/graphql", None, timeout=1)
+            self.assertIn("CharA", res.get("tags", []))
+            self.assertIn("CharC", res.get("tags", []))
+            self.assertEqual(res.get("query_status", {}).get("tags"), "success")
+            self.assertEqual(res.get("response_counts", {}).get("tags"), 3)
+
+    def test_partial_failure_still_returns_other_successful_categories(self):
+        def make_resp(json_data):
+            m = MagicMock()
+            m.read.return_value = json.dumps(json_data).encode("utf-8")
+            m.__enter__.return_value = m
+            return m
+
+        # probe succeeds, perf succeeds, groups fails (error in data) -> triggers 2 fallbacks, tags succeeds
+        empty_groups = {"data": {"findGroups": {"count": 0, "groups": []}}}
+        empty_studios = {"data": {"findStudios": {"count": 0, "studios": []}}}
+        empty_movies = {"data": {"findMovies": {"count": 0, "movies": []}}}
+        side_effects = [
+            make_resp({"data": {"version": {"version": "0.1"}}}),  # probe
+            make_resp({"data": {"findPerformers": {"count": 1, "performers": [{"name": "P1"}]}}}),  # perf
+            make_resp({"data": {}, "errors": [{"message": "findGroups not supported or error"}]}),  # groups error
+            make_resp(empty_studios),  # fallback studios (0)
+            make_resp(empty_movies),  # fallback movies (0)
+            make_resp({"data": {"findTags": {"count": 1, "tags": [{"name": "T1"}]}}}),  # tags
+        ]
+        with patch("urllib.request.urlopen", side_effect=side_effects):
+            res = gui.query_stash_readonly("http://mock/graphql", None, timeout=1)
+            self.assertIn("P1", res.get("performers", []))
+            self.assertIn("T1", res.get("tags", []))
+            self.assertEqual(len(res.get("groups", [])), 0)  # failed
+            self.assertTrue(any("groups" in e.lower() for e in res.get("errors", [])))
+            self.assertEqual(res.get("query_status", {}).get("performers"), "success")
+            self.assertIn("error", res.get("query_status", {}).get("groups", "").lower())
+            self.assertEqual(res.get("query_status", {}).get("tags"), "success")
+
+    def test_graphql_errors_are_surfaced_in_result_errors_and_query_status(self):
+        def make_resp(json_data):
+            m = MagicMock()
+            m.read.return_value = json.dumps(json_data).encode("utf-8")
+            m.__enter__.return_value = m
+            return m
+
+        version_resp = {"data": {"version": {"version": "v0.1"}}}
+        err_resp = {"data": None, "errors": [{"message": "Field 'findPerformers' doesn't exist"}]}
+        with patch("urllib.request.urlopen", side_effect=[make_resp(version_resp), make_resp(err_resp)]):
+            res = gui.query_stash_readonly("http://mock/graphql", None, timeout=1)
+            self.assertTrue(len(res.get("errors", [])) > 0)
+            errs_str = " ".join(res.get("errors", [])).lower()
+            self.assertIn("performers", errs_str)
+            qs = res.get("query_status", {})
+            self.assertIn("graphql error", qs.get("performers", ""))
+
+    def test_no_mutation_strings_are_used_in_compatibility_patch(self):
+        # Re-check source after patch (the dedicated test already covers, but ensure new queries don't introduce)
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+        # also verify the new queries use find* not old roots
+        self.assertIn("findperformers", code)
+        self.assertIn("findgroups", code)
+        self.assertIn("findtags", code)
+        self.assertNotIn("performers {\n            performers", code)  # old shape shouldn't be in query anymore
 
 
 if __name__ == "__main__":

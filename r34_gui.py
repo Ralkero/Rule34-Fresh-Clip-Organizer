@@ -732,77 +732,153 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
     except Exception as e:
         result["errors"].append(f"probe failed: {type(e).__name__}: {e}")
 
-    # Performers (artists)
+    # --- Phase 4b.5 compatibility patch: use Stash find* queries with per_page:-1 ---
+    # These return { count, <items> { id, name, ... } } instead of the old nested root fields.
+    # Always read-only. Separate try per category so one failure doesn't block others.
+    # Collect name + aliases/alias_list for richer candidates where available.
+    # Surface per-category status and response counts for UI diagnostics.
+
+    performer_status = "not run"
+    performer_resp_count = 0
     try:
         q = """
         query {
-          performers {
+          findPerformers(filter: { per_page: -1 }) {
+            count
             performers {
+              id
               name
+              alias_list
             }
           }
         }
         """
         data = _post_graphql(q)
         perfs = []
-        if isinstance(data, dict) and data.get("data") and data["data"].get("performers"):
-            perfs = [
-                p.get("name")
-                for p in (data["data"]["performers"].get("performers") or [])
-                if isinstance(p, dict) and p.get("name")
-            ]
-        result["performers"] = sorted(set(n for n in perfs if n))
-        if result["performers"]:
-            result["meta"]["connected"] = True
+        if isinstance(data, dict) and data.get("data") and data["data"].get("findPerformers"):
+            fp = data["data"]["findPerformers"]
+            performer_resp_count = fp.get("count", 0) or len(fp.get("performers", []) or [])
+            for p in (fp.get("performers") or []):
+                if isinstance(p, dict):
+                    nm = p.get("name")
+                    if nm:
+                        perfs.append(nm)
+                    for al in (p.get("alias_list") or []):
+                        if al:
+                            perfs.append(al)
+            result["performers"] = sorted(set(n for n in perfs if n))
+            performer_status = "success"
+            if result["performers"]:
+                result["meta"]["connected"] = True
+        else:
+            if isinstance(data, dict) and data.get("errors"):
+                gerr = data["errors"][0] if data["errors"] else {}
+                msg = gerr.get("message", str(gerr)) if isinstance(gerr, dict) else str(gerr)
+                performer_status = f"graphql error: {msg}"
+                result["errors"].append(f"performers: {performer_status}")
+            else:
+                performer_status = "no data or unexpected shape"
+                result["errors"].append("performers: no data or unexpected shape")
     except Exception as e:
-        result["errors"].append(f"performers query failed: {type(e).__name__}: {e}")
+        performer_status = f"error: {type(e).__name__}: {e}"
+        result["errors"].append(f"performers query failed: {performer_status}")
 
-    # Groups / franchise groups (try groups first, fallback to studios)
+    # Groups / franchises: try findGroups, fallback to findStudios then findMovies
+    group_status = "not run"
+    group_resp_count = 0
     try:
         q = """
         query {
-          groups {
+          findGroups(filter: { per_page: -1 }) {
+            count
             groups {
+              id
               name
+              aliases
             }
           }
         }
         """
         data = _post_graphql(q)
         grps = []
-        if isinstance(data, dict) and data.get("data") and data["data"].get("groups"):
-            grps = [
-                g.get("name")
-                for g in (data["data"]["groups"].get("groups") or [])
-                if isinstance(g, dict) and g.get("name")
-            ]
-        if not grps:
-            q2 = """
-            query {
-              studios {
-                studios {
-                  name
+        if isinstance(data, dict) and data.get("data") and data["data"].get("findGroups"):
+            fg = data["data"]["findGroups"]
+            group_resp_count = fg.get("count", 0) or len(fg.get("groups", []) or [])
+            for g in (fg.get("groups") or []):
+                if isinstance(g, dict):
+                    nm = g.get("name")
+                    if nm:
+                        grps.append(nm)
+                    for al in (g.get("aliases") or []):
+                        if al:
+                            grps.append(al)
+            result["groups"] = sorted(set(n for n in grps if n))
+            group_status = "success"
+        else:
+            if isinstance(data, dict) and data.get("errors"):
+                gerr = data["errors"][0] if data["errors"] else {}
+                msg = gerr.get("message", str(gerr)) if isinstance(gerr, dict) else str(gerr)
+                group_status = f"graphql error: {msg}"
+                result["errors"].append(f"groups: {group_status}")
+            else:
+                group_status = "no data or unexpected shape (will try fallbacks)"
+                result["errors"].append("groups: no data or unexpected shape (trying fallbacks)")
+        # Fallbacks if no groups yet
+        if not result.get("groups"):
+            for fb_name, fb_q in [
+                ("findStudios", """
+                query {
+                  findStudios(filter: { per_page: -1 }) {
+                    count
+                    studios {
+                      id
+                      name
+                    }
+                  }
                 }
-              }
-            }
-            """
-            data2 = _post_graphql(q2)
-            if isinstance(data2, dict) and data2.get("data") and data2["data"].get("studios"):
-                grps = [
-                    s.get("name")
-                    for s in (data2["data"]["studios"].get("studios") or [])
-                    if isinstance(s, dict) and s.get("name")
-                ]
-        result["groups"] = sorted(set(n for n in grps if n))
+                """),
+                ("findMovies", """
+                query {
+                  findMovies(filter: { per_page: -1 }) {
+                    count
+                    movies {
+                      id
+                      name
+                    }
+                  }
+                }
+                """),
+            ]:
+                try:
+                    data2 = _post_graphql(fb_q)
+                    fb_items = []
+                    key = fb_name[4:].lower()  # studios or movies
+                    if isinstance(data2, dict) and data2.get("data") and data2["data"].get(fb_name):
+                        ffb = data2["data"][fb_name]
+                        group_resp_count = ffb.get("count", 0) or len(ffb.get(key, []) or [])
+                        for item in (ffb.get(key) or []):
+                            if isinstance(item, dict) and item.get("name"):
+                                fb_items.append(item["name"])
+                        if fb_items:
+                            result["groups"] = sorted(set(n for n in fb_items if n))
+                            group_status = f"success (fallback {fb_name})"
+                            break
+                except Exception:
+                    pass  # continue to next fallback
     except Exception as e:
-        result["errors"].append(f"groups/studios query failed: {type(e).__name__}: {e}")
+        group_status = f"error: {type(e).__name__}: {e}"
+        result["errors"].append(f"groups query failed: {group_status}")
 
     # Tags (character candidates)
+    tag_status = "not run"
+    tag_resp_count = 0
     try:
         q = """
         query {
-          tags {
+          findTags(filter: { per_page: -1 }) {
+            count
             tags {
+              id
               name
             }
           }
@@ -810,15 +886,38 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
         """
         data = _post_graphql(q)
         tgs = []
-        if isinstance(data, dict) and data.get("data") and data["data"].get("tags"):
-            tgs = [
-                t.get("name")
-                for t in (data["data"]["tags"].get("tags") or [])
-                if isinstance(t, dict) and t.get("name")
-            ]
-        result["tags"] = sorted(set(n for n in tgs if n))
+        if isinstance(data, dict) and data.get("data") and data["data"].get("findTags"):
+            ft = data["data"]["findTags"]
+            tag_resp_count = ft.get("count", 0) or len(ft.get("tags", []) or [])
+            for t in (ft.get("tags") or []):
+                if isinstance(t, dict) and t.get("name"):
+                    tgs.append(t["name"])
+            result["tags"] = sorted(set(n for n in tgs if n))
+            tag_status = "success"
+        else:
+            if isinstance(data, dict) and data.get("errors"):
+                gerr = data["errors"][0] if data["errors"] else {}
+                msg = gerr.get("message", str(gerr)) if isinstance(gerr, dict) else str(gerr)
+                tag_status = f"graphql error: {msg}"
+                result["errors"].append(f"tags: {tag_status}")
+            else:
+                tag_status = "no data or unexpected shape"
+                result["errors"].append("tags: no data or unexpected shape")
     except Exception as e:
-        result["errors"].append(f"tags query failed: {type(e).__name__}: {e}")
+        tag_status = f"error: {type(e).__name__}: {e}"
+        result["errors"].append(f"tags query failed: {tag_status}")
+
+    # Populate diagnostic info for UI (even on 0 counts or errors)
+    result["query_status"] = {
+        "performers": performer_status,
+        "groups": group_status,
+        "tags": tag_status,
+    }
+    result["response_counts"] = {
+        "performers": performer_resp_count,
+        "groups": group_resp_count,
+        "tags": tag_resp_count,
+    }
 
     if result["performers"] or result["groups"] or result["tags"]:
         result["meta"]["connected"] = True
@@ -829,6 +928,7 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
 def get_sample_stash_data() -> dict:
     """Return realistic sample Stash data for tests and manual verification when no live Stash is available.
     Matches the spirit of the user's reported library sizes (small representative slice).
+    Enhanced for 4b.5 query compatibility patch to include query_status / response_counts for debug UI.
     """
     return {
         "performers": [
@@ -855,6 +955,16 @@ def get_sample_stash_data() -> dict:
             "endpoint": "sample://mock-data-for-phase-4b5",
             "connected": True,
             "note": "Sample data (no network). Use for verification without requiring Stash server.",
+        },
+        "query_status": {
+            "performers": "success (sample)",
+            "groups": "success (sample)",
+            "tags": "success (sample)",
+        },
+        "response_counts": {
+            "performers": 5,
+            "groups": 3,
+            "tags": 5,
         },
     }
 
@@ -2887,6 +2997,14 @@ class OrganizerGUI:
                     counts_vars[ckey] = var
                     ttk.Label(row, textvariable=var).pack(side="left", padx=6)
 
+                # Phase 4b.5 compatibility patch: Schema Compatibility / Debug panel
+                # Shows per-category query status (success / graphql error / fallback) + response counts from Stash
+                # even when 0 items found, so user sees why (e.g. schema mismatch or empty category).
+                debug_frm = ttk.Frame(parent_frame)
+                debug_frm.pack(fill="x", pady=2)
+                debug_var = tk.StringVar(value="Schema Compatibility / Debug: (load or test to populate)")
+                ttk.Label(debug_frm, textvariable=debug_var, font=("TkDefaultFont", 8), foreground="gray", wraplength=750).pack(anchor="w")
+
                 # Filters
                 filter_frm = ttk.Frame(parent_frame)
                 filter_frm.pack(fill="x", pady=2)
@@ -2949,6 +3067,29 @@ class OrganizerGUI:
                         val = c.get(ckey, 0)
                         var.set(f"{mapping.get(ckey, ckey)} {val}")
 
+                def _update_debug(raw):
+                    if not raw:
+                        debug_var.set("Schema Compatibility / Debug: no data")
+                        return
+                    qs = raw.get("query_status", {})
+                    rc = raw.get("response_counts", {})
+                    meta = raw.get("meta", {})
+                    conn = "yes" if meta.get("connected") else "no"
+                    p_st = qs.get("performers", "?")
+                    g_st = qs.get("groups", "?")
+                    t_st = qs.get("tags", "?")
+                    p_c = rc.get("performers", 0)
+                    g_c = rc.get("groups", 0)
+                    t_c = rc.get("tags", 0)
+                    txt = f"Schema Compatibility / Debug: connected:{conn} | performers:{p_st} (resp_count:{p_c}) | groups:{g_st} (resp:{g_c}) | tags:{t_st} (resp:{t_c})"
+                    debug_var.set(txt[:300])  # safe length
+                    # also surface category errors in status if load found 0s but had errors
+                    errs = raw.get("errors", []) or []
+                    if errs and ("0" in status_lbl.cget("text") or "Partial" in status_lbl.cget("text") or "failed" in status_lbl.cget("text").lower()):
+                        short_err = "; ".join(errs[:2])
+                        if short_err and short_err not in status_lbl.cget("text"):
+                            status_lbl.config(text=status_lbl.cget("text") + f" | {short_err[:120]}")
+
                 def _load_stash_preview(use_sample: bool = False):
                     self._stash_preview_items = []
                     preview_lst.delete(0, "end")
@@ -2961,10 +3102,17 @@ class OrganizerGUI:
                         else:
                             status_lbl.config(text="Querying Stash (read-only)...", foreground="black")
                             raw = query_stash_readonly(ep, key)
+                            p_l = len(raw.get("performers", []))
+                            g_l = len(raw.get("groups", []))
+                            t_l = len(raw.get("tags", []))
                             if raw.get("meta", {}).get("connected"):
-                                status_lbl.config(text=f"Connected. Found performers:{len(raw.get('performers',[]))} groups:{len(raw.get('groups',[]))} tags:{len(raw.get('tags',[]))}", foreground="green")
+                                base = f"Connected. performers:{p_l} groups:{g_l} tags:{t_l}"
+                                if p_l == 0 or g_l == 0 or t_l == 0:
+                                    base += " (0 may indicate empty category or query issue - see debug below)"
+                                status_lbl.config(text=base, foreground="green")
                             else:
-                                status_lbl.config(text=f"Partial/failed. Errors: {'; '.join(raw.get('errors',[])[:2])}", foreground="orange")
+                                status_lbl.config(text=f"Partial/failed. Errors: {'; '.join(raw.get('errors',[])[:2])} (see debug panel for per-category status)", foreground="orange")
+                        _update_debug(raw)
                         # Build using CURRENT in-memory local edit dicts (so pending local edits in manager are reflected if user added before opening preview)
                         preview = build_stash_import_preview(
                             raw,
@@ -2995,11 +3143,15 @@ class OrganizerGUI:
                         status_lbl.config(text="Testing connection (read-only probe)...", foreground="black")
                         # Use the query func with a probe; it populates meta
                         res = query_stash_readonly(ep, key)
+                        _update_debug(res)
                         if res.get("meta", {}).get("connected"):
                             ver = res.get("meta", {}).get("version") or "?"
-                            status_lbl.config(text=f"OK: connected to Stash (version {ver}). performers:{len(res.get('performers',[]))}", foreground="green")
+                            p_l = len(res.get("performers", []))
+                            g_l = len(res.get("groups", []))
+                            t_l = len(res.get("tags", []))
+                            status_lbl.config(text=f"OK: connected to Stash (version {ver}). performers:{p_l} groups:{g_l} tags:{t_l} (see debug for query_status)", foreground="green")
                         else:
-                            status_lbl.config(text=f"Could not confirm connection. Errors: {'; '.join(res.get('errors',[])[:1])} (check URL, Stash running?, key if required)", foreground="orange")
+                            status_lbl.config(text=f"Could not confirm connection. Errors: {'; '.join(res.get('errors',[])[:1])} (check URL, Stash running?, key if required; see debug)", foreground="orange")
                     except Exception as ex:
                         status_lbl.config(text=f"Test failed: {ex} (Stash may not be running; use Load Sample for offline verification)", foreground="red")
 
