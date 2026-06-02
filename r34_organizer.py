@@ -1001,8 +1001,10 @@ def clean_position_descriptors(title: str) -> str:
 
     value = re.sub(position_words, _clean_after_position, value)
 
-    # Final aggressive removal of any remaining "Cam" tags and standalone numeric sequences at the end
-    value = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d+)\b.*$", "", value)
+    # Final aggressive removal of any remaining "Cam" tags and standalone numeric sequences *at the end only*.
+    # Do not eat legitimate early numbers like "21 - Riding" (scene/episode style titles) or "Virus 2B MAX".
+    # The .* $ was too broad; limit to trailing junk (fixes jessies_mom, max_quality, normalized_dup pre-existing tests).
+    value = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d+)\b\s*$", "", value)
 
     value = re.sub(r"\s+", " ", value).strip(" -_.,;")
     return value
@@ -2042,6 +2044,10 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             )
 
     character_text = ", ".join(character_detection.characters)
+    # Ensure title-cased form for character output (e.g. "Megaera" not "megaera").
+    # Preserves internal lower norm keys in aliases/learned. Fixes test_learned_character_is_detectable.
+    if character_text:
+        character_text = title_case_words(character_text, config.preserve_tokens)
     title = strip_detected_characters_from_title(full_title, character_detection)
 
     # Apply additional meta stripping (FPS, dates/years) to the final title segment
@@ -2133,6 +2139,17 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
                 folder_reason = char_freason
                 if is_collector_artist:
                     print(f"[Character Folder] Using direct mapping for collector artist '{artist}': {char_folder}")
+
+    # Explicit config character_mappings must always win over later OC/collector artist-as-char
+    # or learned fallbacks (see test_explicit_config_mapping_is_not_overwritten).
+    # Do this after the main char lookup so strong explicit drives target_folder.
+    for ch in (character_detection.characters if character_detection else ()):
+        chn = normalize(ch)
+        if chn in config.character_mappings:
+            target_folder = config.character_mappings[chn]
+            folder_conf = max(folder_conf, 0.95)
+            folder_reason = (folder_reason or "") + ";explicit_config_char_mapping_wins"
+            break
 
     # AI-assisted franchise clarification (Grok) for cases where we have a strong
     # artist from filename prefix (common in collector dumps) or a character,
@@ -2734,7 +2751,13 @@ def replace_config(config: Config, **updates: object) -> Config:
         "angle_variants_folder_name": getattr(config, "angle_variants_folder_name", "_r34_angle_variants"),
     }
     data.update(updates)
-    return Config(**data)
+    new_cfg = Config(**data)
+    # Preserve _loaded_config_path (set via object.__setattr__ in load_config for frozen dataclass;
+    # used by load_learned_franchises etc. for relative paths when GUI uses --config).
+    # See test_learned_resolves_relative_to_loaded_config_path.
+    if hasattr(config, "_loaded_config_path"):
+        object.__setattr__(new_cfg, "_loaded_config_path", getattr(config, "_loaded_config_path", None))
+    return new_cfg
 
 
 def approved_value(value: str) -> bool:
