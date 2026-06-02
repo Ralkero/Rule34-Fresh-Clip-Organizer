@@ -328,6 +328,104 @@ def apply_learned_mappings_edits(learned_path: Path, edits: Optional[dict] = Non
         raise
 
 
+# Phase 3d pure (non-Tk) helpers for view-only dest folders + resolutions validation reports.
+# No writes, no FS create/mutate, no config changes. Reusable in tests + manager refresh.
+# Reuse 3c resolve_learned_mappings_path for learned cross-refs; org.build_reference_data for ref data (read-only).
+
+def build_destination_folder_validation_report(config_path: Path) -> dict:
+    """Pure helper for Phase 3d: build view data + validation for destination folders.
+
+    - Scans via org.build_reference_data (existing dest subdirs under root).
+    - Cross-refs targets from folder_aliases, character_mappings, learned (via resolve_learned + json).
+    - For each pointed target: exists on disk? in ref? sources list.
+    - Reports issues for missing targets (not exist or not in ref), with sources.
+    - Returns structured dict for UI lists (no side effects).
+    """
+    if config_path is None:
+        return {"error": "no config path", "folders": [], "issues": []}
+    try:
+        cpath = Path(config_path)
+        cfg = org.load_config(cpath) if (org and cpath.exists()) else None
+        dest_str = getattr(cfg, "destination_root", None) if cfg else None
+        dest = Path(dest_str) if dest_str and Path(dest_str).exists() else Path(".")
+        ref = org.build_reference_data(dest, cfg) if (org and dest.exists()) else None
+        existing = (ref.destination_folders if ref else {})
+
+        # load learned for cross-ref (reuse 3c pure, no org edit)
+        learned = {}
+        try:
+            lp = resolve_learned_mappings_path(cpath, cfg)
+            if lp.exists():
+                raw = json.loads(lp.read_text(encoding="utf-8"))
+                learned = {(org.normalize(k) if (org and hasattr(org, "normalize")) else str(k).lower().replace(" ", "")): v
+                           for k, v in raw.items() if str(k).strip()}
+        except Exception:
+            learned = {}
+
+        from collections import defaultdict
+        pointed_sources = defaultdict(list)
+        if cfg:
+            for al, tgt in getattr(cfg, "folder_aliases", {}).items():
+                pointed_sources[tgt].append(f"folder_alias:{al}")
+            for ch, tgt in getattr(cfg, "character_mappings", {}).items():
+                pointed_sources[tgt].append(f"char_map:{ch}")
+        for ch, tgt in learned.items():
+            pointed_sources[tgt].append(f"learned:{ch}")
+
+        folders = []
+        issues = []
+        for tgt, srcs in pointed_sources.items():
+            nrm = (org.normalize(tgt) if (org and hasattr(org, "normalize")) else str(tgt).lower().replace(" ", ""))
+            disp = tgt
+            on_disk = (dest / tgt).exists() if dest else False
+            in_ref = nrm in existing
+            folders.append({"norm": nrm, "display": disp, "exists": on_disk, "sources": list(srcs), "in_ref": in_ref})
+            if not on_disk or not in_ref:
+                issues.append(f"Missing target '{tgt}' (sources: {', '.join(srcs)}) - on disk: {on_disk}, in ref: {in_ref}")
+
+        return {
+            "dest_root": str(dest),
+            "folders": folders,
+            "issues": issues,
+            "pointed_targets": len(pointed_sources),
+        }
+    except Exception as e:
+        return {"error": str(e), "folders": [], "issues": [f"error: {e}"]}
+
+
+def build_resolution_validation_report(config_path: Path) -> dict:
+    """Pure helper for Phase 3d: build view data + basic validation for resolutions.
+
+    Uses ref.naming_style (from build_reference_data on dest scan + filename labels).
+    Reports sample count, labels, learned buckets, simple issues (e.g. low samples).
+    No writes, no media probing beyond existing build scan (name parse only).
+    """
+    if config_path is None:
+        return {"error": "no config path", "resolutions": {}, "issues": []}
+    try:
+        cpath = Path(config_path)
+        cfg = org.load_config(cpath) if (org and cpath.exists()) else None
+        dest_str = getattr(cfg, "destination_root", None) if cfg else None
+        dest = Path(dest_str) if dest_str and Path(dest_str).exists() else Path(".")
+        ref = org.build_reference_data(dest, cfg) if (org and dest.exists()) else None
+        if not ref or not hasattr(ref, "naming_style"):
+            return {"dest_root": str(dest), "resolutions": {}, "issues": ["no naming_style in ref"], "sample_count": 0}
+
+        ns = ref.naming_style
+        issues = []
+        if getattr(ns, "sample_count", 0) < 1:
+            issues.append("No resolution samples found during library scan.")
+        return {
+            "dest_root": str(dest),
+            "resolutions": dict(getattr(ns, "resolution_labels", {})),
+            "learned_buckets": list(getattr(ns, "learned_resolution_buckets", [])),
+            "sample_count": getattr(ns, "sample_count", 0),
+            "issues": issues,
+        }
+    except Exception as e:
+        return {"error": str(e), "resolutions": {}, "issues": [f"error: {e}"], "sample_count": 0}
+
+
 # ------------------------------------------------------------------
 # Configuration / Helpers
 # ------------------------------------------------------------------
@@ -1656,13 +1754,13 @@ class OrganizerGUI:
             self.status_var.set(f"Refresh failed: {e}")
 
     def _open_known_values_manager(self):
-        # Phase 3c limited (per directive): schema-aware editing for the 4 allowed (artist_aliases + folder_aliases + character_mappings + canonical_character_aliases from 3a/3b) + learned mappings (learned_character_franchises.json, 3c only).
-        # Collision-proof timestamped backups (%f) before any write (config via apply_known, learned via apply_learned). Preserve ALL other keys/structure exactly.
-        # Destination folders and resolutions: view-only (no editing in 3c or prior). Learned now has dedicated editable tab (no longer "future work").
-        # Refresh dropdowns after save (get_known + _refresh_known_lists; learned now reflected in Characters/Franchises). Do not implement full Phase 3 / dest / res. No r34_organizer.py changes. Keep prior 4 sections behavior 100% unchanged.
+        # Phase 3d limited (per directive): 5 editable sections (3a/3b/3c: artist+folder aliases, char mappings, canon aliases, learned) + dest folders/resolutions as view-only validation tabs (3d only; no writes/FS/edit/save for them).
+        # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly. No config writes or FS ops from 3d views.
+        # Refresh validation buttons rebuild in-memory reports only (reuse org.build_reference_data + 3c resolve_learned + new pure val helpers).
+        # Do not implement full Phase 3 / dest management / res editing. Keep all prior editable behavior 100% unchanged.
         win = tk.Toplevel(self.root)
-        win.title("Known Values Manager (Phase 3c limited: 4 config sections + learned mappings editable + %f backups; dest/res view-only; stop per directive)")
-        win.geometry("800x580")
+        win.title("Known Values Manager (Phase 3d limited: 5 editable + dest_folders/res view-only validation + %f backups for editable; stop per directive)")
+        win.geometry("820x600")
 
         # Load structured dicts (not the flattened correction_known lists) for schema edit of the 4 allowed (3a/3b) + learned (3c only).
         cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
@@ -1700,8 +1798,9 @@ class OrganizerGUI:
             ("character_mappings", "Character Mappings (character_mappings - editable Phase 3b)"),
             ("canonical_character_aliases", "Canonical Character Aliases (canonical_character_aliases - editable Phase 3b)"),
             ("learned", "Learned Mappings (learned_character_franchises.json - editable Phase 3c)"),
-            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3c)"),
-            ("resolutions", "Resolutions (naming style - view-only Phase 3c)")
+            ("dest_folders", "Destination Folders (view-only Phase 3d)"),
+            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3d)"),
+            ("resolutions", "Resolutions (naming style - view-only Phase 3d)")
         ]:
             f = ttk.Frame(nb)
             nb.add(f, text=label)
@@ -1786,25 +1885,94 @@ class OrganizerGUI:
                             pass
                     ttk.Button(frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
 
-                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res) untouched."
+                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res views in 3d) untouched."
                 ttk.Label(f, text=note).pack(pady=2)
             else:
-                # View-only for characters (union now includes learned edits from 3c tab) and resolutions. No editing controls for dest/res in 3c.
-                lst = tk.Listbox(f, height=12)
-                lst.pack(fill="both", expand=True, padx=4, pady=2)
-                src = (self.correction_known or {}).get(cat, [])
-                for v in src:
-                    lst.insert("end", v)
-                if cat == "characters":
-                    note = "View-only in Phase 3c. Do not edit character_mappings/canonical_character_aliases here (use the dedicated editable tabs above). Learned mappings now editable in the 'Learned Mappings' tab (Phase 3c)."
+                # Phase 3d view-only tabs: dest_folders (new dedicated with validation) + characters + resolutions (improved).
+                # No Add/Edit/Remove/Save for these; labels "View-only in Phase 3d"; refresh only rebuilds in-memory report (no FS/config writes).
+                if cat == "dest_folders":
+                    # Two lists: folders + validation issues. Refresh button rebuilds via pure helper.
+                    lst_folders = tk.Listbox(f, height=8)
+                    lst_folders.pack(fill="both", expand=True, padx=4, pady=2)
+                    lst_issues = tk.Listbox(f, height=6)
+                    lst_issues.pack(fill="both", expand=True, padx=4, pady=2)
+                    # store for refresh (closure over these)
+                    self._dest_folders_lst = lst_folders
+                    self._dest_issues_lst = lst_issues
+
+                    def _repop_dest():
+                        lst_folders.delete(0, "end")
+                        lst_issues.delete(0, "end")
+                        try:
+                            rep = build_destination_folder_validation_report(cpath)
+                            for it in rep.get("folders", []):
+                                lst_folders.insert("end", f"{it.get('norm','?')}: {it.get('display','?')} (exists:{it.get('exists')}, in_ref:{it.get('in_ref')}, srcs:{len(it.get('sources',[]))})")
+                            for iss in rep.get("issues", []):
+                                lst_issues.insert("end", iss)
+                            if "error" in rep:
+                                lst_issues.insert("end", f"ERR: {rep['error']}")
+                        except Exception as ex:
+                            lst_issues.insert("end", f"ERR: {ex}")
+
+                    _repop_dest()
+
+                    def _refresh_dest():
+                        _repop_dest()
+                        self.status_var.set("Destination folder validation refreshed (view-only, no writes).")
+
+                    ttk.Button(f, text="Refresh Folder Validation", command=_refresh_dest).pack(pady=2)
+                    ttk.Label(f, text="View-only in Phase 3d. Shows scanned dest folders (from ref) + cross-ref validation for missing targets from aliases/char_maps/learned. No FS ops, no config writes. 'Refresh' rebuilds in-memory only.").pack(pady=2)
+                elif cat == "resolutions":
+                    # Improved view: richer than simple known list; use pure report for labels + issues.
+                    lst_res = tk.Listbox(f, height=8)
+                    lst_res.pack(fill="both", expand=True, padx=4, pady=2)
+                    lst_res_issues = tk.Listbox(f, height=4)
+                    lst_res_issues.pack(fill="both", expand=True, padx=4, pady=2)
+                    self._res_lst = lst_res
+                    self._res_issues_lst = lst_res_issues
+
+                    def _repop_res():
+                        lst_res.delete(0, "end")
+                        lst_res_issues.delete(0, "end")
+                        try:
+                            rep = build_resolution_validation_report(cpath)
+                            for b, lab in rep.get("resolutions", {}).items():
+                                lst_res.insert("end", f"{b}: {lab}")
+                            for iss in rep.get("issues", []):
+                                lst_res_issues.insert("end", iss)
+                            sc = rep.get("sample_count", 0)
+                            if sc:
+                                lst_res.insert("end", f"(sample_count: {sc})")
+                            if "error" in rep:
+                                lst_res_issues.insert("end", f"ERR: {rep['error']}")
+                        except Exception as ex:
+                            lst_res_issues.insert("end", f"ERR: {ex}")
+
+                    _repop_res()
+
+                    def _refresh_res():
+                        _repop_res()
+                        self.status_var.set("Resolution validation refreshed (view-only, no writes).")
+
+                    ttk.Button(f, text="Refresh Resolution Validation", command=_refresh_res).pack(pady=2)
+                    ttk.Label(f, text="View-only in Phase 3d. Shows resolution labels from library scan + naming style. No editing, no config/media writes. Resolution editing is deferred.").pack(pady=2)
                 else:
-                    note = "View-only in Phase 3c. Do not edit destination folders or resolutions (full support later / future phases). Use JSON directly with backups."
-                ttk.Label(f, text=note).pack(pady=2)
+                    # characters view (updated note)
+                    lst = tk.Listbox(f, height=12)
+                    lst.pack(fill="both", expand=True, padx=4, pady=2)
+                    src = (self.correction_known or {}).get(cat, [])
+                    for v in src:
+                        lst.insert("end", v)
+                    if cat == "characters":
+                        note = "View-only in Phase 3d. Do not edit character_mappings/canonical_character_aliases here (use dedicated tabs). Learned editable in its tab. Destination folders now have dedicated view+validation tab (Phase 3d)."
+                    else:
+                        note = "View-only in Phase 3d. Do not edit destination folders or resolutions (dedicated view+validation tabs above; no editing in 3d). Use JSON directly with backups for advanced changes."
+                    ttk.Label(f, text=note).pack(pady=2)
 
         def _save_known_values_changes():
-            # Phase 3c save (extended from 3b/3a): use pures for 4 config sections + learned (separate file).
+            # Phase 3d save (extended from 3c/3b/3a): use pures for 4 config sections + learned (separate file).
             # Backups (collision-proof %f) created inside helpers before any write.
-            # Only the 4 allowed config keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res never edited.
+            # Only the 5 allowed (3a/3b/3c) keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res views (3d) never edited or written.
             try:
                 cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
                 if not cpath or not cpath.exists():
@@ -1857,7 +2025,7 @@ class OrganizerGUI:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 4 config sections + learned mappings in Phase 3c)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable sections + learned in Phase 3c; dest/res 3d views untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
     def _sort_tree(self, col):
