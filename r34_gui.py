@@ -1093,6 +1093,39 @@ def classify_stash_tag(tag_info: dict) -> tuple:
     return "general_tag", "ignored_or_review", "no parent or category clues available"
 
 
+def classify_stash_group(group_info: dict) -> tuple:
+    """Pure: for auto mode, classify Stash group using name/aliases for franchise-like evidence.
+
+    Returns (detected_role, suggested_section, classification_reason)
+    If matches franchise keywords: franchise_candidate / folder_aliases
+    Else (no evidence): ambiguous / ignored_or_review with "Auto mode found no reliable group role evidence"
+    """
+    if not isinstance(group_info, dict):
+        return "ambiguous", "ignored_or_review", "invalid group data"
+
+    clues = set()
+    def add_clue(n):
+        if n:
+            clues.add(str(n).lower().strip())
+
+    add_clue(group_info.get("name"))
+    for a in (group_info.get("aliases") or []):
+        add_clue(a)
+
+    fran_kws = ["franchise", "franchises", "series", "game", "games", "source", "sources", "universe", "studio", "studios"]
+
+    matched = False
+    for cl in clues:
+        if any(kw in cl for kw in fran_kws):
+            matched = True
+            break
+
+    if matched:
+        return "franchise_candidate", "folder_aliases", f"group name/alias matches franchise-like keywords (clues: {sorted(clues)})"
+
+    return "ambiguous", "ignored_or_review", "Auto mode found no reliable group role evidence"
+
+
 def build_stash_import_preview(
     stash_data: dict,
     local_artist_aliases: dict,
@@ -1138,15 +1171,18 @@ def build_stash_import_preview(
     # Track dups within this stash preview (per suggested section) - Phase 4b.6 add ignored
     seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set(), "ignored_or_review": set()}
 
-    def _make_item(source: str, original: str, suggested: str, note: str = "", detected_role: str = None, classification_reason: str = ""):
+    def _make_item(source: str, original: str, suggested: str, note: str = "", detected_role: str = None, classification_reason: str = "", forced_status: str = None):
         nk = normalize_stash_name(original)
         if not nk:
             return
-        status = "missing_local"
-        if _already_exists(nk, suggested):
-            status = "already_exists_local"
-        if nk in seen.get(suggested, set()):
-            status = "possible_duplicate"
+        if forced_status is not None:
+            status = forced_status
+        else:
+            status = "missing_local"
+            if _already_exists(nk, suggested):
+                status = "already_exists_local"
+            if nk in seen.get(suggested, set()):
+                status = "possible_duplicate"
         seen.setdefault(suggested, set()).add(nk)
 
         if detected_role is None:
@@ -1199,11 +1235,11 @@ def build_stash_import_preview(
             role = "ignored_or_review"
             sugg = "ignored_or_review"
             reason = "User configured Stash Groups as review-only"
+            _make_item("stash_group", orig, sugg, "", role, reason, forced_status="ignored_or_review")
+            continue
         else:
-            # auto: default to franchise (current behavior); could enhance with name heuristics later
-            role = "franchise_candidate"
-            sugg = "folder_aliases"
-            reason = "Stash group (auto)"
+            # auto: use evidence from name/aliases; if none, ambiguous (not blindly franchise)
+            role, sugg, reason = classify_stash_group(g)
         _make_item("stash_group", orig, sugg, "", role, reason)
 
     # Tags: classify using rich data
@@ -3193,7 +3229,21 @@ class OrganizerGUI:
                 group_role_cb = ttk.Combobox(group_frm, textvariable=group_role_var, width=22, state="readonly",
                                              values=["auto", "franchises", "rule34_artists", "ignore_review"])
                 group_role_cb.pack(side="left", padx=4)
-                ttk.Label(group_frm, text="(auto = current default to franchises; requires Reload Preview)").pack(side="left", padx=4)
+
+                group_status_lbl = ttk.Label(group_frm, text="", foreground="orange")
+                group_status_lbl.pack(side="left", padx=4)
+
+                # Required note per spec near the dropdown
+                group_note = ttk.Label(parent_frame, text="Auto mode will not assume groups are franchises unless classification evidence exists. If your Stash groups are Rule34 artists, select Rule34 artists and reload preview.", wraplength=600, foreground="gray")
+                group_note.pack(anchor="w", pady=2)
+
+                def _on_group_role_change(*_):
+                    if getattr(self, '_stash_preview_items', None):
+                        group_status_lbl.config(text="Group treatment changed. Click Load Preview or Reclassify Current Preview to update classifications.", foreground="orange")
+                    else:
+                        group_status_lbl.config(text="")
+
+                group_role_var.trace_add("write", _on_group_role_change)
 
                 # Filters
                 filter_frm = ttk.Frame(parent_frame)
@@ -3326,6 +3376,7 @@ class OrganizerGUI:
                             else:
                                 status_lbl.config(text=f"Partial/failed. Errors: {'; '.join(raw.get('errors',[])[:2])} (see debug panel for per-category status)", foreground="orange")
                         _update_debug(raw)
+                        self._last_raw = raw  # store for reclassify without re-query
                         # Build using CURRENT in-memory local edit dicts (so pending local edits in manager are reflected if user added before opening preview)
                         preview = build_stash_import_preview(
                             raw,
@@ -3342,6 +3393,7 @@ class OrganizerGUI:
                         self._last_stash_key_supplied = bool(key)
                         _update_counts_from_preview(preview)
                         _repop_stash_preview()
+                        group_status_lbl.config(text="")  # clear any change warning
                         errs = preview.get("errors") or raw.get("errors", [])
                         if errs:
                             status_lbl.config(text=status_lbl.cget("text") + " | Some queries had errors (see list or export).")
@@ -3349,6 +3401,31 @@ class OrganizerGUI:
                         status_lbl.config(text=f"Error during load: {ex}", foreground="red")
                         self._stash_preview_items = []
                         _repop_stash_preview()
+
+                def _reclassify_current_preview():
+                    """Rebuild classifications from last loaded Stash data using current group treatment, without re-querying Stash."""
+                    if not hasattr(self, '_last_raw') or not self._last_raw:
+                        status_lbl.config(text="No previous Stash data loaded to reclassify. Use Load Preview first.", foreground="red")
+                        return
+                    try:
+                        raw = self._last_raw
+                        preview = build_stash_import_preview(
+                            raw,
+                            getattr(self, "_edit_artist_aliases", {}),
+                            getattr(self, "_edit_folder_aliases", {}),
+                            getattr(self, "_edit_character_mappings", {}),
+                            getattr(self, "_edit_canonical_character_aliases", {}),
+                            getattr(self, "_edit_learned_mappings", {}),
+                            group_role_override=group_role_var.get(),
+                        )
+                        self._stash_preview_items = preview.get("items", [])
+                        self._last_stash_preview = preview
+                        _update_counts_from_preview(preview)
+                        _repop_stash_preview()
+                        group_status_lbl.config(text="")  # clear warning after reclass
+                        status_lbl.config(text="Reclassified current preview with updated group treatment (no Stash re-query).", foreground="green")
+                    except Exception as ex:
+                        status_lbl.config(text=f"Reclassify error: {ex}", foreground="red")
 
                 def _test_connection():
                     ep = url_var.get().strip()
@@ -3398,6 +3475,7 @@ class OrganizerGUI:
                 ttk.Button(btn_frm, text="Test Connection (read-only)", command=_test_connection).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Load Preview (live Stash)", command=lambda: _load_stash_preview(use_sample=False)).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Load Sample Data (no Stash needed)", command=lambda: _load_stash_preview(use_sample=True)).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Reclassify Current Preview (no Stash re-query)", command=_reclassify_current_preview).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Export Preview Report", command=_export_preview_report).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Clear Preview", command=lambda: (setattr(self, "_stash_preview_items", []), preview_lst.delete(0, "end"), status_lbl.config(text="Cleared."))).pack(side="left", padx=2)
 
