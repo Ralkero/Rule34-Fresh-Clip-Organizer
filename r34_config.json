@@ -4,6 +4,7 @@
   "ffprobe_path": "ffprobe",
   "review_folder_name": "_r34_review",
   "content_review_folder_name": "_r34_content_review",
+  "silent_animations_folder_name": "_r34_silent",
   "confidence_threshold": 0.9,
   "allow_create_destination_folders": true,
   "artist_aliases": {
@@ -155,7 +156,15 @@
     "yuna": "Final Fantasy",
     "yoruichi": "Bleach",
     "yoruichi shihoin": "Bleach",
-    "yorha": "Nier Automata"
+    "yorha": "Nier Automata",
+    "power": "Final Fantasy",
+    "power cowgirl": "Final Fantasy",
+    "marin": "Final Fantasy",
+    "marin cowgirl": "Final Fantasy",
+    "juno": "Overwatch",
+    "juno teo minh": "Overwatch",
+    "honoka": "Dead or Alive",
+    "commander white": "Nier Automata"
   },
   "canonical_character_aliases": {
     "2b": "2B",

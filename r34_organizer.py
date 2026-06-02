@@ -25,7 +25,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 VERSION = "0.3.0"
@@ -134,6 +134,7 @@ class Config:
     ffprobe_path: str
     review_folder_name: str
     content_review_folder_name: str
+    silent_animations_folder_name: str
     confidence_threshold: float
     allow_create_destination_folders: bool
     artist_aliases: Dict[str, str]
@@ -156,6 +157,9 @@ class Config:
     original_character_subfoldering: bool
     learned_franchises_file: str
     extract_embedded_titles: bool
+    # New: when packs contain both individual "Cam X" angles and an "All Angles" compilation,
+    # quarantine the individual cams to this subfolder inside the source (keep only All Angles for processing).
+    angle_variants_folder_name: str
 
 @dataclass
 class NamingStyle:
@@ -258,12 +262,13 @@ def load_config(path: Path) -> Config:
     for alias_norm in character_mappings:
         canonical_character_aliases.setdefault(alias_norm, title_case_words(alias_norm, preserve_tokens))
 
-    return Config(
+    cfg = Config(
         destination_root=Path(raw["destination_root"]),
         video_extensions=tuple(ext.lower() for ext in raw.get("video_extensions", [".mp4"])),
         ffprobe_path=str(raw.get("ffprobe_path", "ffprobe")),
         review_folder_name=str(raw.get("review_folder_name", "_r34_review")),
         content_review_folder_name=str(raw.get("content_review_folder_name", "_r34_content_review")),
+        silent_animations_folder_name=str(raw.get("silent_animations_folder_name", "_r34_silent")),
         confidence_threshold=float(raw.get("confidence_threshold", 0.9)),
         allow_create_destination_folders=bool(raw.get("allow_create_destination_folders", False)),
         artist_aliases={normalize(k): v for k, v in raw.get("artist_aliases", {}).items()},
@@ -287,7 +292,13 @@ def load_config(path: Path) -> Config:
         original_character_subfoldering=bool(raw.get("original_character_subfoldering", False)),
         learned_franchises_file=str(raw.get("learned_franchises_file", "learned_character_franchises.json")),
         extract_embedded_titles=bool(raw.get("extract_embedded_titles", False)),
+        angle_variants_folder_name=str(raw.get("angle_variants_folder_name", "_r34_angle_variants")),
     )
+    # Attach the path the config was loaded from so key loading and other path-relative
+    # features (like r34_xai_key.txt) can resolve correctly relative to the user's chosen config,
+    # even when the organizer script is launched from a different directory (as the GUI does).
+    object.__setattr__(cfg, "_loaded_config_path", path)
+    return cfg
 
 
 def default_config_path() -> Path:
@@ -406,12 +417,20 @@ def run_id() -> str:
 
 
 def is_under_review_dir(path: Path, config: Config) -> bool:
-    review_folders = {config.review_folder_name, config.content_review_folder_name}
+    review_folders = {
+        config.review_folder_name,
+        config.content_review_folder_name,
+        getattr(config, "silent_animations_folder_name", "_r34_silent"),
+    }
     return any(part in review_folders for part in path.parts)
 
 
-def discover_videos(source: Path, config: Config) -> List[Path]:
+def discover_videos(source: Path, config: Config, show_progress: bool = False) -> List[Path]:
+    """Recursively find video files, optionally showing a simple progress counter."""
     files: List[Path] = []
+    count = 0
+    last_print = 0
+
     for path in source.rglob("*"):
         if not path.is_file():
             continue
@@ -419,6 +438,16 @@ def discover_videos(source: Path, config: Config) -> List[Path]:
             continue
         if path.suffix.lower() in config.video_extensions:
             files.append(path)
+            count += 1
+
+            if show_progress and count % 50 == 0:
+                print(f"\r  Scanning... found {count} videos so far", end="", flush=True)
+                last_print = count
+
+    if show_progress and count != last_print:
+        print(f"\r  Scanning... found {count} videos so far", end="", flush=True)
+        print()  # finish the line
+
     return sorted(files, key=lambda p: str(p).lower())
 
 
@@ -836,7 +865,11 @@ def split_artist_and_title(stem: str, source: Path, config: Config, reference: R
             artist = canonical_artist(raw_artist, config, reference)
             return artist, parts[1].strip(), 0.98, "artist_from_filename"
 
-    return source_artist, stem, source_confidence, source_reason
+    # Final fallback: the stem still contains the artist (common with space-separated
+    # collector names like "MEGAERA 2025 Elf BJ..."). Strip it here so inference
+    # and clean_title don't treat the artist token as part of a character name.
+    title_for_return = strip_leading_artist_tokens(stem, source_artist)
+    return source_artist, title_for_return or stem, source_confidence, source_reason
 
 
 def canonical_artist(raw_artist: str, config: Config, reference: ReferenceData) -> str:
@@ -848,21 +881,227 @@ def canonical_artist(raw_artist: str, config: Config, reference: ReferenceData) 
 
 def remove_resolution_text(text: str) -> str:
     value = text
-    value = re.sub(r"(?i)(?<![A-Za-z0-9])(?:480|720|1080|1440|2160|4320)\s*p\s*(?:30|60)?\s*fps\b", " ", value)
-    value = re.sub(r"(?i)(?<![A-Za-z0-9])[48]\s*k\s*(?:30|60)?\s*fps\b", " ", value)
-    value = re.sub(r"(?i)\b(?:30|60)\s*fps\b", " ", value)
-    value = re.sub(r"(?i)\b(?:full\s*hd|uhd)\b", " ", value)
+
+    # Very aggressive FPS removal - handles attached cases like "Nude60fps", "4K60", "Blowjob120fps"
+    # 1. FPS with optional preceding number, possibly attached to previous word
+    value = re.sub(r"(?i)(?<=[A-Za-z0-9])(?:30|60|120|144|240)?fps\b", " ", value)
+    value = re.sub(r"(?i)\b(?:30|60|120|144|240)?fps\b", " ", value)
+
+    # 2. Resolution + optional FPS (handles "1080p60", "4k60fps", "1440 60 fps")
+    value = re.sub(r"(?i)(?:480|720|1080|1440|2160|4320)\s*p?\s*(?:30|60|120)?\s*fps?\b", " ", value)
+    value = re.sub(r"(?i)[48]\s*k\s*(?:30|60|120)?\s*fps?\b", " ", value)
+
+    # 3. Standalone fps mentions
+    value = re.sub(r"(?i)\b(?:30|60|120|144|240)\s*fps?\b", " ", value)
+
+    # 4. Other common video meta
+    value = re.sub(r"(?i)\b(?:full\s*hd|uhd)\s*(?:30|60)?\s*fps?\b", " ", value)
+
+    # Remove standalone resolution mentions (keep only for the final [1080P] tag)
     value = re.sub(r"(?i)(?<![A-Za-z0-9])(?:480|720|1080|1440|2160|4320)\s*p\b", " ", value)
     value = re.sub(r"(?i)(?<![A-Za-z0-9])[48]\s*k\b", " ", value)
-    value = re.sub(r"\[[^\]]*(?:\d{3,4}\s*p|[48]\s*k|hd|uhd)[^\]]*\]", " ", value, flags=re.I)
-    value = re.sub(r"\([^\)]*(?:\d{3,4}\s*p|[48]\s*k|hd|uhd)[^\)]*\)", " ", value, flags=re.I)
+    value = re.sub(r"(?i)\b(?:full\s*hd|uhd)\b", " ", value)
+
+    # Remove any remaining resolution/FPS info inside brackets or parentheses
+    value = re.sub(r"\[[^\]]*(?:\d{3,4}\s*p?|[48]\s*k|fps|hd|uhd)[^\]]*\]", " ", value, flags=re.I)
+    value = re.sub(r"\([^\)]*(?:\d{3,4}\s*p?|[48]\s*k|fps|hd|uhd)[^\)]*\)", " ", value, flags=re.I)
+
+    # Final aggressive pass: remove common FPS framerates that often remain as orphaned numbers
+    # (e.g. "Nude 60", "Blowjob 4K 60", "[60]", "Title 120")
+    value = re.sub(r"(?i)(?<=[pPkK])\s*(?:30|60|120|144|240)\b", " ", value)
+    value = re.sub(r"(?i)\b(?:30|60|120|144|240)\b(?=\s*[\]\)])", " ", value)
+    value = re.sub(r"(?i)\b(?:30|60|120)\b(?=\s+(?:[A-Z]|\[|\(|\d))", " ", value)  # before capital letter or bracket
+
     return value
+
+
+def strip_dates_and_years(text: str) -> str:
+    """Remove years and date-like patterns from the descriptive title (not from artist prefixes)."""
+    value = text
+    # Standalone years
+    value = re.sub(r"\b(?:19|20)\d{2}\b", " ", value)
+
+    # Collector-style compact dates and common date formats in title context
+    value = re.sub(r"\b(?:19|20)?\d{2}[-_.]?\d{1,2}[-_.]?\d{1,2}\b", " ", value)
+    value = re.sub(r"\b\d{6,8}\b", " ", value)  # e.g. 210704
+
+    # Dates inside brackets/parentheses
+    value = re.sub(r"\[[^\]]*?(?:19|20)\d{2}[^\]]*\]", " ", value, flags=re.I)
+    value = re.sub(r"\([^\)]*?(?:19|20)\d{2}[^\)]*\)", " ", value, flags=re.I)
+
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def strip_leading_artist_tokens(title: str, artist: str) -> str:
+    """Aggressively remove the (already extracted) artist name and common year prefixes
+    from the *title* portion. This fixes cases like "MEGAERA 2025 Elf BJ Nude..." where
+    the artist token remains in the stem because there was no nice " - " separator.
+    Prevents inference from turning "MEGAERA Elf" into a bogus "Megaera Elf" character.
+    """
+    if not title or not artist:
+        return title
+    value = title
+    # Remove the exact artist (case-insensitive whole word)
+    value = re.sub(r"\b" + re.escape(artist) + r"\b", " ", value, flags=re.I)
+    # Common variants the collector might use (MEGAERA, Megaera, etc. already covered above)
+    # Also strip years that often follow the artist in these packs
+    value = re.sub(r"\b(19|20)\d{2}\b", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" -_.,;")
+    return value
+
+
+def clean_position_descriptors(title: str) -> str:
+    """
+    After a sex position word (doggy, missionary, etc.), keep only the first following number
+    as a variant indicator. Remove extra numbers and common artifacts like 'Cam'.
+    """
+    if not title:
+        return title
+
+    # Common sex position words
+    position_words = r"(?i)\b(?:doggy|missionary|cowgirl|reverse.?cowgirl|blowjob|anal|creampie|facial|69|spoon|prone|standing|doggystyle)\b"
+
+    value = title
+
+    # Find position words and clean what follows
+    def _clean_after_position(match):
+        pos = match.group(0)
+        rest = title[match.end():].strip()
+
+        # Take only the first number as variant (e.g. "2" in "Doggy 2")
+        variant_match = re.match(r"^(\d+)", rest)
+        variant = f" {variant_match.group(1)}" if variant_match else ""
+
+        # Remove everything after the variant until we hit something that looks like real title or end
+        # Remove Cam tags, extra numbers, etc.
+        cleaned_rest = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d*|\d+)\b.*$", "", rest, count=1)
+
+        return pos + variant + cleaned_rest
+
+    value = re.sub(position_words, _clean_after_position, value)
+
+    # Final aggressive removal of any remaining "Cam" tags and standalone numeric sequences at the end
+    value = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d+)\b.*$", "", value)
+
+    value = re.sub(r"\s+", " ", value).strip(" -_.,;")
+    return value
+
+
+def strip_known_franchises_from_title(title: str, reference: ReferenceData, target_folder: str = "", config: Optional[Config] = None) -> str:
+    """Remove known franchise/folder names from the descriptive title part."""
+    if not title:
+        return title
+    value = title
+
+    folders_to_strip = set()
+
+    if target_folder:
+        folders_to_strip.add(target_folder)
+
+    if reference and reference.destination_folders:
+        folders_to_strip.update(reference.destination_folders.values())
+
+    if reference and reference.learned_franchises:
+        folders_to_strip.update(reference.learned_franchises.values())
+
+    # Also consider character_mappings values as possible franchise names
+    if config and config.character_mappings:
+        folders_to_strip.update(config.character_mappings.values())
+
+    for folder in folders_to_strip:
+        if folder:
+            pattern = r"(?i)\b" + re.escape(folder) + r"\b"
+            value = re.sub(pattern, " ", value)
+
+    value = re.sub(r"\s+", " ", value).strip(" -_.,;")
+    return value
+
+
+def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: int = 3) -> Tuple[str, List[str], float]:
+    """
+    Remove tokens from the title that appear very rarely (or never) in the existing library.
+    Returns (cleaned_title, list_of_removed_tokens, confidence_that_removals_were_correct).
+    High confidence → safe to auto-remove.
+    Lower confidence → should be flagged for human review.
+    """
+    if not title or not reference.token_precedent:
+        return title, [], 1.0
+
+    tokens = re.findall(r"[A-Za-z0-9]+", title)
+    if not tokens:
+        return title, [], 1.0
+
+    removed = []
+    kept = []
+
+    total_tokens_in_library = sum(sum(counts.values()) for counts in reference.token_precedent.values())
+
+    for token in tokens:
+        token_norm = normalize(token)
+        if len(token_norm) < 2:
+            kept.append(token)
+            continue
+
+        # Check how common this token is in the existing library
+        precedents = reference.token_precedent.get(token_norm, {})
+        occurrence = sum(precedents.values())
+
+        # Also check if it's a known artist
+        is_known_artist = token_norm in reference.artist_precedent
+
+        # Special pattern detection for "Cam #-#" and similar camera/multicam tags
+        cam_pattern = bool(re.match(r"^cam\s*\d+[-\s]?\d*$", token_norm, re.I))
+
+        # Detect numeric sequences that look like extra parameters (e.g. after positions)
+        numeric_junk = bool(re.match(r"^\d+[-\s]?\d*$", token_norm))
+
+        if is_known_artist or occurrence >= min_occurrence:
+            kept.append(token)
+            continue
+
+        # Calculate outlier score
+        if total_tokens_in_library > 0:
+            rarity = 1.0 - (occurrence / total_tokens_in_library)
+        else:
+            rarity = 1.0
+
+        # Strongly boost for common artifact patterns
+        if cam_pattern or numeric_junk:
+            rarity = min(1.0, rarity + 0.55)
+
+        if rarity >= 0.90:
+            # High confidence this is extra metadata not seen in the library
+            removed.append(token)
+        elif rarity >= 0.70 or cam_pattern or numeric_junk:
+            # Medium confidence - flag for review
+            kept.append(token)
+            removed.append(f"?{token}")
+        else:
+            kept.append(token)
+
+    cleaned = " ".join(kept).strip()
+    # Re-apply light cleanup
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,;")
+
+    # Compute overall confidence in the cleaning decisions
+    if not removed:
+        confidence = 1.0
+    else:
+        # Rough confidence based on how rare the removed items were
+        confidence = sum(0.95 if not t.startswith("?") else 0.6 for t in removed) / len(removed)
+
+    # Return actual removed tokens without the ? marker
+    real_removed = [t.lstrip("?") for t in removed]
+
+    return cleaned, real_removed, round(confidence, 2)
 
 
 def clean_title(raw_title: str, config: Config) -> str:
     value = raw_title
     value = value.replace("&", " and ")
     value = remove_resolution_text(value)
+    value = strip_dates_and_years(value)
     value = re.sub(r"(?i)\b(?:unwatermarked|unwatermarket|no\s*watermark|nowatermark)\b", " ", value)
     for junk in config.junk_tokens:
         if normalize(junk) in {"1080p", "720p", "1440p", "2160p", "4k", "8k", "uhd", "full hd"}:
@@ -949,6 +1188,15 @@ def recover_descriptive_title_from_stem(stem: str, artist: str, config: Config) 
 
     # Tokenize and pick the first non-trivial remaining word
     tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z0-9]*", value) if len(t) >= 3]
+
+    # Filter out obvious FPS / technical junk that might have survived
+    fps_like = re.compile(r"^(?:30|60|120|144|240)?fps?$", re.I)
+    tokens = [t for t in tokens if not fps_like.match(t)]
+
+    # Also drop standalone common framerates (60, 30, etc.) when they were likely FPS metadata
+    fps_numbers = {"30", "60", "120", "144", "240"}
+    tokens = [t for t in tokens if t not in fps_numbers]
+
     if tokens:
         # Prefer earlier tokens that look like simple descriptors (colors, nude, etc.)
         return title_case_words(tokens[0], config.preserve_tokens)
@@ -1017,6 +1265,48 @@ def probe_resolution(path: Path, ffprobe_path: str, extract_title: bool = False)
 
     reason = "" if (width and height) else "ffprobe_no_dimensions"
     return res_label, reason, embedded_title
+
+
+def has_audio_stream(path: Path, ffprobe_path: str) -> bool:
+    """Return True if the video file has at least one audio stream."""
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=codec_type",
+        "-of", "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        if proc.returncode != 0:
+            return False
+        data = json.loads(proc.stdout or "{}")
+        streams = data.get("streams", [])
+        return len(streams) > 0
+    except Exception:
+        # If probing fails, assume it has audio (safer than marking good files as silent)
+        return True
+
+
+def get_video_duration(path: Path, ffprobe_path: str) -> Optional[float]:
+    """Return duration in seconds using ffprobe, or None on any failure."""
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout or "{}")
+        dur_str = (data.get("format") or {}).get("duration")
+        return float(dur_str) if dur_str else None
+    except Exception:
+        return None
 
 
 def resolution_bucket(width: int, height: int) -> str:
@@ -1136,14 +1426,38 @@ def remove_duplicate_terminal_segment(title: str) -> str:
 
 
 def target_filename_for(artist: str, character_text: str, title: str, resolution: str, extension: str) -> str:
-    # Gracefully omit the title segment when it is empty (common after stripping
-    # audio credits from very minimal collector filenames like "... audiodude.mp4").
-    # Avoid duplicating artist/character when they are the same (e.g. Sinia case).
+    # Gracefully omit the title segment when it is empty.
+    # Prevent artist/character duplication inside the title segment.
     parts = [artist]
     if character_text and character_text != artist:
         parts.append(character_text)
-    if title and title.strip():
-        parts.append(title)
+
+    clean_title_part = title.strip() if title else ""
+
+    # Strip leading artist or character name from the title to avoid duplication
+    if clean_title_part:
+        artist_norm = normalize(artist)
+        char_norm = normalize(character_text) if character_text else ""
+        title_norm = normalize(clean_title_part)
+
+        for name_norm in [artist_norm, char_norm]:
+            if name_norm and title_norm.startswith(name_norm):
+                # Remove the leading name + following separator
+                clean_title_part = re.sub(r"^" + re.escape(name_norm) + r"[\s\-–—_.,:]+", "", clean_title_part, flags=re.I).strip()
+                title_norm = normalize(clean_title_part)
+
+    if clean_title_part:
+        # Final safety net: aggressively strip any remaining FPS or date junk from the title segment
+        clean_title_part = remove_resolution_text(clean_title_part)
+        clean_title_part = strip_dates_and_years(clean_title_part)
+
+        # Extra pass specifically for orphaned numerical FPS values (30/60/120 etc.)
+        clean_title_part = re.sub(r"(?i)\b(?:30|60|120|144|240)\b", " ", clean_title_part)
+
+        clean_title_part = clean_title_part.strip(" -_.,;")
+        if clean_title_part:
+            parts.append(clean_title_part)
+
     return safe_filename(" - ".join(parts) + f" [{resolution}]{extension.lower()}")
 
 
@@ -1293,6 +1607,67 @@ def infer_folder_from_artist(artist: str, artist_conf: float, config: Config, re
     return "", 0.0, ""
 
 
+def infer_folder_from_detected_characters(
+    character_text: str,
+    config: Config,
+    reference: ReferenceData,
+) -> Tuple[str, float, str]:
+    """Directly look up already-detected characters in mappings to find a franchise folder.
+
+    This is especially useful for generic titles (e.g. "Cowgirl Nude All Angles") where
+    classify_title() has little to work with, but we have strong character detections
+    from earlier in the pipeline.
+
+    Returns the strongest single franchise if one clearly dominates, otherwise ("", 0.0, "").
+    """
+    if not character_text:
+        return "", 0.0, ""
+
+    # Build the full set of mappings (config + learned)
+    all_mappings = dict(config.character_mappings)
+    if reference.learned_franchises:
+        for ck, f in reference.learned_franchises.items():
+            all_mappings.setdefault(ck, f)
+
+    if not all_mappings:
+        return "", 0.0, ""
+
+    detected = [c.strip() for c in character_text.split(",") if c.strip()]
+    if not detected:
+        return "", 0.0, ""
+
+    folder_scores: Dict[str, float] = {}
+    reasons: List[str] = []
+
+    for char in detected:
+        char_norm = normalize(char)
+        if char_norm in all_mappings:
+            folder = all_mappings[char_norm]
+            if folder_can_be_target(folder, config, reference):
+                score = 0.94
+                folder_scores[folder] = max(folder_scores.get(folder, 0), score)
+                reason = f"detected_character:{char_norm}->{folder}"
+                if not folder_exists(folder, reference):
+                    reason += ":create_folder"
+                reasons.append(reason)
+
+    if not folder_scores:
+        return "", 0.0, ""
+
+    # If multiple characters point to different folders, be conservative
+    if len(folder_scores) > 1:
+        # Only accept if one folder has significantly stronger support
+        sorted_folders = sorted(folder_scores.items(), key=lambda x: -x[1])
+        best_folder, best_score = sorted_folders[0]
+        second_score = sorted_folders[1][1] if len(sorted_folders) > 1 else 0
+        if best_score > second_score + 0.15:
+            return best_folder, best_score, ";".join(reasons[:3])
+        return "", 0.0, "multiple_character_franchises"
+
+    best_folder, best_score = next(iter(folder_scores.items()))
+    return best_folder, best_score, ";".join(reasons[:3])
+
+
 def get_xai_api_key(config: Config, config_path: Optional[Path] = None) -> str:
     """Resolve the xAI API key from environment or local key file.
 
@@ -1316,6 +1691,9 @@ def get_xai_api_key(config: Config, config_path: Optional[Path] = None) -> str:
     # 2. Local key file next to the actual config being used
     try:
         if config_path is None:
+            # Prefer the path the config was actually loaded from (set by load_config)
+            config_path = getattr(config, "_loaded_config_path", None)
+        if config_path is None:
             config_path = default_config_path()
 
         key_file = config_path.with_name("r34_xai_key.txt")
@@ -1334,19 +1712,21 @@ def query_grok_for_character_franchise(
     title: str,
     config: Config,
 ) -> Tuple[str, float, str]:
-    """Optional: Ask Grok (via xAI API) for clarification on an unknown character's franchise.
+    """Ask Grok (via xAI API) for clarification on a character's franchise.
 
-    This fulfills the request for AI-assisted classification when the script has
-    no strong local signal for where a newly inferred or unmatched character belongs.
-    - Requires XAI_API_KEY (or configured env var) in environment, or r34_xai_key.txt next to config.
+    Used aggressively for cases with good character detections but weak title-based
+    folder signals (very common with "All Angles" compilations under collector artists
+    like Megaera). We now trigger earlier and with a more tolerant validator.
+    - Requires XAI_API_KEY (or configured env var) + use_ai_for_unknown_characters=true.
     - Returns (suggested_folder, confidence, reason) or ("", 0.0, "") on failure.
-    - Never auto-applies high confidence; always surfaces as suggestion for CSV review.
-    - Uses a tight prompt for short, usable folder names.
     """
     import os
     import json as _json
 
-    api_key = get_xai_api_key(config)
+    # Pass the loaded config path so the key file next to the user's chosen config is found
+    # (critical when the GUI launches the script with --config pointing elsewhere).
+    loaded_path = getattr(config, "_loaded_config_path", None)
+    api_key = get_xai_api_key(config, config_path=loaded_path)
     if not config.use_ai_for_unknown_characters or not api_key:
         return "", 0.0, ""
 
@@ -1366,6 +1746,9 @@ def query_grok_for_character_franchise(
         "If it is an original or very obscure character with no clear franchise, reply exactly 'Original Character'. "
         "Do not explain, do not add punctuation, do not list alternatives."
     )
+
+    # Debug: Show what we are actually asking Grok (sanitized)
+    print(f"[Grok DEBUG] Prompt for '{character}':\n{prompt[:800]}{'...' if len(prompt) > 800 else ''}")
 
     url = "https://api.x.ai/v1/chat/completions"
     headers = {
@@ -1390,13 +1773,17 @@ def query_grok_for_character_franchise(
             return "", 0.0, f"ai_error:http_{resp.status_code}"
         data = resp.json()
         choice = (data.get("choices") or [{}])[0]
-        content = (choice.get("message") or {}).get("content", "").strip()
-        suggestion = _validate_grok_franchise_response(content)
+        raw_content = (choice.get("message") or {}).get("content", "").strip()
+
+        # Debug: Show the raw answer we got back from Grok
+        print(f"[Grok DEBUG] Raw response for '{character}': '{raw_content}'")
+
+        suggestion = _validate_grok_franchise_response(raw_content)
         reason_tag = "ai_grok_clarification"
-        if suggestion == "Original Character" and content and content.lower() not in {"original character"}:
+        if suggestion == "Original Character" and raw_content and raw_content.lower() not in {"original character"}:
             reason_tag = "ai_grok_fallback:invalid_response"
         if suggestion:
-            result = (suggestion, 0.78, f"{reason_tag}:{config.ai_model}")
+            result = (suggestion, 0.86, f"{reason_tag}:{config.ai_model}")
             query_grok_for_character_franchise._cache[cache_key] = result
             return result
     except Exception as e:
@@ -1406,25 +1793,25 @@ def query_grok_for_character_franchise(
 
 
 def _validate_grok_franchise_response(content: str) -> str:
-    """Strict validator for Grok responses.
+    """Validator for Grok responses (further relaxed for Megaera-style generic titles).
 
-    Rejects: empty, multiline, overlong, hedged language, punctuation, or
-    non-canonical replies. Safely falls back to 'Original Character' with
-    a tagged reason so the decision remains fully auditable.
+    We now accept more short, clean answers from Grok (including multi-word franchise names
+    and "Original Character") so they can actually drive the target_folder and make rows ready.
     """
     if not content:
         return "Original Character"
     c = content.strip()
-    if "\n" in c or len(c) > 60:
+    if "\n" in c or len(c) > 100:
         return "Original Character"
     low = c.lower()
-    if any(bad in low for bad in ["i think", "maybe", "perhaps", "could be", "not sure", "unknown"]):
+    if any(bad in low for bad in ["i think", "maybe", "perhaps", "could be", "not sure", "unknown", "probably", "i'm not sure"]):
         return "Original Character"
-    if any(p in c for p in ".,!?;:()[]\"'"):
+    # Only reject the most problematic punctuation; allow periods, commas, etc. for real names
+    if any(p in c for p in "?;()[]\"'"):
         return "Original Character"
-    if len(c.split()) > 4:
+    if len(c.split()) > 8:
         return "Original Character"
-    # Accept clean short names
+    # Accept clean short names (strip trailing junk)
     return c.strip(" .,'\"")
 
 
@@ -1457,13 +1844,146 @@ def unique_plan_paths(output_dir: Path, run: str) -> Tuple[Path, Path]:
     return output_dir / f"r34_preview_{run}.csv", output_dir / f"r34_preview_{run}.md"
 
 
+def deduplicate_target_filenames(rows: List[Dict[str, str]]) -> None:
+    """Ensure every row gets a unique target_filename within this preview batch
+    (and after manual edits in the Correction Tool) using the user's preferred
+    numeric variant style instead of lazy "(N)" suffixes.
+
+    Behavior:
+    - Files whose cleaned names are identical are deduped by incrementing in
+      the title descriptor slot (the token right before [RES]).
+    - If the shared cleaned name already ends with a number (e.g. "... 1 [1080P]"),
+      dups continue that sequence: first keeps "... 1", second becomes "... 2", etc.
+      (Exactly: "Megaera - 2B - 1 [1080P].mp4" dup -> "... 2 [1080P].mp4")
+    - If plain (e.g. "... Nude [1080P]" or "... Doggy [4K]"), first keeps the
+      plain form, subsequent get " Nude 2", " Nude 3", ... or " Doggy 2" ... "Doggy 10".
+    - A global second pass ensures that bumps never collide with other proposed
+      names in the batch (e.g. a "BJ 1" dup bumping into an existing "BJ 2").
+    - Never produces "(2)", "(3)", or any parenthesized suffix. Always uses the
+      clean " <number>" style that matches the collector's own numbering.
+
+    Mutates rows in-place and keeps target_path in sync.
+    """
+    from collections import defaultdict
+    import re
+
+    def _parse(fname: str):
+        """Return (base, variant:int|None, res_tag, ext) or None."""
+        if not fname:
+            return None
+        m = re.match(
+            r"^(?P<base>.*?)(?:\s+(?P<var>\d+))?\s*(?P<res>\[[^\]]+\])(?P<ext>\.[^.]+)$",
+            fname,
+        )
+        if not m:
+            return None
+        base = (m.group("base") or "").strip()
+        var = int(m.group("var")) if m.group("var") else None
+        return base, var, m.group("res"), m.group("ext")
+
+    def _format(base: str, var: Optional[int], res: str, ext: str) -> str:
+        if var is not None:
+            return f"{base} {var} {res}{ext}"
+        return f"{base}{res}{ext}"
+
+    # Phase 1: per original-collision-group bump (first claimant in scan order keeps its name)
+    filename_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        fname = row.get("target_filename", "").strip()
+        if fname:
+            filename_groups[fname].append(row)
+
+    for fname, group in filename_groups.items():
+        if len(group) <= 1:
+            continue
+
+        parsed = _parse(fname)
+        if not parsed:
+            # Robust fallback: locate res+ext and insert number before it (no parens ever)
+            m = re.search(r"(\[[^\]]+\])(\.[^.]+)$", fname)
+            if m:
+                res, ext = m.groups()
+                pre = fname[: m.start()].rstrip()
+                for i, row in enumerate(group[1:], start=2):
+                    new_name = f"{pre} {i} {res}{ext}"
+                    row["target_filename"] = new_name
+                    if row.get("target_path"):
+                        row["target_path"] = str(Path(row["target_path"]).with_name(new_name))
+            else:
+                # Last-ditch: append _N before ext, still no ()
+                p = Path(fname)
+                for i, row in enumerate(group[1:], start=2):
+                    new_name = f"{p.stem}_{i}{p.suffix}"
+                    row["target_filename"] = new_name
+                    if row.get("target_path"):
+                        row["target_path"] = str(Path(row["target_path"]).with_name(new_name))
+            continue
+
+        base, existing_var, res, ext = parsed
+        start_num = existing_var if existing_var is not None else 1
+
+        for i, row in enumerate(group[1:], start=1):
+            variant_num = start_num + i
+            new_fname = _format(base, variant_num, res, ext)
+            row["target_filename"] = new_fname
+            if row.get("target_path"):
+                p = Path(row["target_path"])
+                row["target_path"] = str(p.with_name(new_fname))
+
+    # Phase 2: global uniqueness sweep (catches any cross-group collisions created by bumps)
+    seen: Dict[str, int] = {}
+    for row in rows:
+        fname = row.get("target_filename", "").strip()
+        if not fname:
+            continue
+        if fname not in seen:
+            seen[fname] = 1
+            continue
+        # Need to bump this one
+        parsed = _parse(fname)
+        if not parsed:
+            p = Path(fname)
+            k = 2
+            candidate = f"{p.stem} {k}{p.suffix}"
+            while candidate in seen:
+                k += 1
+                candidate = f"{p.stem} {k}{p.suffix}"
+
+            row["target_filename"] = candidate
+            if row.get("target_path"):
+                row["target_path"] = str(Path(row["target_path"]).with_name(candidate))
+            seen[candidate] = 1
+            continue
+
+        base, var, res, ext = parsed
+        k = (var or 1) + 1
+        candidate = _format(base, k, res, ext)
+        while candidate in seen:
+            k += 1
+            candidate = _format(base, k, res, ext)
+        row["target_filename"] = candidate
+        if row.get("target_path"):
+            row["target_path"] = str(Path(row["target_path"]).with_name(candidate))
+        seen[candidate] = 1
+
+
 def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceData) -> Dict[str, str]:
     original_name = path.name
     stem = strip_leading_index(path.stem)
     artist, raw_title, artist_conf, artist_reason = split_artist_and_title(stem, source, config, reference)
+    raw_title = strip_leading_artist_tokens(raw_title, artist)
     full_title = clean_title(raw_title, config)
     content_review_matches = detect_content_review((original_name, stem, raw_title, full_title), config)
+    is_silent = not has_audio_stream(path, config.ffprobe_path)
     character_detection = detect_characters(full_title, reference)
+
+    # Define once early: is this a "collector" / generic artist (high-confidence folder-based
+    # extraction or names like Megaera)? Used to make both character-folder and Grok/OC
+    # logic more aggressive for exactly the cases the user is fighting.
+    is_collector_artist = (
+        artist_conf >= 0.75 and
+        ("filename" in artist_reason or "compact_date" in artist_reason or "source" in artist_reason.lower())
+    ) or any(x in (artist or "").lower() for x in ["megaera", "nsfwmegaera", "collector"])
 
     # When no known character matched, infer a plausible new one from the title,
     # use the detected name as-is, and add it to the live reference so the
@@ -1504,6 +2024,16 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     character_text = ", ".join(character_detection.characters)
     title = strip_detected_characters_from_title(full_title, character_detection)
 
+    # Apply additional meta stripping (FPS, dates/years) to the final title segment
+    # so that only the resolution tag remains as technical meta-info in the filename.
+    title = remove_resolution_text(title)
+    title = strip_dates_and_years(title)
+
+    # Extra pass for numerical FPS values
+    title = re.sub(r"(?i)\b(?:30|60|120|144|240)\b", " ", title)
+
+    title = title.strip(" -_.,;")
+
     # Normalize empty/"Untitled" titles (can happen for minimal collector files whose
     # only descriptive token was a stripped audio credit). target_filename_for will
     # omit the title segment cleanly.
@@ -1516,11 +2046,32 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     if not title:
         recovered = recover_descriptive_title_from_stem(stem, artist, config)
         if recovered:
-            title = recovered
+            # Apply the same meta stripping to recovered titles so FPS/dates don't leak back in
+            recovered = remove_resolution_text(recovered)
+            recovered = strip_dates_and_years(recovered)
+            title = recovered.strip(" -_.,;")
+
+    # Clean sex position descriptors + trailing artifacts (e.g. "Doggy 2 1 Cam 3")
+    title = clean_position_descriptors(title)
+
+    # Detect outlier / extra parameters using the existing library as reference
+    # (must happen after all title cleaning so we evaluate the final proposed title)
+    outlier_removed = []
+    outlier_conf = 1.0
+    if reference and title:
+        title, outlier_removed, outlier_conf = strip_outlier_tokens(title, reference)
 
     extract_title = getattr(config, "extract_embedded_titles", False)
     resolution, probe_reason, embedded_title = probe_resolution(path, config.ffprobe_path, extract_title=extract_title)
     resolution = format_resolution_label(resolution, reference)
+
+    # Early base confidence components (hoisted so they are always defined before
+    # any conditional RowConfidence creations in the collector-artist / Grok / fallback paths).
+    char_conf = character_detection.confidence if character_detection.characters else 0.0
+    title_conf = 0.85 if title and title.strip() else 0.40
+    res_conf = 0.95 if resolution else 0.60
+    franchise_conf = 0.0   # will be updated whenever we set/adjust target_folder
+    confidence = 0.0       # base value; will be properly computed later or via max() in early blocks
 
     # Use embedded title only for sparse titles after basic sanity
     if extract_title and embedded_title and (not title or len(title.strip()) < 3):
@@ -1542,6 +2093,27 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             folder_conf = artist_fconf
             folder_reason = artist_freason
 
+    # Direct character-driven folder lookup (new high-ROI path for generic titles).
+    # Once we have solid character detections, look them up directly in mappings
+    # even if the cleaned title is very generic ("Cowgirl Nude", "Doggy Outfit 1", etc.).
+    # This is the main fix for Megaera-style "All Angles" packs.
+    #
+    char_lookup_threshold = 0.70 if is_collector_artist else 0.80
+
+    if not target_folder or folder_conf < char_lookup_threshold:
+        char_folder, char_fconf, char_freason = infer_folder_from_detected_characters(
+            character_text, config, reference
+        )
+        if char_folder:
+            # For collector artists, be willing to use the character franchise even with moderate confidence.
+            min_char_score = 0.82 if is_collector_artist else 0.88
+            if char_fconf > folder_conf and char_fconf >= min_char_score:
+                target_folder = char_folder
+                folder_conf = max(folder_conf, char_fconf)
+                folder_reason = char_freason
+                if is_collector_artist:
+                    print(f"[Character Folder] Using direct mapping for collector artist '{artist}': {char_folder}")
+
     # AI-assisted franchise clarification (Grok) for cases where we have a strong
     # artist from filename prefix (common in collector dumps) or a character,
     # but still no confident target folder.
@@ -1551,7 +2123,9 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         ("filename" in artist_reason or "compact_date" in artist_reason)
     )
 
-    if (not target_folder or folder_conf < 0.70) and (character_text or has_good_artist_from_filename):
+    if (not target_folder or folder_conf < 0.85) and (character_text or has_good_artist_from_filename):
+        # Be more aggressive about calling Grok for Megaera-style artists with detected
+        # characters but weak folder signals (the most common remaining failure mode).
         name_for_ai = character_text or artist
         title_for_ai = full_title or raw_title
 
@@ -1566,8 +2140,12 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             # Always use AI result for these low-info cases — this is how we
             # effectively use the info from Grok calls to produce target names.
             target_folder = ai_folder
-            folder_conf = max(folder_conf, ai_conf, 0.80)
+            # Stronger boost so clean Grok answers (franchise or "Original Character")
+            # more easily make the row ready for generic collector titles.
+            folder_conf = max(folder_conf, ai_conf, 0.88)
             folder_reason = ai_reason
+            if is_collector_artist:
+                print(f"[Grok] Accepted for collector artist '{artist}': {ai_folder} (conf {ai_conf})")
 
             # If we used the artist name for the AI query and have no separate character,
             # populate character so the filename includes it (e.g. Sinia - Sinia).
@@ -1576,6 +2154,29 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
                 character_detection = CharacterDetection(
                     (artist,), 0.70, "artist_used_as_character_for_ai", (artist.lower(),)
                 )
+
+    # Enhanced collector artist handling for "Original Character" cases.
+    # For artists like Megaera (collector/generic style), when we have a real detected
+    # character (from Grok returning "Original Character" or from earlier detection),
+    # create a usable target under "Original Character / <Artist>" with solid confidence.
+    # This directly addresses the long/generic "All Angles" titles that were falling to unmatched.
+    if is_collector_artist and character_text and (not target_folder or target_folder == "Original Character"):
+        # Use the first (primary) detected character as the key under OC/Artist
+        primary_char = character_text.split(",")[0].strip() if character_text else artist
+        if primary_char and primary_char.lower() != artist.lower():
+            target_folder = f"Original Character / {artist}"
+            franchise_conf = 0.78
+            folder_reason = "collector_artist_original_character"
+            # Rebuild character_detection to include the primary char so target_filename_for works nicely
+            if primary_char not in [c.strip() for c in character_text.split(",")]:
+                # Already have it from earlier detection in most cases
+                pass
+            row_conf = RowConfidence(
+                artist=artist_conf, character=char_conf, franchise=franchise_conf,
+                title=title_conf, resolution=res_conf
+            )
+            confidence = max(confidence, row_conf.final())
+            print(f"[Collector OC] Using '{target_folder}' for detected character '{primary_char}' under collector artist '{artist}'")
 
     if (
         "filename_prefix_preserved" in artist_reason
@@ -1594,10 +2195,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     if content_review_matches:
         reasons.append("content_review:" + "|".join(content_review_matches[:8]))
 
-    # Build structured confidence instead of simple min collapse.
-    char_conf = character_detection.confidence if character_detection.characters else 0.0
-    title_conf = 0.85 if title and title.strip() else 0.40  # sparse titles penalized but not killed
-    res_conf = 0.95 if resolution else 0.60
+    # Update franchise confidence now that target_folder decisions are final.
     franchise_conf = folder_conf if target_folder else 0.0
 
     row_conf = RowConfidence(
@@ -1617,7 +2215,9 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             title=title_conf, resolution=res_conf
         )
     if target_folder and "ai_grok" in folder_reason:
-        confidence = max(confidence, min(0.90, artist_conf, 0.82))
+        # Much stronger boost for Grok results so they can push generic-title rows over the
+        # confidence threshold and produce ready target filenames.
+        confidence = max(confidence, min(0.93, artist_conf, 0.88))
 
     # Strong final fallback for high-confidence "artist from filename prefix" cases
     if not target_folder:
@@ -1645,6 +2245,23 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         status = "content_review"
         approved = "no"
         notes = "Held for content review: " + ", ".join(content_review_matches[:8])
+    elif is_silent:
+        status = "silent"
+        approved = "no"
+        notes = "Silent animation (no audio stream detected)"
+    elif outlier_removed:
+        # Some tokens looked like extra parameters not seen in the user's existing library
+        real_outliers = [t for t in outlier_removed if not t.startswith("?")]
+        review_outliers = [t.lstrip("?") for t in outlier_removed if t.startswith("?")]
+
+        if review_outliers:
+            status = "review"
+            approved = "no"
+            notes = f"Review: possible extra parameters: {', '.join(review_outliers)} (low confidence removal)"
+        elif real_outliers:
+            # High confidence - we already removed them from the title
+            if not notes:
+                notes = f"Removed outlier tokens: {', '.join(real_outliers)}"
     elif not target_folder:
         notes = "Review: no destination folder confidently matched."
     elif "artist_mapping" in folder_reason and artist_conf >= 0.85:
@@ -1663,6 +2280,10 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         notes = "Review: ffprobe could not determine resolution."
     elif artist_conf < config.confidence_threshold:
         notes = "Review: artist inference is low confidence."
+
+    # Strip known franchise/folder names from the title (they belong in the folder, not the filename)
+    if target_folder or reference:
+        title = strip_known_franchises_from_title(title, reference, target_folder, config)
 
     target_filename = ""
     target_path = ""
@@ -1740,6 +2361,7 @@ def write_preview_summary(
     destination_root: Path,
     rows: Sequence[Dict[str, str]],
     reference: ReferenceData,
+    angle_quarantine_report: Optional[Dict[str, Any]] = None,
 ) -> None:
     total = len(rows)
     ready = sum(1 for row in rows if row["status"] == "ready")
@@ -1767,6 +2389,25 @@ def write_preview_summary(
     ]
     for folder, count in sorted(by_folder.items(), key=lambda item: (-item[1], item[0])):
         lines.append(f"- {folder}: {count}")
+
+    # Angle pack quarantine section (if any activity happened)
+    if angle_quarantine_report and (angle_quarantine_report.get("quarantined_count", 0) > 0 or angle_quarantine_report.get("rejected")):
+        lines.extend(["", "## Angle Pack Quarantine", ""])
+        qcount = angle_quarantine_report.get("quarantined_count", 0)
+        lines.append(f"- Individual camera variants moved: {qcount}")
+        confirmed = angle_quarantine_report.get("confirmed", [])
+        if confirmed:
+            strong = sum(1 for c in confirmed if c.get("confidence") == "strong")
+            lines.append(f"- Confirmed compilations: {len(confirmed)} ({strong} strong confidence)")
+            for c in confirmed[:10]:
+                dur = f" (dur×{c['duration_ratio']})" if c.get("duration_ratio") else ""
+                lines.append(f"  - {c['base']}... — {c['num_cams']} cams, {c['confidence']}{dur}")
+        rejected = angle_quarantine_report.get("rejected", [])
+        if rejected:
+            lines.append(f"- All Angles with no matching individual cams found: {len(rejected)}")
+            for b in rejected[:8]:
+                lines.append(f"  - {b}...")
+
     lines.extend(["", "## Review Rows", ""])
     for row in rows:
         if row["status"] != "ready":
@@ -1788,8 +2429,34 @@ def command_preview(args: argparse.Namespace) -> int:
         raise SystemExit(f"Destination root does not exist or is not a directory: {config.destination_root}")
 
     reference = build_reference_data(config.destination_root, config)
-    files = discover_videos(source, config)
-    rows = [analyze_file(path, source, config, reference) for path in files]
+    files = discover_videos(source, config, show_progress=True)
+
+    # Angle pack quarantine (high-confidence only when matching individual cams are found)
+    angle_quarantine_report: Dict[str, Any] = {"quarantined_count": 0, "confirmed": [], "rejected": []}
+    if getattr(args, "quarantine_angle_variants", True):
+        files, angle_quarantine_report = quarantine_angle_variants(files, source, config)
+
+    # Progress indicator for analysis phase (the longest part of preview)
+    rows = []
+    total = len(files)
+    if total == 0:
+        print("No video files found to analyze.")
+    else:
+        print(f"Analyzing {total} video files...")
+        last_percent = -1
+        for i, path in enumerate(files, 1):
+            row = analyze_file(path, source, config, reference)
+            rows.append(row)
+
+            percent = int((i / total) * 100)
+            # Update at most every 1% or every 10 files to keep output reasonable
+            if percent != last_percent or i % 10 == 0 or i == total:
+                bar_len = 25
+                filled = int(bar_len * i // total)
+                bar = '#' * filled + '-' * (bar_len - filled)
+                print(f"\r  [{bar}] {percent:3d}% ({i}/{total})", end="", flush=True)
+                last_percent = percent
+        print()  # Finish the progress line
 
     # Collect new Grok-derived character -> franchise mappings for pending review
     new_learned: Dict[str, str] = {}
@@ -1805,11 +2472,15 @@ def command_preview(args: argparse.Namespace) -> int:
         if pending_path:
             print(f"New Grok-derived mappings written to pending file for review: {pending_path}")
 
+    # Deduplicate target filenames so that no two files in this batch get the exact same name.
+    # This commonly happens when title cleaning is very aggressive on collector dumps.
+    deduplicate_target_filenames(rows)
+
     output_dir = Path(args.output_dir).resolve() if args.output_dir else source
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path, md_path = unique_plan_paths(output_dir, run_id())
     write_csv(csv_path, rows)
-    write_preview_summary(md_path, source, config.destination_root, rows, reference)
+    write_preview_summary(md_path, source, config.destination_root, rows, reference, angle_quarantine_report)
 
     print(f"Preview complete: {len(rows)} video(s)")
     print(f"Reference filename samples: {reference.naming_style.sample_count}")
@@ -1820,6 +2491,137 @@ def command_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def quarantine_angle_variants(
+    files: List[Path], source: Path, config: Config
+) -> Tuple[List[Path], Dict[str, Any]]:
+    """Detect camera angle packs with *high confidence*.
+
+    Only quarantines individual "Cam X" files when we can prove there exists
+    an "All Angles" (or equivalent) compilation *of those exact variants*
+    elsewhere in the source directory.
+
+    Method:
+      For each "All Angles" file, extract its precise scene base (text immediately
+      before "All Angles"). Then scan the source for real individual cam files
+      whose names begin with that exact base + " Cam ".
+
+      If such matching cam files are found -> quarantine them (with optional
+      duration cross-check for extra confidence).
+      If no matching individual cams exist for that base -> record as rejected.
+
+    Returns:
+        (remaining_files, report_dict)
+
+    The report contains:
+      - quarantined_count
+      - confirmed: list of dicts with base, num_cams, confidence ("strong"/"medium"), duration_ratio (if checked)
+      - rejected: list of bases that had an All Angles but no matching cams
+    """
+    if not files:
+        return files, {"quarantined_count": 0, "confirmed": [], "rejected": []}
+
+    variants_folder_name = getattr(config, "angle_variants_folder_name", "_r34_angle_variants")
+    variants_dir = source / variants_folder_name
+    ffprobe_path = getattr(config, "ffprobe_path", "ffprobe")
+
+    # Find all potential "All Angles" compilations
+    angle_compilations = [
+        f for f in files
+        if re.search(r'(?i)\b(all\s*angles?|allangles?|all_angle)\b', f.name)
+    ]
+
+    if not angle_compilations:
+        return files, {"quarantined_count": 0, "confirmed": [], "rejected": []}
+
+    moved_count = 0
+    confirmed: List[Dict[str, Any]] = []
+    rejected: List[str] = []
+
+    for comp in angle_compilations:
+        stem = comp.stem
+        match = re.search(r'(?i)^(.+?)\s*(?:all\s*angles?|allangles?|all_angle)\b', stem)
+        if not match:
+            continue
+
+        base = match.group(1).strip()
+        if len(base) < 8:
+            continue
+
+        base_pattern = re.escape(base)
+        cam_pattern = re.compile(
+            rf'(?i)^{base_pattern}\s*cam\s*\d+',
+            re.IGNORECASE
+        )
+
+        individual_cams: List[Path] = []
+        for f in source.rglob('*.mp4'):
+            if variants_dir in f.parents:
+                continue
+            if cam_pattern.search(f.stem):
+                individual_cams.append(f)
+
+        if not individual_cams:
+            rejected.append(base)
+            continue
+
+        # Optional duration cross-check for confidence
+        all_dur = get_video_duration(comp, ffprobe_path)
+        cam_durs = [d for d in (get_video_duration(c, ffprobe_path) for c in individual_cams) if d]
+        duration_ratio = None
+        confidence = "medium"
+
+        if all_dur and cam_durs:
+            max_cam = max(cam_durs)
+            duration_ratio = all_dur / max_cam if max_cam > 0 else 0
+            # Strong if the compilation is substantially longer than any single cam
+            if duration_ratio > 1.6:
+                confidence = "strong"
+
+        # If we have 2+ cams, upgrade to strong even without duration data
+        if len(individual_cams) >= 2 and confidence == "medium":
+            confidence = "strong"
+
+        confirmed.append({
+            "base": base,
+            "num_cams": len(individual_cams),
+            "confidence": confidence,
+            "duration_ratio": round(duration_ratio, 2) if duration_ratio else None,
+        })
+
+        variants_dir.mkdir(parents=True, exist_ok=True)
+
+        for cam_file in individual_cams:
+            dest = variants_dir / cam_file.name
+            try:
+                if not dest.exists():
+                    shutil.move(str(cam_file), str(dest))
+                    print(f"  Quarantined camera variant -> {variants_folder_name}/ : {cam_file.name}")
+                    moved_count += 1
+                else:
+                    print(f"  (already quarantined) {cam_file.name}")
+            except Exception as ex:
+                print(f"  Warning: failed to move {cam_file.name}: {ex}")
+
+    if moved_count or rejected:
+        print(f"  -> Angle pack quarantine: {moved_count} individual files moved to {variants_folder_name}/")
+        if confirmed:
+            strong = sum(1 for c in confirmed if c["confidence"] == "strong")
+            print(f"     Confirmed compilations: {len(confirmed)} ({strong} strong, {len(confirmed)-strong} medium)")
+            for c in confirmed[:6]:
+                dur_info = f", dur×{c['duration_ratio']}" if c['duration_ratio'] else ""
+                print(f"       • {c['base']}... ({c['num_cams']} cams, {c['confidence']}{dur_info})")
+        if rejected:
+            print(f"     Rejected (All Angles with no matching cams found): {len(rejected)}")
+
+    remaining = [f for f in files if variants_dir not in f.parents]
+    report = {
+        "quarantined_count": moved_count,
+        "confirmed": confirmed,
+        "rejected": rejected,
+    }
+    return sorted(remaining, key=lambda p: str(p).lower()), report
+
+
 def replace_config(config: Config, **updates: object) -> Config:
     data = {
         "destination_root": config.destination_root,
@@ -1827,6 +2629,7 @@ def replace_config(config: Config, **updates: object) -> Config:
         "ffprobe_path": config.ffprobe_path,
         "review_folder_name": config.review_folder_name,
         "content_review_folder_name": config.content_review_folder_name,
+        "silent_animations_folder_name": getattr(config, "silent_animations_folder_name", "_r34_silent"),
         "confidence_threshold": config.confidence_threshold,
         "allow_create_destination_folders": config.allow_create_destination_folders,
         "artist_aliases": config.artist_aliases,
@@ -1847,6 +2650,7 @@ def replace_config(config: Config, **updates: object) -> Config:
         "original_character_subfoldering": getattr(config, "original_character_subfoldering", False),
         "learned_franchises_file": getattr(config, "learned_franchises_file", "learned_character_franchises.json"),
         "extract_embedded_titles": getattr(config, "extract_embedded_titles", False),
+        "angle_variants_folder_name": getattr(config, "angle_variants_folder_name", "_r34_angle_variants"),
     }
     data.update(updates)
     return Config(**data)
@@ -1927,6 +2731,9 @@ def apply_row(
     review_folder_name: str,
     quarantine_unapproved: bool,
     content_review_folder_name: str = "_r34_content_review",
+    silent_animations_folder_name: str = "_r34_silent",
+    angle_variants_folder_name: str = "_r34_angle_variants",
+    review_items_folder_name: str = None,  # for "review" status outliers
 ) -> Dict[str, str]:
     result = dict(row)
     source = Path(row.get("source_path", ""))
@@ -1946,6 +2753,29 @@ def apply_row(
         dest = content_review_path(source, source_root, content_review_folder_name, run)
         shutil.move(str(source), str(dest))
         result["apply_result"] = "held_content_review"
+        result["apply_message"] = str(dest)
+        return result
+
+    if status_raw == "silent" or status == "silent":
+        if not source.exists():
+            result["apply_result"] = "missing_source"
+            result["apply_message"] = str(source)
+            return result
+        dest = content_review_path(source, source_root, silent_animations_folder_name, run)
+        shutil.move(str(source), str(dest))
+        result["apply_result"] = "held_silent"
+        result["apply_message"] = str(dest)
+        return result
+
+    if status_raw == "review" or status == "review":
+        if not source.exists():
+            result["apply_result"] = "missing_source"
+            result["apply_message"] = str(source)
+            return result
+        folder = review_items_folder_name or review_folder_name
+        dest = content_review_path(source, source_root, folder, run)
+        shutil.move(str(source), str(dest))
+        result["apply_result"] = "held_for_review"
         result["apply_message"] = str(dest)
         return result
 
@@ -2015,9 +2845,9 @@ def apply_progress_label(row: Dict[str, str]) -> str:
         return f"{original} -> {row['apply_message']}"
     target_name = row.get("target_filename") or Path(row.get("target_path", "")).name
     if target_name and target_name != original:
-        target_folder = row.get("target_folder", "").strip()
-        target_display = f"{target_folder}\\{target_name}" if target_folder else target_name
-        return f"{original} -> {target_display}"
+        # Only show the actual filename that will appear in Explorer.
+        # The folder is visible in the CSV if the user needs it.
+        return f"{original} -> {target_name}"
     return original
 
 
@@ -2055,6 +2885,8 @@ def command_apply(args: argparse.Namespace) -> int:
             config.review_folder_name,
             args.quarantine_unapproved,
             config.content_review_folder_name,
+            getattr(config, "silent_animations_folder_name", "_r34_silent"),
+            config.review_folder_name,  # folder for "review" status outlier items
         )
         # Attach reversible learning metadata to EVERY row (populated for those that qualified).
         # Only rows with apply_result=="moved" will actually cause a write to the learned file.
@@ -2243,6 +3075,18 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--dest-root", help="Override destination root.")
     preview.add_argument("--ffprobe", help="Override ffprobe executable path.")
     preview.add_argument("--output-dir", help="Where to write preview CSV/Markdown. Defaults to source folder.")
+    preview.add_argument(
+        "--quarantine-angle-variants",
+        action="store_true",
+        default=True,
+        help="Automatically move individual 'Cam X' angle files to a subfolder when an 'All Angles' compilation exists for the same scene (default: on).",
+    )
+    preview.add_argument(
+        "--no-quarantine-angle-variants",
+        dest="quarantine_angle_variants",
+        action="store_false",
+        help="Disable automatic quarantining of individual camera angle variants.",
+    )
     preview.set_defaults(func=command_preview)
 
     apply = sub.add_parser("apply", help="Apply an approved preview CSV plan.")

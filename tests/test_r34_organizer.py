@@ -85,6 +85,7 @@ def make_config(dest_root: Path) -> org.Config:
         original_character_subfoldering=False,
         learned_franchises_file="learned_character_franchises.json",
         extract_embedded_titles=False,
+        silent_animations_folder_name="_r34_silent",
     )
 
 
@@ -807,6 +808,23 @@ class GrokAndProductionHardeningTests(unittest.TestCase):
             # Idempotent / stale no-op
             ok2 = org.revert_learned_franchise("sinia", "King of Fighters", "", cfg)
             self.assertFalse(ok2)
+
+    @patch('r34_organizer.subprocess.run')
+    def test_has_audio_stream_detection(self, mock_run):
+        # Simulate ffprobe returning no audio streams (silent video)
+        mock_run.return_value = type('obj', (object,), {
+            'stdout': json.dumps({"streams": []}),
+            'returncode': 0
+        })()
+        cfg = make_config(Path("tmp"))
+        self.assertFalse(org.has_audio_stream(Path("silent.mp4"), "ffprobe"))
+
+        # Simulate one audio stream
+        mock_run.return_value = type('obj', (object,), {
+            'stdout': json.dumps({"streams": [{"codec_type": "audio"}]}),
+            'returncode': 0
+        })()
+        self.assertTrue(org.has_audio_stream(Path("voiced.mp4"), "ffprobe"))
 
     def test_apply_commits_learning_and_undo_reverts_it(self):
         """End-to-end: approved row with character+target_folder on apply -> persisted learned,

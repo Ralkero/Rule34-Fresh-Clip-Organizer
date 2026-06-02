@@ -94,6 +94,8 @@ Collection source folders are also handled as artist context. For example, `Lazy
 
 Content-review terms in `r34_config.json` hold configured non-vanilla/fetish keywords out of the main library. Preview marks matching rows as `content_review`, and apply moves them to `_r34_content_review\<run-id>` under the source root for manual review.
 
+Silent animations (files with no audio stream) are automatically detected via ffprobe during preview and can be routed to a separate folder (configurable via `silent_animations_folder_name`, default `_r34_silent`) on apply. This is useful for separating silent loops from voiced content in large collections.
+
 Known compact title tokens can be expanded through `title_token_replacements` in `r34_config.json`, such as `bonusmotion` -> `Bonus Motion` and `kitchenmissionary` -> `Kitchen Missionary`.
 
 This writes files like:

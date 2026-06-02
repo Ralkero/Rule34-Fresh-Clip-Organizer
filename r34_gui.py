@@ -764,19 +764,29 @@ class OrganizerGUI:
         tree_frame = ttk.Frame(win)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        columns = ("original", "artist", "character", "current_target", "status")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        columns = ("check", "original", "artist", "character", "current_target", "status", "approved")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
+        tree.heading("check", text="✓", anchor="center")
         tree.heading("original", text="Original Filename")
         tree.heading("artist", text="Artist")
         tree.heading("character", text="Character")
         tree.heading("current_target", text="Current Target")
         tree.heading("status", text="Status")
+        tree.heading("approved", text="Approved")
 
-        tree.column("original", width=320)
-        tree.column("artist", width=140)
-        tree.column("character", width=160)
-        tree.column("current_target", width=280)
-        tree.column("status", width=100)
+        tree.column("check", width=30, minwidth=30, stretch=False, anchor="center")
+        tree.column("original", width=300)
+        tree.column("artist", width=120)
+        tree.column("character", width=140)
+        tree.column("current_target", width=260)
+        tree.column("status", width=90)
+        tree.column("approved", width=80)
+
+        # Sorting (click headers)
+        tree.heading("status", command=lambda: self._sort_tree("status"))
+        tree.heading("current_target", command=lambda: self._sort_tree("current_target"))
+        tree.heading("character", command=lambda: self._sort_tree("character"))
+        tree.heading("original", command=lambda: self._sort_tree("original"))
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
@@ -785,6 +795,9 @@ class OrganizerGUI:
 
         # Populate tree
         for i, row in enumerate(rows):
+            if "_bulk_checked" not in row:
+                row["_bulk_checked"] = False
+            checked = "☑" if row.get("_bulk_checked") else "☐"
             orig = row.get("original_name", "")
             artist = row.get("artist", "")
             char = row.get("character", "")
@@ -792,14 +805,16 @@ class OrganizerGUI:
             fname = row.get("target_filename", "")
             current_target = f"{folder}/{fname}" if folder and fname else (fname or "")
             status = row.get("status", "")
-            tree.insert("", "end", iid=str(i), values=(orig, artist, char, current_target, status))
+            approved = row.get("approved", "")
+            tree.insert("", "end", iid=str(i), values=(checked, orig, artist, char, current_target, status, approved))
 
         self.correction_tree = tree
         self.correction_rows = rows
 
         # Edit panel
-        edit_frame = ttk.LabelFrame(win, text="Correct Selected Row", padding=10)
+        edit_frame = ttk.LabelFrame(win, text="Correct Selected Row(s)", padding=10)
         edit_frame.pack(fill="x", padx=10, pady=8)
+        self.edit_frame = edit_frame  # for dynamic label updates on multi-select
 
         ttk.Label(edit_frame, text="Corrected Target Folder:").grid(row=0, column=0, sticky="e", padx=5)
         self.corr_folder_var = tk.StringVar()
@@ -817,9 +832,9 @@ class OrganizerGUI:
         btn_frame = ttk.Frame(edit_frame)
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
 
-        btn_apply_corr = ttk.Button(btn_frame, text="Apply Correction to Selected Row", command=self._apply_correction)
+        btn_apply_corr = ttk.Button(btn_frame, text="Apply Correction to Selected Row(s)", command=self._apply_correction)
         btn_apply_corr.pack(side="left", padx=5)
-        Tooltip(btn_apply_corr, "Applies the three values in the edit fields (Corrected Target Folder / Target Filename / Notes) to the row currently selected in the table above. The change is performed in memory only. It also appends a timestamped 'manual_correction: YYYY-MM-DD HH:MM' entry (plus your Notes text) to the row's notes and reason columns so the audit trail is complete. The full target_path is recomputed using your current Dest root + config. Click Save All Changes afterward to persist everything to disk.")
+        Tooltip(btn_apply_corr, "Applies the values from the edit fields to ALL currently selected rows (supports Ctrl+Click / Shift+Click multi-select). Only non-empty fields are applied (so you can change just the folder for a batch, for example). Changes are in-memory; use Save All Changes to persist. A correction note is appended to each affected row for audit.")
 
         btn_mark = ttk.Button(btn_frame, text="Mark as Approved", command=self._mark_selected_approved)
         btn_mark.pack(side="left", padx=5)
@@ -829,8 +844,33 @@ class OrganizerGUI:
         btn_reset.pack(side="left", padx=5)
         Tooltip(btn_reset, "Placeholder action (currently shows an info dialog). A future enhancement could reload the original values for the selected row from a hidden backup copy of the preview CSV. For now, simply close this Correction Tool window without saving and re-open it from the original preview CSV if you want to discard all edits.")
 
-        # Bind selection
+        # Bulk actions
+        bulk_frame = ttk.Frame(edit_frame)
+        bulk_frame.grid(row=4, column=0, columnspan=2, pady=(5, 0))
+        btn_approve_sel = ttk.Button(bulk_frame, text="Approve Selected (Ctrl/Shift+Click)", command=self._approve_selected)
+        btn_approve_sel.pack(side="left", padx=5)
+        Tooltip(btn_approve_sel, "Marks all currently selected (highlighted) rows (use Ctrl+Click or Shift+Click in the table) as approved='yes'. Complements the checkbox system — you can also right-click highlighted rows and use 'Select multiple (toggle checkboxes)' if you prefer the checkmark workflow.")
+
+        btn_approve_chk = ttk.Button(bulk_frame, text="Approve Checked (☑)", command=self._approve_checked)
+        btn_approve_chk.pack(side="left", padx=5)
+        Tooltip(btn_approve_chk, "Marks all rows that have a checkmark in the ✓ column as approved='yes'. Click the checkbox column (first column) to toggle individual rows. Shift/Ctrl+Click to highlight multiple rows, then right-click and choose 'Select multiple (toggle checkboxes)' to batch-toggle their checkmarks — now the highlighted rows behave like individually checked ones.")
+
+        # Bind selection and checkbox toggle
         tree.bind("<<TreeviewSelect>>", self._on_correction_row_selected)
+        tree.bind("<ButtonRelease-1>", self._on_correction_tree_click, add="+")
+
+        # Right-click context menu so that Shift/Ctrl+Click row highlighting
+        # can drive the checkbox column (same effect as clicking individual ✓ cells).
+        # User highlights a batch (or many), right-clicks anywhere, chooses the item
+        # to batch-toggle those rows' _bulk_checked state + the visible symbol.
+        context_menu = tk.Menu(tree, tearoff=0)
+        context_menu.add_command(
+            label="Select multiple (toggle checkboxes)",
+            command=self._toggle_checkboxes_for_selected
+        )
+        self.correction_context_menu = context_menu
+
+        tree.bind("<Button-3>", self._on_correction_tree_right_click)
 
         # Bottom bar
         bottom = ttk.Frame(win, padding=8)
@@ -843,13 +883,21 @@ class OrganizerGUI:
         self.correction_window = win
 
     def _on_correction_row_selected(self, event=None):
-        """Load selected row into the edit fields."""
+        """Load the first selected row into the edit fields as a template.
+        When multiple rows are selected, edits will apply to all of them on 'Apply Correction'."""
         tree = getattr(self, "correction_tree", None)
         if not tree:
             return
         selection = tree.selection()
         if not selection:
             return
+
+        # Update the edit panel label to reflect multi-select
+        if hasattr(self, "edit_frame") and self.edit_frame:
+            count = len(selection)
+            label = f"Correct Selected Rows ({count}) — edits apply to ALL selected" if count > 1 else "Correct Selected Row"
+            self.edit_frame.config(text=label)
+
         iid = selection[0]
         idx = int(iid)
         row = self.correction_rows[idx]
@@ -858,87 +906,296 @@ class OrganizerGUI:
         self.corr_filename_var.set(row.get("target_filename", ""))
         self.corr_notes_var.set(row.get("notes", ""))
 
-    def _apply_correction(self):
-        """Apply manual correction from the edit fields to the selected row."""
+    def _on_correction_tree_click(self, event):
+        """Handle click on checkbox column to toggle bulk selection."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        region = tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = tree.identify_column(event.x)
+        item = tree.identify_row(event.y)
+        if not item or col != "#1":  # first column is "check"
+            return
+        try:
+            idx = int(item)
+            row = self.correction_rows[idx]
+            row["_bulk_checked"] = not row.get("_bulk_checked", False)
+            sym = "☑" if row["_bulk_checked"] else "☐"
+            tree.set(item, "check", sym)
+        except (ValueError, IndexError, KeyError):
+            pass
+
+    def _on_correction_tree_right_click(self, event):
+        """Show context menu on right-click (Windows Button-3).
+
+        If the clicked row is not already part of the current multi-selection
+        (made via Shift or Ctrl+Click), select it. Then the menu allows
+        "Select multiple" to toggle the checkboxes on all currently highlighted rows.
+
+        This makes visual row highlighting (extended selection) a first-class way
+        to drive the checkbox column, exactly like individual checkbox clicks.
+        """
+        tree = getattr(self, "correction_tree", None)
+        if not tree or not hasattr(self, "correction_context_menu"):
+            return
+        item = tree.identify_row(event.y)
+        if item:
+            # Preserve an existing multi-selection if the user right-clicks inside it.
+            # Only change selection if the clicked row is outside the current set.
+            try:
+                if item not in tree.selection():
+                    tree.selection_set(item)
+            except Exception:
+                pass
+        # Popup the menu (command executes against whatever selection exists at click time)
+        try:
+            self.correction_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.correction_context_menu.grab_release()
+
+    def _toggle_checkboxes_for_selected(self):
+        """Toggle _bulk_checked (and the ✓/☐ symbol) for every row in the current
+        Treeview selection (the highlighted rows from Shift/Ctrl+Click).
+
+        This is the action behind the right-click 'Select multiple' menu item.
+        It lets you highlight a batch exactly like you would with checkboxes,
+        then batch-toggle their check state so Approve Checked / other bulk
+        checkbox-driven features see them. Live in-place update, no popups.
+        """
         tree = getattr(self, "correction_tree", None)
         if not tree:
             return
         selection = tree.selection()
         if not selection:
-            messagebox.showwarning("No Selection", "Please select a row in the list first.")
+            self.status_var.set("No rows selected (use Shift/Ctrl+Click to highlight first).")
             return
+        count = 0
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
+                row["_bulk_checked"] = not row.get("_bulk_checked", False)
+                sym = "☑" if row["_bulk_checked"] else "☐"
+                tree.set(iid, "check", sym)
+                count += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+        if count:
+            msg = f"Toggled checkboxes on {count} selected row(s) (live)."
+            self.append_output(msg)
+            self.status_var.set(msg)
 
-        iid = selection[0]
-        idx = int(iid)
-        row = self.correction_rows[idx]
+    def _apply_correction(self):
+        """Apply the edit fields to ALL selected rows (supports multi-select via Ctrl/Shift).
+
+        - Only non-empty fields are applied (enables folder-only or filename-only bulk edits).
+        - A correction note is appended to every affected row.
+        - target_path is recomputed per row using the (updated) folder + filename for that row.
+        - Changes are reflected LIVE in the tree immediately (no popups, no confirmation dialogs).
+        """
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected for correction.")
+            return
 
         new_folder = self.corr_folder_var.get().strip()
         new_filename = self.corr_filename_var.get().strip()
         notes = self.corr_notes_var.get().strip()
 
-        if not new_filename:
-            messagebox.showerror("Error", "Corrected Target Filename cannot be empty.")
+        if not new_folder and not new_filename:
+            self.status_var.set("Enter a folder and/or filename to apply.")
             return
 
-        # Update the row
-        if new_folder:
-            row["target_folder"] = new_folder
-        row["target_filename"] = new_filename
-
-        # Recompute target_path using current dest root
+        # Prepare dest_root once (used for target_path recompute)
         dest_root = self.dest_var.get().strip() or ""
         if not dest_root:
-            # Try to load from config
             try:
                 cfg = org.load_config(Path(self.config_var.get() or DEFAULT_CONFIG))
                 dest_root = str(cfg.destination_root)
             except Exception:
                 dest_root = ""
 
-        if dest_root and new_folder and new_filename:
-            target_path = str(Path(dest_root) / new_folder / new_filename)
-            row["target_path"] = target_path
-
-        # Add correction note
-        existing_notes = row.get("notes", "")
         correction_note = f"manual_correction: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         if notes:
             correction_note += f" - {notes}"
-        row["notes"] = f"{existing_notes}; {correction_note}".strip("; ")
 
-        # Update reason to make it auditable
-        existing_reason = row.get("reason", "")
-        row["reason"] = f"{existing_reason};manual_filename_correction".strip(";")
+        updated_count = 0
+        affected_iids = []
 
-        # Refresh tree display
-        tree = self.correction_tree
-        current_target = f"{row.get('target_folder','')}/{new_filename}" if row.get("target_folder") else new_filename
-        tree.item(iid, values=(
-            row.get("original_name", ""),
-            row.get("artist", ""),
-            row.get("character", ""),
-            current_target,
-            row.get("status", "")
-        ))
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
 
-        self.append_output(f"Applied manual correction to: {row.get('original_name')}")
+                changed = False
+                if new_folder:
+                    row["target_folder"] = new_folder
+                    changed = True
+                if new_filename:
+                    row["target_filename"] = new_filename
+                    changed = True
+
+                if not changed:
+                    continue
+
+                # Recompute target_path for this row using its (possibly updated) folder + filename
+                row_folder = row.get("target_folder", "")
+                row_fname = row.get("target_filename", "")
+                if dest_root and row_folder and row_fname:
+                    target_path = str(Path(dest_root) / row_folder / row_fname)
+                    row["target_path"] = target_path
+
+                # Append audit note to this row
+                existing_notes = row.get("notes", "")
+                row["notes"] = f"{existing_notes}; {correction_note}".strip("; ")
+
+                existing_reason = row.get("reason", "")
+                row["reason"] = f"{existing_reason};manual_filename_correction".strip(";")
+
+                # Live update this row in the tree immediately (7-tuple with check column)
+                checked = "☑" if row.get("_bulk_checked") else "☐"
+                approved_val = row.get("approved", "")
+                current_target = f"{row_folder}/{row_fname}" if row_folder else row_fname
+                tree.item(iid, values=(
+                    checked,
+                    row.get("original_name", ""),
+                    row.get("artist", ""),
+                    row.get("character", ""),
+                    current_target,
+                    row.get("status", ""),
+                    approved_val
+                ))
+
+                updated_count += 1
+                affected_iids.append(iid)
+            except (ValueError, IndexError, KeyError):
+                pass
+
+        if updated_count > 0:
+            msg = f"Applied correction to {updated_count} selected row(s) — live in tree. Use Save to persist to CSV."
+            self.append_output(msg)
+            self.status_var.set(msg)
+        else:
+            self.status_var.set("No rows were updated (edit fields were empty).")
 
     def _mark_selected_approved(self):
+        """Mark currently selected row(s) approved (live, supports multi-select)."""
         tree = getattr(self, "correction_tree", None)
         if not tree:
             return
         selection = tree.selection()
         if not selection:
+            self.status_var.set("No rows selected to approve.")
             return
-        iid = selection[0]
-        idx = int(iid)
-        row = self.correction_rows[idx]
-        row["approved"] = "yes"
-        self.append_output(f"Marked as approved: {row.get('original_name')}")
+        count = 0
+        first_name = ""
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
+                row["approved"] = "yes"
+                tree.set(iid, "approved", "yes")
+                if not first_name:
+                    first_name = row.get("original_name", "")
+                count += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+        if count:
+            msg = f"Marked {count} row(s) as approved (live)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+
+    def _approve_selected(self):
+        """Approve all currently selected rows (live update, no popup)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected to approve.")
+            return
+        count = 0
+        for iid in selection:
+            try:
+                idx = int(iid)
+                self.correction_rows[idx]["approved"] = "yes"
+                # Live update the approved column in the tree
+                tree.set(iid, "approved", "yes")
+                count += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+        if count:
+            msg = f"Marked {count} selected row(s) as approved (live in tree)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+
+    def _approve_checked(self):
+        """Approve all checked (☑) rows (live update, no popup)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        count = 0
+        for i, row in enumerate(self.correction_rows):
+            if row.get("_bulk_checked"):
+                row["approved"] = "yes"
+                # Live update the tree row
+                try:
+                    tree.set(str(i), "approved", "yes")
+                except Exception:
+                    pass
+                count += 1
+        if count:
+            msg = f"Marked {count} checked row(s) as approved (live in tree)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+        else:
+            self.status_var.set("No checked rows to approve.")
+
+    def _sort_tree(self, col):
+        """Sort the underlying rows and refresh the tree view."""
+        if not hasattr(self, "_sort_state"):
+            self._sort_state = {}
+        reverse = self._sort_state.get(col, False)
+
+        key_funcs = {
+            "status": lambda r: (r.get("status", "") or "").lower(),
+            "current_target": lambda r: ((r.get("target_folder", "") or "") + "/" + (r.get("target_filename", "") or "")).lower(),
+            "character": lambda r: (r.get("character", "") or "").lower(),
+            "original": lambda r: (r.get("original_name", "") or "").lower(),
+        }
+        if col not in key_funcs:
+            return
+
+        self.correction_rows.sort(key=key_funcs[col], reverse=reverse)
+        self._sort_state[col] = not reverse
+        self._refresh_correction_tree()
+
+    def _refresh_correction_tree(self):
+        """Re-populate the tree from the current (possibly sorted) order of correction_rows."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        tree.delete(*tree.get_children())
+        for i, row in enumerate(self.correction_rows):
+            checked = "☑" if row.get("_bulk_checked") else "☐"
+            orig = row.get("original_name", "")
+            artist = row.get("artist", "")
+            char = row.get("character", "")
+            folder = row.get("target_folder", "")
+            fname = row.get("target_filename", "")
+            current_target = f"{folder}/{fname}" if folder and fname else (fname or "")
+            status = row.get("status", "")
+            approved = row.get("approved", "")
+            tree.insert("", "end", iid=str(i), values=(checked, orig, artist, char, current_target, status, approved))
 
     def _reset_selected_row(self):
         # This is a simple version — for full reset we'd need the original CSV backup.
-        messagebox.showinfo("Info", "Reset functionality can be added by keeping a backup of the original preview CSV.")
+        self.status_var.set("Reset: close the Correction Tool without saving and re-open the original CSV to discard edits.")
 
     def _save_corrections(self):
         """Write the corrected rows back to the CSV."""
@@ -947,9 +1204,13 @@ class OrganizerGUI:
             return
 
         try:
+            # Ensure filenames remain unique after manual edits
+            if hasattr(org, "deduplicate_target_filenames"):
+                org.deduplicate_target_filenames(self.correction_rows)
+
             org.write_csv(Path(self.correction_plan_path), self.correction_rows)
             self.append_output(f"Corrections saved to: {self.correction_plan_path}")
-            messagebox.showinfo("Saved", "Corrections have been written to the CSV.\nYou can now run Apply.")
+            self.status_var.set("Corrections saved to CSV. Ready for Apply Approved Plan.")
             self.correction_window.destroy()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save corrections: {e}")
@@ -1005,12 +1266,10 @@ class OrganizerGUI:
                 status = row.get("status", "")
 
                 if fname:
-                    if folder:
-                        # Use " - " separator in console display to match the user's
-                        # preferred naming style (e.g. "King of Fighters - Mai [1080P].mp4")
-                        revised = f"{folder} - {fname}" if not fname.startswith(folder) else fname
-                    else:
-                        revised = fname
+                    # Show ONLY the actual filename that will be created on disk.
+                    # Do not prepend the folder — the user wants the log to match
+                    # exactly what they will see in Windows Explorer.
+                    revised = fname
                 else:
                     revised = "(no target generated - needs review)"
 

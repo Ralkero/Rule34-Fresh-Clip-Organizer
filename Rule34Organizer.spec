@@ -1,12 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('r34_organizer.py', '.'), ('r34_config.json', '.')]
+binaries = []
+hiddenimports = ['tkinter', 'tkinter.ttk']
+tmp_ret = collect_all('tcl')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('tk')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['r34_gui.py'],
     pathex=[],
-    binaries=[],
-    datas=[('r34_organizer.py', '.'), ('r34_config.json', '.')],
-    hiddenimports=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

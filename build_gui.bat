@@ -14,6 +14,10 @@ pyinstaller ^
   --name "Rule34Organizer" ^
   --add-data "r34_organizer.py;." ^
   --add-data "r34_config.json;." ^
+  --hidden-import=tkinter ^
+  --hidden-import=tkinter.ttk ^
+  --collect-all tcl ^
+  --collect-all tk ^
   r34_gui.py
 
 echo.
