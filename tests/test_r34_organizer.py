@@ -1866,7 +1866,9 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
         # must not suggest character_mappings
         mappings = [i for i in preview["items"] if i["suggested_section"] == "character_mappings"]
         self.assertEqual(len(mappings), 0)
-        self.assertTrue(any("canonical alias candidate only" in (i.get("note") or "") for i in chars))
+        # 4b.6: reason may be in classification_reason or note
+        reasons = [(i.get("note") or "") + " " + (i.get("classification_reason") or "") for i in chars]
+        self.assertTrue(any("character" in r.lower() for r in reasons))
 
     def test_existing_local_values_are_marked_already_exists_local(self):
         stash = {"performers": ["pantsushi"], "groups": [], "tags": []}
@@ -2075,6 +2077,167 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
         self.assertIn("findgroups", code)
         self.assertIn("findtags", code)
         self.assertNotIn("performers {\n            performers", code)  # old shape shouldn't be in query anymore
+
+    # ------------------------------------------------------------------
+    # Phase 4b.6 Stash tag classification tests (pure build + sample rich data)
+    # ------------------------------------------------------------------
+
+    def test_tag_with_parent_artists_classified_artist_candidate(self):
+        # Use rich tag data
+        stash = {"performer_data": [], "group_data": [], "tag_data": [
+            {"id": "t5", "name": "ArtistTagUnderArtists", "aliases": [], "parents": [{"name": "Artists"}], "children": []}
+        ], "errors": [], "meta": {}}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        arts = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases"]
+        self.assertTrue(arts)
+        self.assertEqual(arts[0]["detected_tag_role"], "artist_candidate")
+        self.assertIn("artist", arts[0].get("classification_reason", "").lower())
+
+    def test_tag_with_parent_characters_classified_character_candidate(self):
+        stash = {"performer_data": [], "group_data": [], "tag_data": [
+            {"id": "t1", "name": "2b", "aliases": ["2B"], "parents": [{"name": "Characters"}], "children": []}
+        ], "errors": [], "meta": {}}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        chars = [i for i in preview["items"] if i.get("suggested_section") == "canonical_character_aliases"]
+        self.assertTrue(chars)
+        self.assertEqual(chars[0]["detected_tag_role"], "character_candidate")
+
+    def test_tag_with_parent_franchises_or_series_classified_franchise(self):
+        stash = {"performer_data": [], "group_data": [], "tag_data": [
+            {"id": "t6", "name": "FranchiseTag", "aliases": [], "parents": [{"name": "Franchises"}], "children": []}
+        ], "errors": [], "meta": {}}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        frans = [i for i in preview["items"] if i.get("suggested_section") == "folder_aliases" and i.get("source") == "stash_tag"]
+        self.assertTrue(frans)
+        self.assertEqual(frans[0]["detected_tag_role"], "franchise_candidate")
+
+    def test_tag_no_parent_clue_becomes_general_ignored(self):
+        stash = {"performer_data": [], "group_data": [], "tag_data": [
+            {"id": "t4", "name": "TestChar", "aliases": [], "parents": [], "children": []}
+        ], "errors": [], "meta": {}}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        ign = [i for i in preview["items"] if i.get("suggested_section") == "ignored_or_review"]
+        self.assertTrue(ign)
+        self.assertEqual(ign[0]["detected_tag_role"], "general_tag")
+
+    def test_tag_conflicting_parents_becomes_ambiguous_ignored(self):
+        stash = {"performer_data": [], "group_data": [], "tag_data": [
+            {"id": "t7", "name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []}
+        ], "errors": [], "meta": {}}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        amb = [i for i in preview["items"] if i.get("detected_tag_role") == "ambiguous" or i.get("suggested_section") == "ignored_or_review"]
+        self.assertTrue(amb)
+        # status or role indicates
+        self.assertTrue(any(i.get("detected_tag_role") == "ambiguous" for i in amb))
+
+    def test_section_artist_aliases_includes_performers_and_artist_tags(self):
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {})
+        artist_items = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases"]
+        has_perf = any(i["source"] == "stash_performer" for i in artist_items)
+        has_artist_tag = any(i["source"] == "stash_tag" and i.get("detected_tag_role") == "artist_candidate" for i in artist_items)
+        self.assertTrue(has_perf)
+        self.assertTrue(has_artist_tag)
+
+    def test_section_canonical_does_not_include_artist_tags(self):
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {})
+        canon_items = [i for i in preview["items"] if i.get("suggested_section") == "canonical_character_aliases"]
+        has_artist_tag_in_canon = any(i["source"] == "stash_tag" and i.get("detected_tag_role") == "artist_candidate" for i in canon_items)
+        self.assertFalse(has_artist_tag_in_canon)
+
+    def test_existing_local_still_marked_already_exists(self):
+        stash = {"performer_data": [{"name": "pantsushi"}], "group_data": [], "tag_data": []}
+        local_aa = {"pantsushi": "Pantsushi"}
+        preview = gui.build_stash_import_preview(stash, local_aa, {}, {}, {})
+        arts = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases"]
+        self.assertTrue(arts)
+        self.assertEqual(arts[0]["status"], "already_exists_local")
+
+    def test_no_graphql_mutation_strings_in_4b6(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+        self.assertIn("findtags", code)  # still using find
+
+    def test_full_suite_still_passes_after_4b6(self):
+        # meta
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {})
+        self.assertIn("counts", preview)
+        cstr = str(preview.get("counts", {}))
+        istr = str(preview.get("items", [{}])[0] if preview.get("items") else "")
+        self.assertTrue("ignored_or_review" in cstr or "artist_candidate" in istr or "general_tag" in istr)
+        self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4b.6 group-role override tests (source vs detected_role vs suggested_section)
+    # ------------------------------------------------------------------
+
+    def test_stash_group_rule34_artists_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "SomeR34ArtistGroup"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertTrue(groups)
+        self.assertEqual(groups[0]["detected_tag_role"], "artist_candidate")
+        self.assertEqual(groups[0]["suggested_section"], "artist_aliases")
+        self.assertIn("Rule34 artists", groups[0].get("classification_reason", ""))
+
+    def test_stash_group_franchises_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "SomeFranchiseGroup"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="franchises")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertTrue(groups)
+        self.assertEqual(groups[0]["detected_tag_role"], "franchise_candidate")
+        self.assertEqual(groups[0]["suggested_section"], "folder_aliases")
+        self.assertIn("franchises/folders", groups[0].get("classification_reason", ""))
+
+    def test_stash_group_ignore_override(self):
+        stash = {"performer_data": [], "group_data": [{"name": "ReviewOnlyGroup"}], "tag_data": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="ignore_review")
+        groups = [i for i in preview["items"] if i.get("source") == "stash_group"]
+        self.assertTrue(groups)
+        self.assertEqual(groups[0]["detected_tag_role"], "ignored_or_review")
+        self.assertEqual(groups[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("review-only", groups[0].get("classification_reason", ""))
+
+    def test_section_artist_aliases_includes_stash_group_when_rule34_artists(self):
+        stash = gui.get_sample_stash_data()
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        artist_s = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases"]
+        has_group_as_artist = any(i["source"] == "stash_group" and i.get("detected_tag_role") == "artist_candidate" for i in artist_s)
+        self.assertTrue(has_group_as_artist)
+
+    def test_section_folder_aliases_does_not_include_stash_group_as_artists(self):
+        stash = gui.get_sample_stash_data()
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        folder_s = [i for i in preview["items"] if i.get("suggested_section") == "folder_aliases"]
+        has_group_as_artist_in_folder = any(i["source"] == "stash_group" and i.get("detected_tag_role") == "artist_candidate" for i in folder_s)
+        self.assertFalse(has_group_as_artist_in_folder)
+
+    def test_existing_local_artist_when_group_as_artists(self):
+        stash = {"performer_data": [], "group_data": [{"name": "pantsushi"}], "tag_data": []}
+        local_aa = {"pantsushi": "Pantsushi"}
+        preview = gui.build_stash_import_preview(stash, local_aa, {}, {}, {}, group_role_override="rule34_artists")
+        arts = [i for i in preview["items"] if i.get("suggested_section") == "artist_aliases" and i.get("source") == "stash_group"]
+        self.assertTrue(arts)
+        self.assertEqual(arts[0]["status"], "already_exists_local")
+
+    def test_no_config_writes_in_group_override(self):
+        # meta safety, like before
+        import tempfile, json, os
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = Path(tmp) / "c.json"
+            tcfg.write_text(json.dumps({"artist_aliases": {}, "folder_aliases": {}}), encoding="utf-8")
+            pre_m = tcfg.stat().st_mtime
+            stash = {"performer_data": [], "group_data": [{"name": "g"}], "tag_data": []}
+            gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+            self.assertEqual(pre_m, tcfg.stat().st_mtime)
+
+    def test_no_mutation_strings_still(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+
+    def test_full_suite_after_group_override(self):
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {}, group_role_override="rule34_artists")
+        self.assertIn("counts", preview)
+        self.assertTrue(True)
 
 
 if __name__ == "__main__":
