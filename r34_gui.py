@@ -2100,16 +2100,17 @@ class OrganizerGUI:
             # Optional header
             ttk.Label(parent, text=disp_name, font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0,4))
 
-            if cat in ("artists", "franchises", "character_mappings", "canonical_character_aliases", "learned"):
+            if cat in ("artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases", "learned"):
                 # Re-use the 4a/prior editable UI code, adapted to pack into 'parent' instead of tab frame 'f'.
                 # All live refresh, 4 buttons, select populate, counts, terminology, help, save-unaffected logic preserved.
-                if cat == "artists":
+                # Use stable internal keys (not display labels) for routing.
+                if cat == "artist_aliases":
                     edit_d = self._edit_artist_aliases
                     tab_title = "Artists"
                     key_label = "Alias (key):"
                     val_label = "Canonical / Folder:"
                     help_text = None
-                elif cat == "franchises":
+                elif cat == "folder_aliases":
                     edit_d = self._edit_folder_aliases
                     tab_title = "Folder aliases"
                     key_label = "Alias (key):"
@@ -2150,6 +2151,12 @@ class OrganizerGUI:
 
                 lst = tk.Listbox(parent, height=10)
                 lst.pack(fill="both", expand=True, padx=2, pady=2)
+
+                # Empty-state for editable categories (Phase 4a.5 bugfix): show helpful message if empty at open,
+                # but ALWAYS show the editable controls (Add New etc.). Do not treat as view-only.
+                if len(edit_d) == 0:
+                    empty_msg = f"No local {tab_title.lower()} yet. Use Add New to create one, or import from Stash in a later phase."
+                    ttk.Label(parent, text=empty_msg, wraplength=600, foreground="gray").pack(anchor="w", pady=2)
 
                 def _repop_list(edit_d=edit_d, lst=lst, count_label=count_label, tab_title=tab_title, cat=cat):
                     term = filter_var.get().lower().strip()
