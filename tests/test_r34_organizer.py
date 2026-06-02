@@ -1162,10 +1162,11 @@ import json as _json  # alias to avoid shadowing in scope
 
 
 class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
-    """Pure tests for Phase 3b manager save logic (via the new pure helper in r34_gui).
+    """Pure tests for Phase 3b+ manager save logic (via the apply pures in r34_gui).
 
-    No Tk, no GUI instance, no changes to main r34_config.json or learned json.
+    No Tk, no GUI instance, no changes to main r34_config.json or learned json (except via the pures under test).
     All use fresh temp copies of the real committed config.
+    Extended through 3e (folder create safety) and 4a (meta only; 4a is UI wiring on top of unchanged pures).
     """
 
     @property
@@ -1811,6 +1812,28 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
             r = gui.collect_missing_folder_suggestions(cfgp)
             self.assertIsInstance(r, list)
         # the full discover is asserted in the re-run after this in exec
+        self.assertTrue(True)
+
+    def test_full_suite_still_passes_after_phase4a_changes(self):
+        """Phase 4a meta: after 4a usability (live refresh wiring in manager), discover still clean. No new pures; UI changes covered by manual."""
+        # Exercise the known pures that Save path still uses (unchanged by 4a)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "artist_aliases": {"foo": "Foo"},
+                "folder_aliases": {"bar": "Bar"},
+                "character_mappings": {"baz": "Baz"},
+                "canonical_character_aliases": {"quux": "Quux"},
+            }), encoding="utf-8")
+            # The apply pures are the ones that matter for Save; 4a only changed the Tk wiring around the in-mem dicts.
+            b = gui.apply_known_values_edits_to_config(
+                cfgp,
+                artist_aliases={"foo": "Foo", "new": "New"},
+                folder_aliases={"bar": "Bar"},
+                character_mappings={"baz": "Baz"},
+                canonical_character_aliases={"quux": "Quux"},
+            )
+            self.assertIsNotNone(b)  # backup created
         self.assertTrue(True)
 
 

@@ -1990,12 +1990,16 @@ class OrganizerGUI:
             self.status_var.set(f"Refresh failed: {e}")
 
     def _open_known_values_manager(self):
-        # Phase 3e (per directive): 5 editable sections (3a/3b/3c) + learned + dest folders as view-only validation tab EXTENDED with safe missing-folder creation suggestions (collect from 3 sources, Generate plan in-mem only, explicit Create Selected with askyesno listing *exact* paths, mkdir only for safe under dest_root, report md only on execute).
-        # Resolutions + characters remain view-only. No auto-create on open/refresh/validate/Generate. No del/rename/move. validate rejects unsafe. r34_config + learned json untouched by 3e create tools.
+        # Phase 4a (per directive): usability fixes on the *existing* 5 editable tabs only (artists, franchises, character_mappings, canonical_character_aliases, learned).
+        # Split "Add / Update" into Add New + Update Selected + Remove Selected + Clear Selection/New Entry.
+        # Selecting row populates fields. Live list + count refresh immediately after Add/Update/Remove/Clear (before Save).
+        # Count labels + improved terminology + clarifying help text (exact for the two char sections).
+        # dest_folders/resolutions remain view-only validation (3d/3e). Save/backup logic 100% unchanged.
+        # No Stash import, no new sections, no name-gen/preview/apply changes, no org.py edits.
         # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
-        # Do not implement full Phase 3 / folder rename/delete/move / res editing. Keep all prior editable behavior 100% unchanged.
+        # Stop after 4a. Do not proceed to 4b.
         win = tk.Toplevel(self.root)
-        win.title("Known Values Manager (Phase 3e: 5 editable + learned + dest_folders view+safe explicit missing-folder creation suggestions (Generate then Create with confirm dialog) + res view-only; %f backups for editable; stop per directive)")
+        win.title("Known Values Manager (Phase 4a: 5 editable tabs usability - split buttons + Clear + live list/count refresh on Add/Update/Remove/Clear + counts + better char labels+help; dest/res view-only; %f backups; stop per directive)")
         win.geometry("820x600")
 
         # Load structured dicts (not the flattened correction_known lists) for schema edit of the 4 allowed (3a/3b) + learned (3c only).
@@ -2042,38 +2046,54 @@ class OrganizerGUI:
             nb.add(f, text=label)
 
             if cat in ("artists", "franchises", "character_mappings", "canonical_character_aliases", "learned"):
-                # Schema-aware 2-field editor for the 4 allowed (3a/3b) + learned (3c only). Reuse 3a/3b pattern, no UI rewrite.
+                # Phase 4a usability: 5 editable tabs (kept from 3c/3b/3a). Split buttons, select populates fields,
+                # live list+count refresh after every Add New / Update Selected / Remove / Clear (before Save),
+                # count labels, improved terminology + clarifying help text (esp. for the two char sections).
+                # Save/backup behavior unchanged. No Stash, no new sections, no dest/res editing.
                 if cat == "artists":
                     edit_d = self._edit_artist_aliases
+                    tab_title = "Artists"
                     key_label = "Alias (key):"
                     val_label = "Canonical / Folder:"
+                    help_text = None
                 elif cat == "franchises":
                     edit_d = self._edit_folder_aliases
+                    tab_title = "Folder aliases"
                     key_label = "Alias (key):"
                     val_label = "Canonical / Folder:"
+                    help_text = None
                 elif cat == "character_mappings":
                     edit_d = self._edit_character_mappings
-                    key_label = "Character alias/key:"
+                    tab_title = "Character mappings"
+                    key_label = "Character alias / filename match text:"
                     val_label = "Franchise/folder:"
+                    help_text = ("Alias / match text is what the organizer looks for in filenames. "
+                                 "Canonical name is the clean display name used in output filenames.\n"
+                                 "Character mappings decide the destination franchise/folder.")
                 elif cat == "canonical_character_aliases":
                     edit_d = self._edit_canonical_character_aliases
-                    key_label = "Character alias/key:"
+                    tab_title = "Canonical aliases"
+                    key_label = "Character alias / filename match text:"
                     val_label = "Canonical display name:"
+                    help_text = ("Alias / match text is what the organizer looks for in filenames. "
+                                 "Canonical name is the clean display name used in output filenames.\n"
+                                 "Canonical character aliases decide the display name used in output filenames.")
                 else:  # learned (Phase 3c)
                     edit_d = self._edit_learned_mappings
+                    tab_title = "Learned mappings"
                     key_label = "Learned character/key:"
                     val_label = "Franchise/folder:"
+                    help_text = None
 
-                lst = tk.Listbox(f, height=12)
+                # Count label (Phase 4a)
+                count_label = ttk.Label(f, text="")
+                count_label.pack(pady=(2,0))
+
+                lst = tk.Listbox(f, height=10)
                 lst.pack(fill="both", expand=True, padx=4, pady=2)
 
-                def _repop_list():
-                    lst.delete(0, "end")
-                    for k in sorted(edit_d.keys()):
-                        lst.insert("end", f"{k} -> {edit_d[k]}")
-
-                _repop_list()
-
+                # Create entry widgets EARLY so that ALL callback defs (which close over them) see the per-tab instances.
+                # This + default args in defs fixes the loop closure late-binding bug.
                 frm = ttk.Frame(f)
                 frm.pack(fill="x", padx=4, pady=4)
                 ttk.Label(frm, text=key_label).pack(side="left")
@@ -2083,16 +2103,70 @@ class OrganizerGUI:
                 canon_ent = ttk.Entry(frm, width=22)
                 canon_ent.pack(side="left", padx=2)
 
-                def _do_add_or_update():
+                # Define helpers and callbacks AFTER all per-tab widgets exist, using default args to bind
+                # the iteration's values (edit_d, lst, etc.) at def time. This prevents all closures from
+                # seeing only the *last* tab's objects after the for-loop ends.
+                def _update_count(edit_d=edit_d, count_label=count_label, tab_title=tab_title, cat=cat):
+                    suffix = "learned entries" if cat == "learned" else "local entries"
+                    count_label.config(text=f"{tab_title}: {len(edit_d)} {suffix}")
+
+                def _repop_list(edit_d=edit_d, lst=lst, count_label=count_label, _update_count=_update_count):
+                    lst.delete(0, "end")
+                    for k in sorted(edit_d.keys()):
+                        lst.insert("end", f"{k} -> {edit_d[k]}")
+                    _update_count()
+
+                def _on_select(evt=None, lst=lst, alias_ent=alias_ent, canon_ent=canon_ent):
+                    sel = lst.curselection()
+                    if not sel:
+                        return
+                    line = lst.get(sel[0])
+                    if " -> " in line:
+                        k, v = line.split(" -> ", 1)
+                        alias_ent.delete(0, "end")
+                        alias_ent.insert(0, k)
+                        canon_ent.delete(0, "end")
+                        canon_ent.insert(0, v)
+
+                lst.bind("<<ListboxSelect>>", _on_select)
+
+                _repop_list()
+
+                # Phase 4a: separate buttons + live refresh (list + count + status) immediately, before Save.
+                def _do_add_new(edit_d=edit_d, lst=lst, count_label=count_label, alias_ent=alias_ent, canon_ent=canon_ent, _repop_list=_repop_list):
                     a = alias_ent.get().strip()
                     c = canon_ent.get().strip()
                     if not a or not c:
                         return
                     nk = org.normalize(a) if (org and hasattr(org, "normalize")) else a.lower().replace(" ", "")
+                    if nk in edit_d:
+                        if not messagebox.askyesno("Overwrite existing?", f"Key '{nk}' already exists. Overwrite its value?"):
+                            return
                     edit_d[nk] = c
                     _repop_list()
+                    self.status_var.set(f"Added new entry for {nk} (live in list, before Save).")
 
-                def _do_remove():
+                def _do_update_selected(edit_d=edit_d, lst=lst, alias_ent=alias_ent, canon_ent=canon_ent, _repop_list=_repop_list):
+                    sel = lst.curselection()
+                    if not sel:
+                        messagebox.showwarning("No selection", "Select a row first to Update Selected.")
+                        return
+                    line = lst.get(sel[0])
+                    if " -> " not in line:
+                        return
+                    old_k = line.split(" -> ", 1)[0]
+                    a = alias_ent.get().strip()
+                    c = canon_ent.get().strip()
+                    if not a or not c:
+                        return
+                    nk = org.normalize(a) if (org and hasattr(org, "normalize")) else a.lower().replace(" ", "")
+                    if old_k != nk and old_k in edit_d:
+                        edit_d.pop(old_k, None)  # support key rename via the Alias field
+                    edit_d[nk] = c
+                    _repop_list()
+                    self.status_var.set(f"Updated {nk} (live in list, before Save).")
+
+                def _do_remove(edit_d=edit_d, lst=lst, _repop_list=_repop_list):
                     sel = lst.curselection()
                     if not sel:
                         return
@@ -2101,12 +2175,21 @@ class OrganizerGUI:
                         k = line.split(" -> ", 1)[0]
                         edit_d.pop(k, None)
                         _repop_list()
+                        self.status_var.set(f"Removed {k} (live in list; no Save required to disappear).")
 
-                ttk.Button(frm, text="Add / Update", command=_do_add_or_update).pack(side="left", padx=4)
-                ttk.Button(frm, text="Remove Selected", command=_do_remove).pack(side="left")
+                def _do_clear(lst=lst, alias_ent=alias_ent, canon_ent=canon_ent):
+                    lst.selection_clear(0, "end")
+                    alias_ent.delete(0, "end")
+                    canon_ent.delete(0, "end")
+                    self.status_var.set("Cleared selection / new entry mode. Fill Alias + Value then click Add New.")
+
+                ttk.Button(frm, text="Add New", command=_do_add_new).pack(side="left", padx=2)
+                ttk.Button(frm, text="Update Selected", command=_do_update_selected).pack(side="left", padx=2)
+                ttk.Button(frm, text="Remove Selected", command=_do_remove).pack(side="left", padx=2)
+                ttk.Button(frm, text="Clear Selection / New Entry", command=_do_clear).pack(side="left", padx=2)
 
                 if cat == "learned":
-                    def _do_reload_learned():
+                    def _do_reload_learned(edit_d=edit_d, _repop_list=_repop_list):
                         try:
                             lp = resolve_learned_mappings_path(cpath, cfg)
                             new_d = {}
@@ -2121,7 +2204,11 @@ class OrganizerGUI:
                             pass
                     ttk.Button(frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
 
-                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res views in 3d/3e - 3e adds controlled suggestions+create) untouched."
+                # Phase 4a explanatory help text for the two character sections (exact per spec)
+                if help_text:
+                    ttk.Label(f, text=help_text, wraplength=700, justify="left").pack(pady=2)
+
+                note = "Phase 4a: edits are in-memory only until Save. All lists + counts refresh live after Add New / Update Selected / Remove / Clear (before Save is clicked). Clear switches to new-entry mode. Backups created on Save as before."
                 ttk.Label(f, text=note).pack(pady=2)
             else:
                 # Phase 3d/3e view-only tabs: dest_folders (extended with 3e suggestions + explicit create) + characters + resolutions (improved).
@@ -2310,10 +2397,10 @@ class OrganizerGUI:
                     ttk.Label(f, text=note).pack(pady=2)
 
         def _save_known_values_changes():
-            # Phase 3e save (extended from 3d/3c/3b/3a): use pures for 4 config sections + learned (separate file).
+            # Phase 4a save (unchanged from 3e/3d/3c/3b/3a): use pures for 4 config sections + learned (separate file).
             # Backups (collision-proof %f) created inside helpers before any write.
-            # Only the 5 allowed (3a/3b/3c) keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res views (3d/3e) never edited or written by Save.
-            # 3e folder creation (if any) is side-effect under dest_root only via the explicit dest tab button after dialog; never mutates the json files.
+            # Only the 5 allowed keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res views never edited or written by Save.
+            # 4a changes are purely UI (live refresh, buttons, counts, labels) on the editable tabs; no new write paths.
             try:
                 cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
                 if not cpath or not cpath.exists():
@@ -2366,7 +2453,7 @@ class OrganizerGUI:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; dest/res 3d/3e views untouched - 3e creation is separate explicit button in dest tab)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; Phase 4a UI polish only - live edits before Save; dest/res views untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
     def _sort_tree(self, col):
