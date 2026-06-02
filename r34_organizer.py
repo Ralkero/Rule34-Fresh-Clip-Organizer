@@ -22,6 +22,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -307,10 +309,14 @@ def default_config_path() -> Path:
 
 def load_learned_franchises(config: Config) -> Dict[str, str]:
     """Load manually confirmed learned franchises (safe, user-reviewed)."""
-    p = Path(config.learned_franchises_file)
-    if not p.exists():
-        # also check next to config
-        p = default_config_path().with_name(p.name)
+    fname = Path(config.learned_franchises_file).name
+    loaded = getattr(config, "_loaded_config_path", None)
+    if loaded:
+        p = Path(loaded).with_name(fname)
+    else:
+        p = Path(config.learned_franchises_file)
+        if not p.exists():
+            p = default_config_path().with_name(fname)
     if p.exists():
         try:
             return {normalize(k): v for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
@@ -323,9 +329,14 @@ def write_pending_learned_franchises(new_mappings: Dict[str, str], config: Confi
     """Write new Grok-derived mappings to .pending.json for manual review/rename."""
     if not new_mappings:
         return Path()
-    p = Path(config.learned_franchises_file).with_suffix(".pending.json")
-    if not p.parent.exists():
-        p = default_config_path().with_name(p.name)
+    fname = Path(config.learned_franchises_file).with_suffix(".pending.json").name
+    loaded = getattr(config, "_loaded_config_path", None)
+    if loaded:
+        p = Path(loaded).with_name(fname)
+    else:
+        p = Path(config.learned_franchises_file).with_suffix(".pending.json")
+        if not p.parent.exists():
+            p = default_config_path().with_name(fname)
     existing = {}
     if p.exists():
         try:
@@ -359,9 +370,14 @@ def write_learned_franchises(mappings: Dict[str, str], config: Config) -> Path:
     """
     if not mappings:
         return Path()
-    p = Path(config.learned_franchises_file)
-    if not p.parent.exists() or not p.parent.is_dir():
-        p = default_config_path().with_name(p.name)
+    fname = Path(config.learned_franchises_file).name
+    loaded = getattr(config, "_loaded_config_path", None)
+    if loaded:
+        p = Path(loaded).with_name(fname)
+    else:
+        p = Path(config.learned_franchises_file)
+        if not p.parent.exists() or not p.parent.is_dir():
+            p = default_config_path().with_name(fname)
     existing: Dict[str, str] = {}
     if p.exists():
         try:
@@ -392,9 +408,14 @@ def revert_learned_franchise(char_norm: str, applied_franchise: str, pre_franchi
     """
     if not char_norm:
         return False
-    p = Path(config.learned_franchises_file)
-    if not p.exists():
-        p = default_config_path().with_name(p.name)
+    fname = Path(config.learned_franchises_file).name
+    loaded = getattr(config, "_loaded_config_path", None)
+    if loaded:
+        p = Path(loaded).with_name(fname)
+    else:
+        p = Path(config.learned_franchises_file)
+        if not p.exists():
+            p = default_config_path().with_name(fname)
     if not p.exists():
         return False
     try:
@@ -498,7 +519,11 @@ def build_reference_data(destination_root: Path, config: Optional[Config] = None
     canonical_character_aliases: Dict[str, str] = {}
     resolution_counts: Dict[str, Counter] = {}
     naming_sample_count = 0
+    learned = load_learned_franchises(config) if config else {}
     if config:
+        # learned first so that explicit config mappings/aliases take priority (per P3)
+        for ck in learned:
+            add_canonical_character_aliases(canonical_character_aliases, ck)
         canonical_character_aliases.update(config.canonical_character_aliases)
 
     if destination_root.exists():
@@ -538,11 +563,6 @@ def build_reference_data(destination_root: Path, config: Optional[Config] = None
         resolution_labels=resolution_labels,
         learned_resolution_buckets=sorted_resolution_buckets(resolution_counts.keys()),
     )
-    learned = load_learned_franchises(config) if config else {}
-    if learned:
-        for ck, folder in learned.items():
-            if ck not in character_mappings:
-                pass
     ref_learned = learned or {}
     return ReferenceData(folders, artist_precedent, token_precedent, canonical_character_aliases, naming_style, learned_franchises=ref_learned)
 
@@ -2390,18 +2410,25 @@ def write_preview_summary(
     for folder, count in sorted(by_folder.items(), key=lambda item: (-item[1], item[0])):
         lines.append(f"- {folder}: {count}")
 
-    # Angle pack quarantine section (if any activity happened)
-    if angle_quarantine_report and (angle_quarantine_report.get("quarantined_count", 0) > 0 or angle_quarantine_report.get("rejected")):
+    # Angle pack quarantine / suggestion section (Priority 1 repair: surface suggestions even with 0 moves performed)
+    if angle_quarantine_report and (angle_quarantine_report.get("quarantined_count", 0) > 0 or angle_quarantine_report.get("confirmed") or angle_quarantine_report.get("rejected")):
         lines.extend(["", "## Angle Pack Quarantine", ""])
         qcount = angle_quarantine_report.get("quarantined_count", 0)
-        lines.append(f"- Individual camera variants moved: {qcount}")
+        if qcount > 0:
+            lines.append(f"- Individual camera variants moved: {qcount}")
+        else:
+            lines.append("- Individual camera variants: 0 moved (suggestions only; preview is read-only)")
         confirmed = angle_quarantine_report.get("confirmed", [])
         if confirmed:
             strong = sum(1 for c in confirmed if c.get("confidence") == "strong")
-            lines.append(f"- Confirmed compilations: {len(confirmed)} ({strong} strong confidence)")
+            label = "Suggested compilations (not performed)" if qcount == 0 else "Confirmed compilations"
+            lines.append(f"- {label}: {len(confirmed)} ({strong} strong confidence)")
             for c in confirmed[:10]:
-                dur = f" (dur×{c['duration_ratio']})" if c.get("duration_ratio") else ""
-                lines.append(f"  - {c['base']}... — {c['num_cams']} cams, {c['confidence']}{dur}")
+                dur = f" (dur×{c.get('duration_ratio')})" if c.get('duration_ratio') else ""
+                cams_note = ""
+                if qcount == 0 and c.get("cam_files"):
+                    cams_note = f" (example cams: {', '.join(c['cam_files'][:3])}...)"
+                lines.append(f"  - {c['base']}... — {c['num_cams']} cams, {c['confidence']}{dur}{cams_note}")
         rejected = angle_quarantine_report.get("rejected", [])
         if rejected:
             lines.append(f"- All Angles with no matching individual cams found: {len(rejected)}")
@@ -2431,10 +2458,14 @@ def command_preview(args: argparse.Namespace) -> int:
     reference = build_reference_data(config.destination_root, config)
     files = discover_videos(source, config, show_progress=True)
 
-    # Angle pack quarantine (high-confidence only when matching individual cams are found)
+    # Angle pack detection (read-only in normal preview).
+    # --quarantine-angle-variants now means "detect + report suggestions in CSV/summary".
+    # Actual moves never happen from the preview command (perform_quarantine=False).
+    # Affected files will be present in the CSV with status="angle_variant_review" etc.
     angle_quarantine_report: Dict[str, Any] = {"quarantined_count": 0, "confirmed": [], "rejected": []}
-    if getattr(args, "quarantine_angle_variants", True):
-        files, angle_quarantine_report = quarantine_angle_variants(files, source, config)
+    if getattr(args, "quarantine_angle_variants", False):
+        # Force read-only even if caller passed the flag; preview is never destructive.
+        files, angle_quarantine_report = quarantine_angle_variants(files, source, config, perform_quarantine=False)
 
     # Progress indicator for analysis phase (the longest part of preview)
     rows = []
@@ -2457,6 +2488,10 @@ def command_preview(args: argparse.Namespace) -> int:
                 print(f"\r  [{bar}] {percent:3d}% ({i}/{total})", end="", flush=True)
                 last_percent = percent
         print()  # Finish the progress line
+
+    # Post-process angle variant suggestions (Priority 1 repair) via helper.
+    # Ensures explicit visibility in CSV (status/notes) without omitting files.
+    mark_angle_variants_for_review(rows, angle_quarantine_report)
 
     # Collect new Grok-derived character -> franchise mappings for pending review
     new_learned: Dict[str, str] = {}
@@ -2492,20 +2527,28 @@ def command_preview(args: argparse.Namespace) -> int:
 
 
 def quarantine_angle_variants(
-    files: List[Path], source: Path, config: Config
+    files: List[Path], source: Path, config: Config, *, perform_quarantine: bool = False
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Detect camera angle packs with *high confidence*.
 
-    Only quarantines individual "Cam X" files when we can prove there exists
-    an "All Angles" (or equivalent) compilation *of those exact variants*
-    elsewhere in the source directory.
+    Preview behavior (perform_quarantine=False, the safe default):
+      - Detects matching All-Angles + individual Cam packs.
+      - Populates report["confirmed"] / rejected.
+      - **Never moves, renames, quarantines or deletes files.**
+      - The caller (preview) will ensure affected files appear in the CSV with
+        explicit status="angle_variant_review", approved="no" and notes so they
+        are visible for review (never silently omitted).
 
-    Method:
+    When perform_quarantine=True (only for explicit/opt-in use outside normal preview):
+      - Actually moves the individual cam files into the variants subfolder.
+      - Updates moved_count and prints "Quarantined...".
+
+    Method (detection always runs):
       For each "All Angles" file, extract its precise scene base (text immediately
       before "All Angles"). Then scan the source for real individual cam files
       whose names begin with that exact base + " Cam ".
 
-      If such matching cam files are found -> quarantine them (with optional
+      If such matching cam files are found -> (optionally) quarantine them (with optional
       duration cross-check for extra confidence).
       If no matching individual cams exist for that base -> record as rejected.
 
@@ -2513,9 +2556,10 @@ def quarantine_angle_variants(
         (remaining_files, report_dict)
 
     The report contains:
-      - quarantined_count
-      - confirmed: list of dicts with base, num_cams, confidence ("strong"/"medium"), duration_ratio (if checked)
+      - quarantined_count (actual moves performed; 0 when !perform_quarantine)
+      - confirmed: list of dicts with base, num_cams, confidence, duration_ratio, and cam_files (names)
       - rejected: list of bases that had an All Angles but no matching cams
+      - (when !perform) the confirmed entries still list what *would* be quarantined
     """
     if not files:
         return files, {"quarantined_count": 0, "confirmed": [], "rejected": []}
@@ -2586,23 +2630,26 @@ def quarantine_angle_variants(
             "num_cams": len(individual_cams),
             "confidence": confidence,
             "duration_ratio": round(duration_ratio, 2) if duration_ratio else None,
+            "cam_files": [p.name for p in individual_cams],
         })
 
-        variants_dir.mkdir(parents=True, exist_ok=True)
+        if perform_quarantine:
+            variants_dir.mkdir(parents=True, exist_ok=True)
 
-        for cam_file in individual_cams:
-            dest = variants_dir / cam_file.name
-            try:
-                if not dest.exists():
-                    shutil.move(str(cam_file), str(dest))
-                    print(f"  Quarantined camera variant -> {variants_folder_name}/ : {cam_file.name}")
-                    moved_count += 1
-                else:
-                    print(f"  (already quarantined) {cam_file.name}")
-            except Exception as ex:
-                print(f"  Warning: failed to move {cam_file.name}: {ex}")
+            for cam_file in individual_cams:
+                dest = variants_dir / cam_file.name
+                try:
+                    if not dest.exists():
+                        _safe_shutil_move(cam_file, dest)
+                        print(f"  Quarantined camera variant -> {variants_folder_name}/ : {cam_file.name}")
+                        moved_count += 1
+                    else:
+                        print(f"  (already quarantined) {cam_file.name}")
+                except Exception as ex:
+                    print(f"  Warning: failed to move {cam_file.name}: {ex}")
+        # else: dry-run / preview mode — report only, no FS mutation
 
-    if moved_count or rejected:
+    if perform_quarantine and (moved_count or rejected):
         print(f"  -> Angle pack quarantine: {moved_count} individual files moved to {variants_folder_name}/")
         if confirmed:
             strong = sum(1 for c in confirmed if c["confidence"] == "strong")
@@ -2612,14 +2659,48 @@ def quarantine_angle_variants(
                 print(f"       • {c['base']}... ({c['num_cams']} cams, {c['confidence']}{dur_info})")
         if rejected:
             print(f"     Rejected (All Angles with no matching cams found): {len(rejected)}")
+    elif not perform_quarantine and confirmed:
+        print(f"  -> Angle pack suggestions (NOT performed — preview is read-only): {len(confirmed)} compilation(s)")
+        strong = sum(1 for c in confirmed if c.get("confidence") == "strong")
+        print(f"     Suggested: {len(confirmed)} ({strong} strong, {len(confirmed)-strong} medium)")
+        for c in confirmed[:6]:
+            dur_info = f", dur×{c.get('duration_ratio')}" if c.get('duration_ratio') else ""
+            cams = ", ".join(c.get("cam_files", [])[:3])
+            print(f"       • {c['base']}... ({c['num_cams']} cams: {cams}..., {c['confidence']}{dur_info})")
+        if rejected:
+            print(f"     Rejected (All Angles with no matching cams found): {len(rejected)}")
 
-    remaining = [f for f in files if variants_dir not in f.parents]
+    # Always return the caller's file list (do not filter here in dry/preview mode).
+    # The caller will ensure any suggested angle variants are visible in the CSV
+    # via explicit status/notes/suggested fields (never silently omitted).
+    remaining = list(files)
     report = {
         "quarantined_count": moved_count,
         "confirmed": confirmed,
         "rejected": rejected,
     }
     return sorted(remaining, key=lambda p: str(p).lower()), report
+
+
+def mark_angle_variants_for_review(rows: list, angle_report: Dict[str, Any]) -> None:
+    """Post-process rows from preview so that detected (but not moved) angle variants
+    are explicitly visible in the CSV plan with status + notes (never silently omitted).
+    Mutates the row dicts in place. Called from command_preview after analyze.
+    """
+    suggested = set()
+    for c in (angle_report or {}).get("confirmed", []):
+        for nm in c.get("cam_files", []):
+            suggested.add(nm)
+    for row in rows:
+        if row.get("original_name") in suggested:
+            row["status"] = "angle_variant_review"
+            row["approved"] = "no"
+            note = "Suggested angle variant quarantine; not moved during preview."
+            existing = (row.get("notes") or "").strip()
+            row["notes"] = f"{existing}; {note}".strip("; ").strip() if existing else note
+            rsn = (row.get("reason") or "").strip()
+            if "angle_variant" not in rsn:
+                row["reason"] = (rsn + ";angle_variant_suggested").strip(";")
 
 
 def replace_config(config: Config, **updates: object) -> Config:
@@ -2751,7 +2832,7 @@ def apply_row(
             result["apply_message"] = str(source)
             return result
         dest = content_review_path(source, source_root, content_review_folder_name, run)
-        shutil.move(str(source), str(dest))
+        _safe_shutil_move(source, dest)
         result["apply_result"] = "held_content_review"
         result["apply_message"] = str(dest)
         return result
@@ -2762,7 +2843,7 @@ def apply_row(
             result["apply_message"] = str(source)
             return result
         dest = content_review_path(source, source_root, silent_animations_folder_name, run)
-        shutil.move(str(source), str(dest))
+        _safe_shutil_move(source, dest)
         result["apply_result"] = "held_silent"
         result["apply_message"] = str(dest)
         return result
@@ -2774,7 +2855,7 @@ def apply_row(
             return result
         folder = review_items_folder_name or review_folder_name
         dest = content_review_path(source, source_root, folder, run)
-        shutil.move(str(source), str(dest))
+        _safe_shutil_move(source, dest)
         result["apply_result"] = "held_for_review"
         result["apply_message"] = str(dest)
         return result
@@ -2782,7 +2863,7 @@ def apply_row(
     if not approved:
         if quarantine_unapproved and source.exists():
             dest = quarantine_path(source, source_root, review_folder_name, run)
-            shutil.move(str(source), str(dest))
+            _safe_shutil_move(source, dest)
             result["apply_result"] = "quarantined_unapproved"
             result["apply_message"] = str(dest)
         else:
@@ -2808,16 +2889,45 @@ def apply_row(
     target = Path(target_text)
     if target.exists():
         dest = quarantine_path(source, source_root, review_folder_name, run)
-        shutil.move(str(source), str(dest))
+        _safe_shutil_move(source, dest)
         result["apply_result"] = "quarantined_duplicate" if likely_same_clip(dest, target) else "quarantined_conflict"
         result["apply_message"] = f"{dest} (target exists: {target})"
         return result
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(target))
+    _safe_shutil_move(source, target)
     result["apply_result"] = "moved"
     result["apply_message"] = str(target)
     return result
+
+
+def _safe_shutil_move(src: str | Path, dst: str | Path, max_retries: int = 8, base_delay: float = 0.25) -> None:
+    """Robust move for Windows file locks (common with video files in Explorer, players, AV).
+
+    Retries on PermissionError/WinError 32 (file in use) with exponential backoff.
+    Other errors are raised immediately.
+    """
+    src_s = str(src)
+    dst_s = str(dst)
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            shutil.move(src_s, dst_s)
+            return
+        except (PermissionError, OSError) as e:
+            last_err = e
+            msg = str(e).lower()
+            winerr = getattr(e, "winerror", None)
+            if winerr == 32 or "being used by another process" in msg or "access is denied" in msg:
+                delay = min(base_delay * (2 ** attempt), 8.0)
+                name = Path(src_s).name
+                print(f"  [move retry {attempt+1}/{max_retries}] File in use, waiting {delay:.1f}s: {name}")
+                time.sleep(delay)
+                continue
+            # non-retryable
+            raise
+    if last_err:
+        raise last_err
 
 
 def write_apply_log(plan: Path, rows: Sequence[Dict[str, str]], run: str) -> Path:
@@ -2843,6 +2953,9 @@ def apply_progress_label(row: Dict[str, str]) -> str:
     original = row.get("original_name") or Path(row.get("source_path", "")).name or "(unknown file)"
     if row.get("apply_result") == "held_content_review" and row.get("apply_message"):
         return f"{original} -> {row['apply_message']}"
+    if row.get("apply_result") == "error":
+        msg = row.get("apply_message", "")
+        return f"{original} -> ERROR ({msg})" if msg else f"{original} -> ERROR"
     target_name = row.get("target_filename") or Path(row.get("target_path", "")).name
     if target_name and target_name != original:
         # Only show the actual filename that will appear in Explorer.
@@ -2878,16 +2991,25 @@ def command_apply(args: argparse.Namespace) -> int:
     if total == 0:
         print("Apply progress: 0/0 (100%) - no rows to process", flush=True)
     for index, row in enumerate(rows, start=1):
-        result = apply_row(
-            row,
-            source_root,
-            run,
-            config.review_folder_name,
-            args.quarantine_unapproved,
-            config.content_review_folder_name,
-            getattr(config, "silent_animations_folder_name", "_r34_silent"),
-            config.review_folder_name,  # folder for "review" status outlier items
-        )
+        try:
+            result = apply_row(
+                row,
+                source_root,
+                run,
+                config.review_folder_name,
+                args.quarantine_unapproved,
+                config.content_review_folder_name,
+                getattr(config, "silent_animations_folder_name", "_r34_silent"),
+                config.review_folder_name,  # folder for "review" status outlier items
+            )
+        except Exception as ex:
+            # Never let one locked/missing file kill the entire apply batch.
+            # Record the failure so the log captures partial success.
+            orig_name = row.get("original_name") or Path(row.get("source_path", "")).name
+            print(f"  ERROR applying row for {orig_name}: {ex}", flush=True)
+            result = dict(row)
+            result["apply_result"] = "error"
+            result["apply_message"] = str(ex)
         # Attach reversible learning metadata to EVERY row (populated for those that qualified).
         # Only rows with apply_result=="moved" will actually cause a write to the learned file.
         char = (row.get("character") or "").strip()
@@ -2972,7 +3094,7 @@ def undo_row(
     if restore_path.exists():
         # Conflict at original location — quarantine the file we're trying to restore
         quarantine_dest = quarantine_path(current_location, source_root, review_folder_name, f"undo_{run}")
-        shutil.move(str(current_location), str(quarantine_dest))
+        _safe_shutil_move(current_location, quarantine_dest)
         result["undo_result"] = "quarantined_conflict_on_undo"
         result["undo_message"] = str(quarantine_dest)
         # Still attempt learning revert: the apply had committed it as part of the original move
@@ -2981,7 +3103,7 @@ def undo_row(
 
     # Safe to restore
     restore_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(current_location), str(restore_path))
+    _safe_shutil_move(current_location, restore_path)
     result["undo_result"] = "restored"
     result["undo_message"] = str(restore_path)
     _maybe_revert_learning(row, config, result)
@@ -3036,7 +3158,15 @@ def command_undo(args: argparse.Namespace) -> int:
     print(f"Source root for restore: {source_root}")
 
     for index, row in enumerate(applied_rows, start=1):
-        result = undo_row(row, source_root, run, "_r34_review", config)
+        try:
+            result = undo_row(row, source_root, run, "_r34_review", config)
+        except Exception as ex:
+            orig_name = row.get("original_name") or Path(row.get("source_path", "")).name
+            print(f"  ERROR undoing row for {orig_name}: {ex}", flush=True)
+            result = dict(row)
+            result["undo_result"] = "error"
+            result["undo_message"] = str(ex)
+            result["learning_reverted"] = ""
         undone.append(result)
 
         percent = round((index / total) * 100) if total else 100
@@ -3064,6 +3194,124 @@ def command_undo(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_eval_namegen(args: argparse.Namespace) -> int:
+    """P5 foundation: run name-gen on cases JSON.
+
+    - Creates temp dummy files only (no user videos required).
+    - Forces use_ai=False and patches the real helpers (probe_resolution, has_audio_stream, get_video_duration).
+    - Prints artist/character/target_folder/filename/status accuracy.
+    - Never calls Grok.
+    """
+    import json as _json
+    from unittest.mock import patch as _patch
+
+    cases_p = Path(args.cases)
+    if not cases_p.exists():
+        print(f"ERROR: cases file not found: {cases_p}")
+        return 1
+    cases = _json.loads(cases_p.read_text(encoding="utf-8"))
+    if not isinstance(cases, list) or not cases:
+        print("No cases or invalid format.")
+        return 0
+
+    total = len(cases)
+    print(f"Eval namegen on {total} cases (synthetic, no Grok, no real videos)...")
+
+    a_ok = c_ok = f_ok = fn_ok = s_ok = 0
+
+    # basic mappings so common cases have a chance (copied subset from test defaults; no new heuristics)
+    basic_char_map = {
+        "2b": "Nier Automata", "2p": "Nier Automata", "a2": "Nier Automata",
+        "d va": "Overwatch", "dva": "Overwatch",
+        "botw zelda": "Legend of Zelda", "palutena": "Kid Icarus",
+        "peach": "Super Mario", "tifa": "Final Fantasy",
+        "chun li": "Street Fighter", "chun-li": "Street Fighter",
+    }
+    basic_canon = {k: v for k, v in basic_char_map.items()}  # simplistic
+    basic_artist = {"pantsushi": "Pantsushi", "nodu": "Nodu", "bewyx": "Bewyx"}
+
+    for case in cases:
+        orig = case.get("original_name") or "case.mp4"
+        parent = case.get("source_parent") or "src"
+        exp = case.get("expected") or {}
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / parent
+            src.mkdir(parents=True, exist_ok=True)
+            dummy = src / orig
+            dummy.write_bytes(b"fake video")
+
+            dest = Path(td) / "dest"
+            dest.mkdir(exist_ok=True)
+
+            # temp config json (ai off, basic maps for the cases)
+            tcfg = {
+                "destination_root": str(dest),
+                "video_extensions": [".mp4"],
+                "ffprobe_path": "ffprobe",
+                "review_folder_name": "_r34_review",
+                "content_review_folder_name": "_r34_content_review",
+                "silent_animations_folder_name": "_r34_silent",
+                "confidence_threshold": 0.9,
+                "allow_create_destination_folders": False,
+                "artist_aliases": basic_artist,
+                "folder_aliases": {},
+                "character_mappings": basic_char_map,
+                "canonical_character_aliases": basic_canon,
+                "title_token_replacements": {},
+                "content_review_terms": {},
+                "junk_tokens": ["1080p", "4k", "unwatermarked"],
+                "preserve_tokens": ["2B", "2P", "D.Va"],
+                "audio_credits": ["audiodude", "evilaudio", "multiaudio"],
+                "known_collectors": ["audio collection"],
+                "collection_folder_indicators": ["collection"],
+                "use_ai_for_unknown_characters": False,
+                "ai_model": "grok-3",
+                "ai_api_key_env_var": "XAI_API_KEY",
+                "auto_load_xai_key": False,
+                "original_character_subfoldering": False,
+                "learned_franchises_file": "learned.json",
+                "extract_embedded_titles": False,
+                "angle_variants_folder_name": "_r34_angle_variants",
+            }
+            tcfg_p = Path(td) / "tcfg.json"
+            tcfg_p.write_text(_json.dumps(tcfg), encoding="utf-8")
+            cfg = load_config(tcfg_p)
+            ref = build_reference_data(dest, cfg)
+
+            with _patch("r34_organizer.probe_resolution", return_value=("1080p", "", "")), \
+                 _patch("r34_organizer.has_audio_stream", return_value=True), \
+                 _patch("r34_organizer.get_video_duration", return_value=120.0), \
+                 _patch("r34_organizer.query_grok_for_character_franchise", return_value=None):
+                row = analyze_file(dummy, src, cfg, ref)
+
+            if (row.get("artist") or "") == (exp.get("artist") or ""):
+                a_ok += 1
+            if (row.get("character") or "") == (exp.get("character") or ""):
+                c_ok += 1
+            if (row.get("target_folder") or "") == (exp.get("target_folder") or ""):
+                f_ok += 1
+            # filename: loose check (contains or matches if provided)
+            tgt = row.get("target_filename") or ""
+            exp_fn = exp.get("target_filename") or ""
+            if exp_fn:
+                if exp_fn in tgt or tgt in exp_fn:
+                    fn_ok += 1
+            else:
+                fn_ok += 1  # if no expectation, count as pass for foundation
+            if (row.get("status") or "") == (exp.get("status") or ""):
+                s_ok += 1
+
+    print("Accuracy (artist/character/folder/filename/status):")
+    def pct(ok): return f"{ok}/{total} ({100*ok/total:.1f}%)" if total else "0/0"
+    print(f"  artist: {pct(a_ok)}")
+    print(f"  character: {pct(c_ok)}")
+    print(f"  folder: {pct(f_ok)}")
+    print(f"  filename: {pct(fn_ok)}")
+    print(f"  status: {pct(s_ok)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preview and apply Rule34 clip renames/moves.")
     parser.add_argument("--config", type=Path, default=default_config_path(), help="Path to JSON config.")
@@ -3078,14 +3326,14 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument(
         "--quarantine-angle-variants",
         action="store_true",
-        default=True,
-        help="Automatically move individual 'Cam X' angle files to a subfolder when an 'All Angles' compilation exists for the same scene (default: on).",
+        default=False,
+        help="Detect individual camera-angle variants when an All Angles compilation exists and report suggested quarantines in the preview output / CSV. This does not move files during preview (normal preview is always read-only).",
     )
     preview.add_argument(
         "--no-quarantine-angle-variants",
         dest="quarantine_angle_variants",
         action="store_false",
-        help="Disable automatic quarantining of individual camera angle variants.",
+        help="Disable angle-variant detection/reporting in the preview (default behavior).",
     )
     preview.set_defaults(func=command_preview)
 
@@ -3103,6 +3351,10 @@ def build_parser() -> argparse.ArgumentParser:
     undo.add_argument("--log", required=True, help="Path to an r34_apply_*.csv log file from a previous apply.")
     undo.add_argument("--source-root", help="Override source root for restoring files (usually not needed).")
     undo.set_defaults(func=command_undo)
+
+    evalp = sub.add_parser("eval-namegen", help="Evaluate current name-generation logic on synthetic cases (no real video files, no Grok/xAI calls). Prints per-field accuracy. Foundation only.")
+    evalp.add_argument("--cases", required=True, help="JSON file with list of {original_name, source_parent?, expected:{artist,character,target_folder,status,...}}")
+    evalp.set_defaults(func=command_eval_namegen)
 
     return parser
 

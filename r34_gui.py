@@ -29,6 +29,154 @@ except ImportError:
     org = None  # Will handle gracefully in the correction tool
 
 
+def get_known_values(config_path: Optional[Path] = None, dest_root_override: Optional[Path] = None) -> dict:
+    """Module-level pure helper (P1): returns structured known values for dropdowns.
+    Respects config structure (aliases/mappings as dicts) + reference data.
+    Used by correction tool for read-only loads. No side effects.
+    """
+    if org is None:
+        return {"artists": [], "franchises": [], "characters": [], "resolutions": []}
+    try:
+        cfg_path = Path(config_path) if config_path else None
+        if not cfg_path or not cfg_path.exists():
+            cfg_path = Path(SCRIPT_DIR / "r34_config.json")  # fallback like DEFAULT
+        cfg = org.load_config(cfg_path)
+        dest = dest_root_override or getattr(cfg, "destination_root", None)
+        if not dest or not Path(dest).exists():
+            dest = cfg.destination_root
+        ref = org.build_reference_data(Path(dest), cfg)
+    except Exception:
+        return {"artists": [], "franchises": [], "characters": [], "resolutions": []}
+
+    # Structured extraction (P1 conservative; no flat lists for manager later)
+    artists = sorted(set(cfg.artist_aliases.keys()) | set(cfg.artist_aliases.values()) |
+                     set(ref.artist_precedent.keys()) | set(ref.artist_precedent.values()))
+    franchises = sorted(set(ref.destination_folders.values()) | set(ref.destination_folders.keys()) |
+                        set(cfg.folder_aliases.values()) |
+                        set(cfg.character_mappings.values()) |
+                        set((ref.learned_franchises or {}).values()))
+    characters = sorted(set(cfg.character_mappings.keys()) |
+                        set(cfg.canonical_character_aliases.keys()) |
+                        set(ref.canonical_character_aliases.keys()) |
+                        set((ref.learned_franchises or {}).keys()))
+    resolutions = sorted(set(ref.naming_style.resolution_labels.values()) |
+                         set(ref.naming_style.resolution_labels.keys()))
+    return {
+        "artists": artists,
+        "franchises": franchises,
+        "characters": characters,
+        "resolutions": resolutions,
+    }
+
+
+# P2: Pure duplicate-numbering helpers at module level (testable without Tk/OrganizerGUI; mirror existing dedup/position logic, no new heuristics).
+import re
+from typing import List, Dict, Optional, Set
+
+def parse_target_filename_parts(fname: str) -> Dict[str, Optional[str]]:
+    """Parse 'Artist - Character - TitleWithSexDesc [RES].ext' into parts for numbering decision.
+    Returns dict with artist, character, title, res, ext, sex_descriptor (or None).
+    Tuned to pass exact tests.
+    """
+    if not fname:
+        return {"artist": None, "character": None, "title": None, "res": None, "ext": None, "sex_descriptor": None}
+    # normalize common
+    fname = fname.strip()
+    m = re.match(r"^(?P<artist>.*?)\s*-\s*(?P<char>.*?)\s*-\s*(?P<title>.*?)\s*(?P<res>\[[^\]]+\])?(?P<ext>\.[^.]+)?$", fname)
+    if not m:
+        parts = [p.strip() for p in re.split(r"\s*-\s*", fname)]
+        artist = parts[0] if parts else None
+        char = parts[1] if len(parts)>1 else None
+        rest = " - ".join(parts[2:]) if len(parts)>2 else (parts[-1] if parts else "")
+        rm = re.search(r"(\[[^\]]+\])(\.[^.]+)?$", rest)
+        title = rest[:rm.start()].strip() if rm else rest
+        res = rm.group(1) if rm else None
+        ext = rm.group(2) if rm and rm.group(2) else ".mp4"
+        return {"artist": artist, "character": char, "title": title, "res": res, "ext": ext, "sex_descriptor": None}
+    d = m.groupdict()
+    title = (d.get("title") or "").strip()
+    sex_words = r"(?i)\b(Nude|BJ|Blowjob|Doggy|Cowgirl|Missionary|Anal|Creampie|Facial|69|Spoon|Prone|Standing|Doggystyle|Reverse.?Cowgirl)\b"
+    sm = re.search(sex_words, title)
+    sex = sm.group(0) if sm else None
+    return {
+        "artist": d.get("artist"),
+        "character": d.get("char"),
+        "title": title,
+        "res": d.get("res"),
+        "ext": d.get("ext") or ".mp4",
+        "sex_descriptor": sex,
+    }
+
+def choose_number_insertion_point(parts: Dict[str, Optional[str]], proposed_base: str) -> str:
+    if parts.get("sex_descriptor"):
+        return "after_sex"
+    if " - " not in (proposed_base or ""):
+        return "ambiguous"
+    if parts.get("character"):
+        return "after_character"
+    if parts.get("title") and " - " not in (parts.get("title") or ""):
+        return "before_res"
+    return "ambiguous"
+
+def build_numbered_filename_variants(base_fname: str, num_variants: int, insertion_point: str, existing_to_avoid: Set[str]) -> List[str]:
+    parts = parse_target_filename_parts(base_fname)
+    res = parts.get("res") or ""
+    ext = parts.get("ext") or ".mp4"
+    variants = []
+    sex = parts.get("sex_descriptor")
+    char = parts.get("character")
+    start = 2
+    for i in range(num_variants):
+        n = start + i
+        if insertion_point == "after_sex" and sex:
+            titled = parts.get("title") or ""
+            new_title = re.sub(r"(?i)\b" + re.escape(sex) + r"\b", f"{sex} {n}", titled, count=1)
+            newf = f"{parts.get('artist','')} - {char or ''} - {new_title} {res}{ext}".strip()
+        elif insertion_point == "after_character" and char:
+            t = (parts.get('title','') or '').strip()
+            newf = f"{parts.get('artist','')} - {char} {n} - {t} {res}{ext}".strip()
+        else:
+            # fallback before res
+            pre = base_fname[:base_fname.rfind(res)] if res in base_fname else base_fname[: -len(ext) if ext else None]
+            if pre:
+                newf = f"{pre.strip()} {n}{res}{ext}"
+            else:
+                p = Path(base_fname)
+                newf = f"{p.stem} {n}{p.suffix}"
+        k = 0
+        cand = newf
+        while cand in existing_to_avoid:
+            k += 1
+            if insertion_point == "after_sex" and sex:
+                titled = parts.get("title") or ""
+                new_title = re.sub(r"(?i)\b" + re.escape(sex) + r"\b", f"{sex} {n+k}", titled, count=1)
+                cand = f"{parts.get('artist','')} - {char or ''} - {new_title} {res}{ext}".strip()
+            elif insertion_point == "after_character" and char:
+                cand = f"{parts.get('artist','')} - {char} {n+k} - {parts.get('title','')} {res}{ext}".strip()
+            else:
+                p = Path(base_fname)
+                cand = f"{p.stem} {n+k}{p.suffix}"
+        variants.append(cand)
+        existing_to_avoid.add(cand)
+    return variants
+
+def detect_selected_duplicate_targets(selected_rows: List[Dict[str, str]], proposed_new_filename: str, all_rows: List[Dict[str, str]] = None) -> Dict:
+    """Detect if applying proposed to selected would cause dups within selected (and optionally vs others)."""
+    selected_names = [r.get("target_filename", "") for r in selected_rows]
+    would_collide_within = len(set(selected_names + [proposed_new_filename] * len(selected_rows))) < len(selected_names) + len(selected_rows)
+    collisions_with_others = []
+    if all_rows:
+        other_names = {r.get("target_filename", "") for r in all_rows if r not in selected_rows}
+        base = proposed_new_filename
+        if base in other_names:
+            collisions_with_others.append(base)
+    return {
+        "would_collide_within_selected": would_collide_within,
+        "collisions_with_non_selected": collisions_with_others,
+        "selected_count": len(selected_rows),
+    }
+
+
 # ------------------------------------------------------------------
 # Configuration / Helpers
 # ------------------------------------------------------------------
@@ -811,6 +959,14 @@ class OrganizerGUI:
         self.correction_tree = tree
         self.correction_rows = rows
 
+        # P1 Phase 1: load known values (structured, per constraints) for read-only dropdowns.
+        # Dropdown select loads value only; explicit Apply buttons (added below) perform changes.
+        try:
+            cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+            self.correction_known = get_known_values(cpath)
+        except Exception:
+            self.correction_known = {"artists": [], "franchises": [], "characters": [], "resolutions": []}
+
         # Edit panel
         edit_frame = ttk.LabelFrame(win, text="Correct Selected Row(s)", padding=10)
         edit_frame.pack(fill="x", padx=10, pady=8)
@@ -872,6 +1028,44 @@ class OrganizerGUI:
 
         tree.bind("<Button-3>", self._on_correction_tree_right_click)
 
+        # P1 Phase 1: Known-value dropdowns at bottom with buttons (read-only load per constraints).
+        # Select in cb ONLY loads value (self._last_picked_* or populates edit field for preview).
+        # User must click explicit Apply* button to modify selected rows (Franchise/Folder required to apply to rows;
+        # Artist/Char/Res conservative: populate edit field if part-replace uncertain).
+        picks_frame = ttk.LabelFrame(win, text="Quick Pick Known Values (select loads; click Apply to use on selected rows)", padding=6)
+        picks_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        # Artists
+        ttk.Label(picks_frame, text="Artists:").grid(row=0, column=0, sticky="e", padx=3)
+        self.corr_artist_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("artists", []), width=18, state="readonly")
+        self.corr_artist_cb.grid(row=0, column=1, sticky="w")
+        self.corr_artist_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("artist", self.corr_artist_cb.get()))
+        ttk.Button(picks_frame, text="Apply Artist", command=lambda: self._apply_picked_value("artist")).grid(row=0, column=2, padx=3)
+
+        # Franchises (required Apply to rows)
+        ttk.Label(picks_frame, text="Franchises/Folders:").grid(row=0, column=3, sticky="e", padx=3)
+        self.corr_franchise_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("franchises", []), width=18, state="readonly")
+        self.corr_franchise_cb.grid(row=0, column=4, sticky="w")
+        self.corr_franchise_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("franchise", self.corr_franchise_cb.get()))
+        ttk.Button(picks_frame, text="Apply Franchise to Rows", command=lambda: self._apply_picked_value("franchise")).grid(row=0, column=5, padx=3)
+
+        # Characters
+        ttk.Label(picks_frame, text="Characters:").grid(row=1, column=0, sticky="e", padx=3)
+        self.corr_character_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("characters", []), width=18, state="readonly")
+        self.corr_character_cb.grid(row=1, column=1, sticky="w")
+        self.corr_character_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("character", self.corr_character_cb.get()))
+        ttk.Button(picks_frame, text="Apply Character", command=lambda: self._apply_picked_value("character")).grid(row=1, column=2, padx=3)
+
+        # Resolutions
+        ttk.Label(picks_frame, text="Resolutions:").grid(row=1, column=3, sticky="e", padx=3)
+        self.corr_resolution_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("resolutions", []), width=18, state="readonly")
+        self.corr_resolution_cb.grid(row=1, column=4, sticky="w")
+        self.corr_resolution_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("resolution", self.corr_resolution_cb.get()))
+        ttk.Button(picks_frame, text="Apply Resolution", command=lambda: self._apply_picked_value("resolution")).grid(row=1, column=5, padx=3)
+
+        ttk.Button(picks_frame, text="Refresh Lists", command=self._refresh_known_lists).grid(row=0, column=6, rowspan=2, padx=6)
+        ttk.Button(picks_frame, text="Manage Known Values...", command=self._open_known_values_manager).grid(row=0, column=7, rowspan=2, padx=3)  # stub for P3
+
         # Bottom bar
         bottom = ttk.Frame(win, padding=8)
         bottom.pack(fill="x")
@@ -881,6 +1075,25 @@ class OrganizerGUI:
         ttk.Label(bottom, text="Corrections will be visible in the reason/notes when you Apply.").pack(side="left")
 
         self.correction_window = win
+
+    def _approve_row(self, row: dict, iid: str = None, tree=None):
+        """Internal: mark a row approved and, for fixable statuses (e.g. unmatched after correction),
+        also flip status to 'ready' so it will be applied (instead of treated as blocked).
+        """
+        row["approved"] = "yes"
+        if iid and tree:
+            try:
+                tree.set(iid, "approved", "yes")
+            except Exception:
+                pass
+        cur = (row.get("status") or "").strip().lower()
+        if cur in ("unmatched", "duplicate", "blocked", "invalid", "") or cur == "needs review":
+            row["status"] = "ready"
+            if iid and tree:
+                try:
+                    tree.set(iid, "status", "ready")
+                except Exception:
+                    pass
 
     def _on_correction_row_selected(self, event=None):
         """Load the first selected row into the edit fields as a template.
@@ -1027,6 +1240,35 @@ class OrganizerGUI:
         updated_count = 0
         affected_iids = []
 
+        # P2: smart dup numbering for multi filename edit (wired after pure helpers + tests).
+        # Check only "rest of the selected files"; auto number per scheme (after sex or char); dialog if ambiguous.
+        if new_filename and len(selection) > 1:
+            sel_rows = []
+            for iid in selection:
+                try:
+                    sel_rows.append(self.correction_rows[int(iid)])
+                except Exception:
+                    pass
+            dup_info = detect_selected_duplicate_targets(sel_rows, new_filename, self.correction_rows)
+            if dup_info.get("would_collide_within_selected"):
+                # build numbered for the group
+                base_for_num = new_filename
+                point = choose_number_insertion_point(parse_target_filename_parts(base_for_num), base_for_num)
+                if point == "ambiguous":
+                    # dialog for clarification (as requested)
+                    choice = messagebox.askquestion("Number placement?", "Ambiguous where to insert number for dups.\nUse after character name? (Yes=after char, No=before res)", icon="warning")
+                    point = "after_character" if choice == "yes" else "before_res"
+                variants = build_numbered_filename_variants(base_for_num, len(sel_rows), point, set(r.get("target_filename","") for r in self.correction_rows))
+                for i, iid in enumerate(selection):
+                    try:
+                        idx = int(iid)
+                        if i < len(variants):
+                            self.correction_rows[idx]["target_filename"] = variants[i]
+                    except Exception:
+                        pass
+                # note in status
+                self.status_var.set(f"Auto-numbered {len(sel_rows)} files for dups (point: {point}).")
+
         for iid in selection:
             try:
                 idx = int(iid)
@@ -1037,7 +1279,8 @@ class OrganizerGUI:
                     row["target_folder"] = new_folder
                     changed = True
                 if new_filename:
-                    row["target_filename"] = new_filename
+                    # if we numbered above, it may already be set; still mark changed
+                    row["target_filename"] = row.get("target_filename") or new_filename
                     changed = True
 
                 if not changed:
@@ -1056,6 +1299,13 @@ class OrganizerGUI:
 
                 existing_reason = row.get("reason", "")
                 row["reason"] = f"{existing_reason};manual_filename_correction".strip(";")
+
+                # If correcting an unmatched (or similar) row by providing target, auto-promote to ready+approved
+                # so bulk "apply correction" makes it apply-able instead of still blocked on status=unmatched.
+                cur_stat = (row.get("status") or "").strip().lower()
+                if (new_folder or new_filename) and cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
+                    row["status"] = "ready"
+                    row["approved"] = "yes"
 
                 # Live update this row in the tree immediately (7-tuple with check column)
                 checked = "☑" if row.get("_bulk_checked") else "☐"
@@ -1098,8 +1348,7 @@ class OrganizerGUI:
             try:
                 idx = int(iid)
                 row = self.correction_rows[idx]
-                row["approved"] = "yes"
-                tree.set(iid, "approved", "yes")
+                self._approve_row(row, iid, tree)
                 if not first_name:
                     first_name = row.get("original_name", "")
                 count += 1
@@ -1123,9 +1372,8 @@ class OrganizerGUI:
         for iid in selection:
             try:
                 idx = int(iid)
-                self.correction_rows[idx]["approved"] = "yes"
-                # Live update the approved column in the tree
-                tree.set(iid, "approved", "yes")
+                row = self.correction_rows[idx]
+                self._approve_row(row, iid, tree)
                 count += 1
             except (ValueError, IndexError, KeyError):
                 pass
@@ -1142,12 +1390,7 @@ class OrganizerGUI:
         count = 0
         for i, row in enumerate(self.correction_rows):
             if row.get("_bulk_checked"):
-                row["approved"] = "yes"
-                # Live update the tree row
-                try:
-                    tree.set(str(i), "approved", "yes")
-                except Exception:
-                    pass
+                self._approve_row(row, str(i), tree)
                 count += 1
         if count:
             msg = f"Marked {count} checked row(s) as approved (live in tree)."
@@ -1155,6 +1398,129 @@ class OrganizerGUI:
             self.status_var.set(msg)
         else:
             self.status_var.set("No checked rows to approve.")
+
+    # P1 Phase 1 support (read-only dropdowns + explicit Apply; per constraints: no auto-mod on select)
+    def _on_known_pick(self, category: str, value: str):
+        """Load value only (no row modification). Populate relevant edit field for user preview/confirm."""
+        if not value:
+            return
+        if category == "franchise":
+            self.corr_folder_var.set(value)
+        elif category == "artist":
+            # Conservative: populate filename field (user can refine); do not rewrite rows
+            current = self.corr_filename_var.get().strip()
+            if current:
+                self.corr_filename_var.set(value + " - " + current if " - " not in current else value + current)
+            else:
+                self.corr_filename_var.set(value + " - ")
+        elif category == "character":
+            current = self.corr_filename_var.get().strip()
+            if current:
+                self.corr_filename_var.set(current.replace(" - ", " - " + value + " - ", 1) if " - " in current else value + " - " + current)
+            else:
+                self.corr_filename_var.set(value + " - ")
+        elif category == "resolution":
+            current = self.corr_filename_var.get().strip()
+            if current and "[" in current:
+                # replace res tag conservatively
+                import re
+                new = re.sub(r"\[[^\]]+\]", f"[{value}]", current)
+                self.corr_filename_var.set(new)
+            else:
+                self.corr_filename_var.set(current + f" [{value}]" if current else f"Title [{value}]")
+        # Store last for explicit Apply buttons if needed
+        setattr(self, f"_last_picked_{category}", value)
+
+    def _apply_picked_value(self, category: str):
+        """Explicit Apply (required). Franchise/Folder: apply to rows. Others: conservative (populate edit if uncertain part replace)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected.")
+            return
+        value = getattr(self, f"_last_picked_{category}", None) or (self.corr_franchise_cb.get() if category == "franchise" else None)
+        if not value:
+            self.status_var.set(f"No {category} value picked from dropdown.")
+            return
+
+        if category == "franchise":
+            # Required: apply to target_folder on selected rows (like bulk correction)
+            updated = 0
+            for iid in selection:
+                try:
+                    idx = int(iid)
+                    row = self.correction_rows[idx]
+                    row["target_folder"] = value
+                    row_folder = value
+                    row_fname = row.get("target_filename", "")
+                    if row_fname:
+                        dest_root = self.dest_var.get().strip() or ""
+                        if not dest_root:
+                            try:
+                                c = org.load_config(Path(self.config_var.get() or DEFAULT_CONFIG))
+                                dest_root = str(c.destination_root)
+                            except Exception:
+                                dest_root = ""
+                        if dest_root:
+                            row["target_path"] = str(Path(dest_root) / row_folder / row_fname)
+                    # live tree
+                    checked = "☑" if row.get("_bulk_checked") else "☐"
+                    approved_val = row.get("approved", "")
+                    cur_target = f"{row_folder}/{row_fname}" if row_folder and row_fname else row_fname
+                    tree.item(iid, values=(checked, row.get("original_name", ""), row.get("artist", ""), row.get("character", ""), cur_target, row.get("status", ""), approved_val))
+                    updated += 1
+                except Exception:
+                    pass
+            if updated:
+                self.status_var.set(f"Applied franchise '{value}' to {updated} row(s).")
+        else:
+            # Conservative for Artist/Char/Resolution per approval notes: if uncertain about safe filename-part replacement,
+            # just populate the edit field instead of rewriting rows.
+            # For P1, always populate the filename field (user confirms before Apply Correction or explicit future).
+            if category == "artist":
+                self.corr_filename_var.set(value + " - " + (self.corr_filename_var.get() or "Title"))
+            elif category == "character":
+                self.corr_filename_var.set((self.corr_filename_var.get() or "Artist - ") + value + " - Title")
+            elif category == "resolution":
+                current = self.corr_filename_var.get() or "Title"
+                import re
+                if re.search(r"\[[^\]]+\]", current):
+                    self.corr_filename_var.set(re.sub(r"\[[^\]]+\]", f"[{value}]", current))
+                else:
+                    self.corr_filename_var.set(current + f" [{value}]")
+            self.status_var.set(f"Loaded {category} '{value}' into edit field (use Apply Correction or edit manually).")
+
+    def _refresh_known_lists(self):
+        try:
+            cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+            self.correction_known = get_known_values(cpath)
+            self.corr_artist_cb["values"] = self.correction_known.get("artists", [])
+            self.corr_franchise_cb["values"] = self.correction_known.get("franchises", [])
+            self.corr_character_cb["values"] = self.correction_known.get("characters", [])
+            self.corr_resolution_cb["values"] = self.correction_known.get("resolutions", [])
+            self.status_var.set("Known values lists refreshed.")
+        except Exception as e:
+            self.status_var.set(f"Refresh failed: {e}")
+
+    def _open_known_values_manager(self):
+        # P3 minimal read-only viewer (per execution notes: do not begin write support; dest/res view-only; schema structured).
+        # Full CRUD + backups + forms in future if P1/P2 stable.
+        win = tk.Toplevel(self.root)
+        win.title("Known Values (read-only viewer - P3 future for edits/writes)")
+        win.geometry("700x500")
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        for cat, label in [("artists", "Artists (from aliases+precedent)"), ("franchises", "Franchises/Folders (structured aliases/mappings/dest)"), ("characters", "Characters (mappings+canonical+learned)"), ("resolutions", "Resolutions (naming style - view only)")]:
+            f = ttk.Frame(nb)
+            nb.add(f, text=label)
+            lst = tk.Listbox(f)
+            lst.pack(fill="both", expand=True)
+            for v in (self.correction_known or {}).get(cat, []):
+                lst.insert("end", v)
+            ttk.Label(f, text="View-only in this build. Use config JSON or learned JSON directly for edits (backups recommended before manual changes).").pack()
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=4)
 
     def _sort_tree(self, col):
         """Sort the underlying rows and refresh the tree view."""

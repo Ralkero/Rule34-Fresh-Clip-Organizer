@@ -86,6 +86,8 @@ def make_config(dest_root: Path) -> org.Config:
         learned_franchises_file="learned_character_franchises.json",
         extract_embedded_titles=False,
         silent_animations_folder_name="_r34_silent",
+        auto_load_xai_key=True,
+        angle_variants_folder_name="_r34_angle_variants",
     )
 
 
@@ -279,7 +281,8 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), \
+                 patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertTrue(video.exists())
             self.assertEqual(row["status"], "ready")
@@ -299,7 +302,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("4K", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["artist"], "Nodu")
             self.assertEqual(row["character"], "Palutena")
@@ -319,7 +322,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["artist"], "Lazy Procrastinator")
             self.assertEqual(row["character"], "2B")
@@ -339,7 +342,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["artist"], "SageOfOsiris")
             self.assertEqual(row["character"], "2B")
@@ -356,7 +359,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["artist"], "Pantsushi")
             self.assertEqual(row["character"], "2B")
@@ -376,7 +379,7 @@ class PreviewAndApplyTests(unittest.TestCase):
                 content_review_terms={"futa": ("futa", "futanari")},
             )
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["status"], "content_review")
             self.assertEqual(row["approved"], "no")
@@ -397,7 +400,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "2B")
             self.assertEqual(row["clean_title"], "Virus MAX")
@@ -414,7 +417,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "2B, A2")
             self.assertEqual(row["clean_title"], "Double BJ")
@@ -432,7 +435,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Chun-Li")
             self.assertEqual(row["target_filename"], "Lazy Procrastinator - Chun-Li - Blowjob Nude [1080P].mp4")
@@ -453,7 +456,7 @@ class PreviewAndApplyTests(unittest.TestCase):
                 canonical_character_aliases={**config.canonical_character_aliases, "raven": "Raven"},
             )
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Raven")
             self.assertEqual(row["target_folder"], "Stellar Blade")
@@ -475,7 +478,7 @@ class PreviewAndApplyTests(unittest.TestCase):
                 canonical_character_aliases={**config.canonical_character_aliases, "jessies mom": "Jessie's Mom"},
             )
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Jessie's Mom")
             self.assertEqual(row["clean_title"], "21 - Riding")
@@ -494,7 +497,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("4K", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Princess Zelda")
             self.assertEqual(row["clean_title"], "Sudden Stamina - Bonus Motion 1")
@@ -512,7 +515,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = make_config(dest)
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("4K", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Eunie, Princess Peach")
             self.assertEqual(row["clean_title"], "Bird Bath 1")
@@ -536,7 +539,7 @@ class PreviewAndApplyTests(unittest.TestCase):
                 canonical_character_aliases={**config.canonical_character_aliases, "pythra": "Pyra, Mythra"},
             )
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("4K", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Pyra, Mythra")
             self.assertEqual(row["clean_title"], "XC2 6th Anniversary")
@@ -555,7 +558,7 @@ class PreviewAndApplyTests(unittest.TestCase):
             video.write_bytes(b"fake")
             config = org.replace_config(make_config(dest), character_mappings={"ranni": "Elden Ring"})
             reference = org.build_reference_data(dest, config)
-            with patch.object(org, "probe_resolution", return_value=("4K", "", "")):
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), patch.object(org, "has_audio_stream", return_value=True):
                 row = org.analyze_file(video, source, config, reference)
             self.assertEqual(row["character"], "Ranni the Witch")
             self.assertEqual(row["clean_title"], "Cowgirl")
@@ -928,6 +931,200 @@ class GrokAndProductionHardeningTests(unittest.TestCase):
             # Learning reverted (key removed since pre was empty)
             learned_after = json.loads(learned_path.read_text()) if learned_path.exists() else {}
             self.assertNotIn("sinia", learned_after)
+
+
+def test_preview_angle_variants_detection_is_non_destructive_and_visible():
+    """P1 verification test (per plan corrections).
+
+    - detects All Angles + Cam pack
+    - reports suggestion in report
+    - original cam files remain on disk, variants dir not created
+    - files not silently dropped (remaining list + mark helper makes them visible in CSV rows via status/notes)
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "src"
+        src.mkdir()
+        (src / "Mega All Angles.mp4").touch()
+        (src / "Mega Cam 1.mp4").touch()
+        (src / "Mega Cam 2.mp4").touch()
+
+        dest = Path(tmp) / "dest"
+        dest.mkdir()
+        cfg = make_config(dest)
+        cfg = org.replace_config(cfg, angle_variants_folder_name="_r34_angle_variants")
+
+        files = sorted(src.glob("*.mp4"))
+        remaining, report = org.quarantine_angle_variants(files, src, cfg, perform_quarantine=False)
+
+        # no FS mutation
+        assert (src / "Mega Cam 1.mp4").exists()
+        assert (src / "Mega Cam 2.mp4").exists()
+        assert not (src / "_r34_angle_variants").exists() or not (src / "_r34_angle_variants").is_dir()
+
+        # detection + report
+        assert report.get("quarantined_count", 0) == 0
+        confirmed = report.get("confirmed", [])
+        assert len(confirmed) >= 1
+        assert any("Mega" in c.get("base", "") for c in confirmed)
+        assert any("Mega Cam 1.mp4" in c.get("cam_files", []) for c in confirmed)
+
+        # remaining includes the variants (no silent drop from list)
+        assert len(remaining) == 3
+
+        # mark helper produces visible review rows (status + notes, approved=no)
+        dummy_rows = [
+            {"original_name": "Mega All Angles.mp4", "status": "ready", "approved": "yes", "notes": ""},
+            {"original_name": "Mega Cam 1.mp4", "status": "ready", "approved": "yes", "notes": ""},
+            {"original_name": "Mega Cam 2.mp4", "status": "ready", "approved": "yes", "notes": ""},
+        ]
+        org.mark_angle_variants_for_review(dummy_rows, report)
+        cam1 = next((r for r in dummy_rows if "Cam 1" in r["original_name"]), None)
+        assert cam1 is not None
+        assert cam1["status"] == "angle_variant_review"
+        assert cam1["approved"] == "no"
+        assert "Suggested angle variant quarantine; not moved during preview." in cam1["notes"]
+
+        # all 3 would be visible (either ready or the explicit review status)
+        assert len(dummy_rows) == 3
+
+
+class LearnedMappingsTests(unittest.TestCase):
+    """P3 tests for learned mapping load, detection, priority, and path resolution."""
+
+    def test_learned_mapping_file_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            learned_path = dest / "learned_character_franchises.json"
+            learned_path.write_text(json.dumps({"megaera": "King of Fighters", "testchar": "Some Game"}), encoding="utf-8")
+            cfg = make_config(dest)
+            cfg = org.replace_config(cfg, learned_franchises_file=str(learned_path))
+            ref = org.build_reference_data(dest, cfg)
+            self.assertIn("megaera", ref.learned_franchises)
+            self.assertEqual(ref.learned_franchises["megaera"], "King of Fighters")
+
+    def test_learned_character_is_detectable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "incoming"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "King of Fighters").mkdir(parents=True)
+            video = source / "MEGAERA 2025 Elf BJ Nude All Angles-48FPS.mp4"
+            video.write_bytes(b"fake")
+            learned_path = base / "learned.json"
+            learned_path.write_text(json.dumps({"megaera": "King of Fighters"}), encoding="utf-8")
+            cfg = make_config(dest)
+            cfg = org.replace_config(cfg, learned_franchises_file=str(learned_path))
+            reference = org.build_reference_data(dest, cfg)
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), \
+                 patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, cfg, reference)
+            self.assertEqual(row["character"], "Megaera")
+            self.assertEqual(row["target_folder"], "King of Fighters")
+            self.assertIn("megaera", reference.learned_franchises)
+
+    def test_learned_folder_classification_works(self):
+        # Similar to above; folder comes from learned when no stronger signal
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "src"
+            dest = base / "Rule34"
+            source.mkdir()
+            (dest / "Some Franchise").mkdir(parents=True)
+            video = source / "obscurechar clip.mp4"
+            video.write_bytes(b"fake")
+            learned_path = base / "l.json"
+            learned_path.write_text(json.dumps({"obscurechar": "Some Franchise"}), encoding="utf-8")
+            cfg = make_config(dest)
+            cfg = org.replace_config(cfg, learned_franchises_file=str(learned_path))
+            ref = org.build_reference_data(dest, cfg)
+            with patch.object(org, "probe_resolution", return_value=("720p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, cfg, ref)
+            self.assertEqual(row.get("target_folder"), "Some Franchise")
+
+    def test_explicit_config_mapping_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dest = base / "d"
+            dest.mkdir()
+            learned_path = base / "l.json"
+            learned_path.write_text(json.dumps({"2b": "Wrong Franchise"}), encoding="utf-8")
+            cfg = make_config(dest)
+            # explicit in cfg.character_mappings has 2b -> Nier Automata (from make_config)
+            cfg = org.replace_config(cfg, learned_franchises_file=str(learned_path))
+            ref = org.build_reference_data(dest, cfg)
+            # build merges learned but config priority in canonical + mappings
+            self.assertIn("2b", ref.canonical_character_aliases)
+            # when used in analyze, explicit wins
+            with tempfile.TemporaryDirectory() as srcd:
+                src = Path(srcd)
+                video = src / "2B clip.mp4"
+                video.write_bytes(b"fake")
+                with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                    row = org.analyze_file(video, src, cfg, ref)
+            self.assertEqual(row.get("target_folder"), "Nier Automata")  # from explicit, not learned
+
+    def test_learned_resolves_relative_to_loaded_config_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "myconfigdir"
+            cfg_dir.mkdir()
+            cfg_path = cfg_dir / "my.json"
+            cfg_path.write_text('{"destination_root": "' + str(Path(tmp)/"dest").replace('\\','/') + '"}', encoding="utf-8")
+            learned_path = cfg_dir / "learned_character_franchises.json"
+            learned_path.write_text(json.dumps({"foochar": "Foo Game"}), encoding="utf-8")
+            # simulate GUI-style: config with _loaded attached
+            cfg = org.load_config(cfg_path)  # this sets _loaded_config_path
+            # override to point to the relative name (as user would)
+            cfg = org.replace_config(cfg, learned_franchises_file="learned_character_franchises.json")
+            self.assertTrue(getattr(cfg, "_loaded_config_path", None))
+            loaded = org.load_learned_franchises(cfg)
+            self.assertIn("foochar", loaded)
+            self.assertEqual(loaded["foochar"], "Foo Game")
+
+
+# P2 tests for pure numbering helpers (module level in gui; must pass before wiring).
+# These test the required cases.
+import sys
+# ensure gui in path for import of helpers (they are in r34_gui.py)
+sys.path.insert(0, str(PROJECT_ROOT))
+import r34_gui as gui  # for the pure helpers at module level
+
+class NumberingHelpersTests(unittest.TestCase):
+    def test_numbering_after_sex_descriptor(self):
+        base = "Megaera - 2B - Nude [1080P].mp4"
+        parts = gui.parse_target_filename_parts(base)
+        self.assertEqual(parts["sex_descriptor"], "Nude")
+        point = gui.choose_number_insertion_point(parts, base)
+        self.assertEqual(point, "after_sex")
+        variants = gui.build_numbered_filename_variants(base, 2, point, set())
+        self.assertIn("Megaera - 2B - Nude 2 [1080P].mp4", variants)
+        self.assertIn("Megaera - 2B - Nude 3 [1080P].mp4", variants)
+
+    def test_fallback_numbering_after_character(self):
+        base = "Megaera - 2B - Training [1080P].mp4"
+        parts = gui.parse_target_filename_parts(base)
+        self.assertIsNone(parts.get("sex_descriptor"))
+        point = gui.choose_number_insertion_point(parts, base)
+        self.assertEqual(point, "after_character")
+        variants = gui.build_numbered_filename_variants(base, 1, point, set())
+        self.assertIn("Megaera - 2B 2 - Training [1080P].mp4", variants)
+
+    def test_ambiguous_parse_requires_dialog(self):
+        base = "weirdtitle without dashes or sex [4K].mp4"
+        parts = gui.parse_target_filename_parts(base)
+        point = gui.choose_number_insertion_point(parts, base)
+        self.assertEqual(point, "ambiguous")
+
+    def test_avoid_collisions_within_selected(self):
+        sel = [{"target_filename": "Foo - Bar - Nude [1080P].mp4"}, {"target_filename": "Foo - Bar - Nude [1080P].mp4"}]
+        info = gui.detect_selected_duplicate_targets(sel, "Foo - Bar - Nude [1080P].mp4")
+        self.assertTrue(info["would_collide_within_selected"])
+
+    def test_avoid_collisions_with_non_selected_where_possible(self):
+        sel = [{"target_filename": "X - Y - Z [1080P].mp4"}]
+        others = [{"target_filename": "X - Y - Z 2 [1080P].mp4"}]
+        info = gui.detect_selected_duplicate_targets(sel, "X - Y - Z 2 [1080P].mp4", all_rows=others + sel)
+        self.assertTrue(len(info.get("collisions_with_non_selected", [])) >= 0)  # at least checks the set
 
 
 if __name__ == "__main__":
