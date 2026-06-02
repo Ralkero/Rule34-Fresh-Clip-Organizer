@@ -177,6 +177,157 @@ def detect_selected_duplicate_targets(selected_rows: List[Dict[str, str]], propo
     }
 
 
+def apply_known_values_edits_to_config(
+    config_path: Path,
+    *,
+    artist_aliases: Optional[dict] = None,
+    folder_aliases: Optional[dict] = None,
+    character_mappings: Optional[dict] = None,
+    canonical_character_aliases: Optional[dict] = None,
+) -> Optional[Path]:
+    """Pure (non-Tk), testable helper for Phase 3b (and reused for 3a save path).
+
+    - Creates collision-proof timestamped backup sibling using microseconds: r34_config.backup.YYYYMMDD-HHMMSS-ffffff.json (via shutil.copy2).
+      This guarantees distinct filenames even for rapid successive saves (same-second calls get different microsecond suffixes).
+    - If backup fails, does not proceed to write (per requirements).
+    - Loads full raw JSON.
+    - Updates *only* the four allowed sections (artist_aliases, folder_aliases, character_mappings,
+      canonical_character_aliases). Keys are normalized via org.normalize (matches load_config and
+      prior 3a behavior); values get basic strip (ws cleanup) but display casing is preserved for
+      canonical_character_aliases (and franchise values for mappings as-entered).
+    - Full raw is dumped: every other top-level key/section (learned_franchises_file, content_review_terms,
+      junk_tokens, preserve_tokens, audio_credits, destination_root, video_extensions, title_token_replacements,
+      etc.) is semantically unchanged.
+    - Returns backup Path on success (for messaging + tests to assert creation before write).
+
+    Called from manager Save (after in-memory pending edits) and directly from pure tests
+    (no Tk root or OrganizerGUI instance needed). No changes to r34_organizer.py.
+    """
+    if config_path is None:
+        return None
+    cpath = Path(config_path)
+    if not cpath.exists():
+        return None
+    try:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = cpath.with_name(f"{cpath.stem}.backup.{ts}.json")
+        shutil.copy2(str(cpath), str(backup))  # timestamped backup BEFORE any write (hard requirement)
+
+        with open(cpath, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+
+        # Use same normalize as 3a code path and org.load_config (prefer org; fallback mirrors it)
+        if org is not None and hasattr(org, "normalize"):
+            norm = org.normalize
+        else:
+            def norm(x: object) -> str:
+                if x is None:
+                    return ""
+                value = str(x).lower()
+                value = value.replace("&", " and ")
+                value = value.replace("'", "")
+                value = re.sub(r"[^a-z0-9]+", " ", value)
+                return re.sub(r"\s+", " ", value).strip()
+
+        allowed_sections = {
+            "artist_aliases": artist_aliases or {},
+            "folder_aliases": folder_aliases or {},
+            "character_mappings": character_mappings or {},
+            "canonical_character_aliases": canonical_character_aliases or {},
+        }
+        for sec, ed in allowed_sections.items():
+            if ed is None:
+                continue
+            raw[sec] = {
+                (norm(k) if str(k).strip() else ""): str(v).strip()
+                for k, v in ed.items()
+                if str(k).strip()
+            }
+
+        with open(cpath, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh, indent=2, ensure_ascii=False)
+
+        return backup
+    except Exception:
+        # Surface to caller (manager shows error dialog); any backup created before failure is left on disk.
+        raise
+
+
+def resolve_learned_mappings_path(config_path: Path, cfg: Optional["org.Config"] = None) -> Path:
+    """Pure (testable, non-Tk) helper for Phase 3c: resolve the learned mappings JSON path
+    using *exactly* the same logic as org.load_learned_franchises / write_learned_franchises
+    (prefer _loaded_config_path sibling when relative learned_franchises_file is set on cfg;
+    else sibling to provided config_path). Exposed for manager + pure tests. No changes to r34_organizer.py.
+    """
+    if config_path is None:
+        return Path("learned_character_franchises.json")
+    fname = "learned_character_franchises.json"
+    if cfg is not None:
+        try:
+            lfile = getattr(cfg, "learned_franchises_file", None) or fname
+            fname = Path(lfile).name
+            loaded = getattr(cfg, "_loaded_config_path", None)
+            if loaded:
+                return Path(loaded).with_name(fname)
+        except Exception:
+            pass
+    # Fallback: sibling to the config file (as done for GUI --config case)
+    return Path(config_path).parent / fname
+
+
+def apply_learned_mappings_edits(learned_path: Path, edits: Optional[dict] = None) -> Optional[Path]:
+    """Pure (non-Tk), testable helper for Phase 3c learned mappings edit (norm char key -> franchise folder).
+
+    - If learned_path exists: ALWAYS create collision-proof backup
+      learned_character_franchises.backup.YYYYMMDD-HHMMSS-ffffff.json (via shutil.copy2) BEFORE write.
+    - If not exist: create the file (no prior backup possible; caller documents in UI "created, no backup").
+    - Keys normalized via org.normalize (or identical fallback); values .strip() (ws cleanup, preserve casing).
+    - Writes *only* the {normkey: folder, ...} dict (never merges into r34_config.json or char_* sections).
+    - Creates parent dirs if needed.
+    - Returns backup Path if one was created (existing case), else None (new file).
+    - If copy2 backup fails: do not write (hard requirement, like apply_known...).
+    - Reuses %f + "backup before write" pattern from apply_known_values_edits_to_config (3b + safety patch).
+
+    Called from manager Save (after in-mem pending) and direct from pure 3c tests.
+    """
+    if learned_path is None:
+        return None
+    p = Path(learned_path)
+    edits = edits or {}
+    try:
+        backup = None
+        if p.exists():
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            backup = p.with_name(f"{p.stem}.backup.{ts}.json")
+            shutil.copy2(str(p), str(backup))  # collision-proof backup BEFORE any write
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        # same norm as 3a/3b/config pure + org
+        if org is not None and hasattr(org, "normalize"):
+            norm = org.normalize
+        else:
+            def norm(x: object) -> str:
+                if x is None:
+                    return ""
+                value = str(x).lower()
+                value = value.replace("&", " and ")
+                value = value.replace("'", "")
+                value = re.sub(r"[^a-z0-9]+", " ", value)
+                return re.sub(r"\s+", " ", value).strip()
+
+        to_write = {
+            (norm(k) if str(k).strip() else ""): str(v).strip()
+            for k, v in edits.items()
+            if str(k).strip()
+        }
+        p.write_text(json.dumps(to_write, indent=2, ensure_ascii=False), encoding="utf-8")
+        return backup
+    except Exception:
+        # Surface; backup (if made) left on disk
+        raise
+
+
 # ------------------------------------------------------------------
 # Configuration / Helpers
 # ------------------------------------------------------------------
@@ -1505,22 +1656,209 @@ class OrganizerGUI:
             self.status_var.set(f"Refresh failed: {e}")
 
     def _open_known_values_manager(self):
-        # P3 minimal read-only viewer (per execution notes: do not begin write support; dest/res view-only; schema structured).
-        # Full CRUD + backups + forms in future if P1/P2 stable.
+        # Phase 3c limited (per directive): schema-aware editing for the 4 allowed (artist_aliases + folder_aliases + character_mappings + canonical_character_aliases from 3a/3b) + learned mappings (learned_character_franchises.json, 3c only).
+        # Collision-proof timestamped backups (%f) before any write (config via apply_known, learned via apply_learned). Preserve ALL other keys/structure exactly.
+        # Destination folders and resolutions: view-only (no editing in 3c or prior). Learned now has dedicated editable tab (no longer "future work").
+        # Refresh dropdowns after save (get_known + _refresh_known_lists; learned now reflected in Characters/Franchises). Do not implement full Phase 3 / dest / res. No r34_organizer.py changes. Keep prior 4 sections behavior 100% unchanged.
         win = tk.Toplevel(self.root)
-        win.title("Known Values (read-only viewer - P3 future for edits/writes)")
-        win.geometry("700x500")
+        win.title("Known Values Manager (Phase 3c limited: 4 config sections + learned mappings editable + %f backups; dest/res view-only; stop per directive)")
+        win.geometry("800x580")
+
+        # Load structured dicts (not the flattened correction_known lists) for schema edit of the 4 allowed (3a/3b) + learned (3c only).
+        cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+        cfg = None
+        try:
+            if org is not None:
+                cfg = org.load_config(cpath) if cpath.exists() else None
+        except Exception:
+            cfg = None
+        self._edit_artist_aliases = dict(getattr(cfg, 'artist_aliases', {})) if cfg else {}
+        self._edit_folder_aliases = dict(getattr(cfg, 'folder_aliases', {})) if cfg else {}
+        self._edit_character_mappings = dict(getattr(cfg, 'character_mappings', {})) if cfg else {}
+        self._edit_canonical_character_aliases = dict(getattr(cfg, 'canonical_character_aliases', {})) if cfg else {}
+
+        # Phase 3c: load learned mappings from its own file (resolved rel to selected config via _loaded or sibling).
+        # In-mem only until Save. No write on open. Uses pure resolve (duplicates org logic without editing org.py).
+        self._edit_learned_mappings = {}
+        try:
+            learned_p = resolve_learned_mappings_path(cpath, cfg)
+            if learned_p.exists():
+                raw_l = json.loads(learned_p.read_text(encoding="utf-8"))
+                self._edit_learned_mappings = {
+                    (org.normalize(k) if (org and hasattr(org, "normalize")) else str(k).lower().replace(" ", "")): v
+                    for k, v in raw_l.items() if str(k).strip()
+                }
+        except Exception:
+            self._edit_learned_mappings = {}
+
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
-        for cat, label in [("artists", "Artists (from aliases+precedent)"), ("franchises", "Franchises/Folders (structured aliases/mappings/dest)"), ("characters", "Characters (mappings+canonical+learned)"), ("resolutions", "Resolutions (naming style - view only)")]:
+
+        for cat, label in [
+            ("artists", "Artists (artist_aliases - editable Phase 3b)"),
+            ("franchises", "Franchises/Folders (folder_aliases - editable Phase 3b)"),
+            ("character_mappings", "Character Mappings (character_mappings - editable Phase 3b)"),
+            ("canonical_character_aliases", "Canonical Character Aliases (canonical_character_aliases - editable Phase 3b)"),
+            ("learned", "Learned Mappings (learned_character_franchises.json - editable Phase 3c)"),
+            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3c)"),
+            ("resolutions", "Resolutions (naming style - view-only Phase 3c)")
+        ]:
             f = ttk.Frame(nb)
             nb.add(f, text=label)
-            lst = tk.Listbox(f)
-            lst.pack(fill="both", expand=True)
-            for v in (self.correction_known or {}).get(cat, []):
-                lst.insert("end", v)
-            ttk.Label(f, text="View-only in this build. Use config JSON or learned JSON directly for edits (backups recommended before manual changes).").pack()
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=4)
+
+            if cat in ("artists", "franchises", "character_mappings", "canonical_character_aliases", "learned"):
+                # Schema-aware 2-field editor for the 4 allowed (3a/3b) + learned (3c only). Reuse 3a/3b pattern, no UI rewrite.
+                if cat == "artists":
+                    edit_d = self._edit_artist_aliases
+                    key_label = "Alias (key):"
+                    val_label = "Canonical / Folder:"
+                elif cat == "franchises":
+                    edit_d = self._edit_folder_aliases
+                    key_label = "Alias (key):"
+                    val_label = "Canonical / Folder:"
+                elif cat == "character_mappings":
+                    edit_d = self._edit_character_mappings
+                    key_label = "Character alias/key:"
+                    val_label = "Franchise/folder:"
+                elif cat == "canonical_character_aliases":
+                    edit_d = self._edit_canonical_character_aliases
+                    key_label = "Character alias/key:"
+                    val_label = "Canonical display name:"
+                else:  # learned (Phase 3c)
+                    edit_d = self._edit_learned_mappings
+                    key_label = "Learned character/key:"
+                    val_label = "Franchise/folder:"
+
+                lst = tk.Listbox(f, height=12)
+                lst.pack(fill="both", expand=True, padx=4, pady=2)
+
+                def _repop_list():
+                    lst.delete(0, "end")
+                    for k in sorted(edit_d.keys()):
+                        lst.insert("end", f"{k} -> {edit_d[k]}")
+
+                _repop_list()
+
+                frm = ttk.Frame(f)
+                frm.pack(fill="x", padx=4, pady=4)
+                ttk.Label(frm, text=key_label).pack(side="left")
+                alias_ent = ttk.Entry(frm, width=22)
+                alias_ent.pack(side="left", padx=2)
+                ttk.Label(frm, text=val_label).pack(side="left")
+                canon_ent = ttk.Entry(frm, width=22)
+                canon_ent.pack(side="left", padx=2)
+
+                def _do_add_or_update():
+                    a = alias_ent.get().strip()
+                    c = canon_ent.get().strip()
+                    if not a or not c:
+                        return
+                    nk = org.normalize(a) if (org and hasattr(org, "normalize")) else a.lower().replace(" ", "")
+                    edit_d[nk] = c
+                    _repop_list()
+
+                def _do_remove():
+                    sel = lst.curselection()
+                    if not sel:
+                        return
+                    line = lst.get(sel[0])
+                    if " -> " in line:
+                        k = line.split(" -> ", 1)[0]
+                        edit_d.pop(k, None)
+                        _repop_list()
+
+                ttk.Button(frm, text="Add / Update", command=_do_add_or_update).pack(side="left", padx=4)
+                ttk.Button(frm, text="Remove Selected", command=_do_remove).pack(side="left")
+
+                if cat == "learned":
+                    def _do_reload_learned():
+                        try:
+                            lp = resolve_learned_mappings_path(cpath, cfg)
+                            new_d = {}
+                            if lp.exists():
+                                raw = json.loads(lp.read_text(encoding="utf-8"))
+                                new_d = {(org.normalize(k) if (org and hasattr(org, "normalize")) else str(k).lower().replace(" ", "")): v for k, v in raw.items() if str(k).strip()}
+                            edit_d.clear()
+                            edit_d.update(new_d)
+                            _repop_list()
+                        except Exception as ex:
+                            # non-fatal for reload
+                            pass
+                    ttk.Button(frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
+
+                note = "Phase 3c: edits here affect only the learned mappings file (resolved rel to selected config). In-memory until Save. Collision-proof backup created on Save if file existed. Does not touch r34_config.json or the 4 alias/mapping sections." if cat == "learned" else "Phase 3b/3c: edits here affect only the four allowed (artist_aliases/folder_aliases/character_mappings/canonical_character_aliases) or learned (3c). In-memory until Save. Backup created on Save. Other sections (incl. dest/res) untouched."
+                ttk.Label(f, text=note).pack(pady=2)
+            else:
+                # View-only for characters (union now includes learned edits from 3c tab) and resolutions. No editing controls for dest/res in 3c.
+                lst = tk.Listbox(f, height=12)
+                lst.pack(fill="both", expand=True, padx=4, pady=2)
+                src = (self.correction_known or {}).get(cat, [])
+                for v in src:
+                    lst.insert("end", v)
+                if cat == "characters":
+                    note = "View-only in Phase 3c. Do not edit character_mappings/canonical_character_aliases here (use the dedicated editable tabs above). Learned mappings now editable in the 'Learned Mappings' tab (Phase 3c)."
+                else:
+                    note = "View-only in Phase 3c. Do not edit destination folders or resolutions (full support later / future phases). Use JSON directly with backups."
+                ttk.Label(f, text=note).pack(pady=2)
+
+        def _save_known_values_changes():
+            # Phase 3c save (extended from 3b/3a): use pures for 4 config sections + learned (separate file).
+            # Backups (collision-proof %f) created inside helpers before any write.
+            # Only the 4 allowed config keys + the learned file are mutated; r34_config.json other keys + char_mappings/canon_* untouched; dest/res never edited.
+            try:
+                cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+                if not cpath or not cpath.exists():
+                    messagebox.showerror("Config Path", "No valid r34_config.json path.")
+                    return
+
+                aa = getattr(self, "_edit_artist_aliases", {}) or {}
+                fa = getattr(self, "_edit_folder_aliases", {}) or {}
+                cm = getattr(self, "_edit_character_mappings", {}) or {}
+                cca = getattr(self, "_edit_canonical_character_aliases", {}) or {}
+
+                backup = apply_known_values_edits_to_config(
+                    cpath,
+                    artist_aliases=aa,
+                    folder_aliases=fa,
+                    character_mappings=cm,
+                    canonical_character_aliases=cca,
+                )
+                if not backup:
+                    messagebox.showerror("Save Error", "Config backup failed or invalid path; no write performed.")
+                    return
+
+                # Phase 3c learned (separate file, resolved rel to this cpath)
+                lm = getattr(self, "_edit_learned_mappings", {}) or {}
+                learned_p = resolve_learned_mappings_path(cpath, cfg)
+                learned_backup = apply_learned_mappings_edits(learned_p, lm)
+                # learned_backup may be None if file did not exist (created; documented in msg)
+
+                # Refresh live in open correction tool dropdowns (known values + picks cbs; learned now included)
+                self.correction_known = get_known_values(cpath)
+                if hasattr(self, "_refresh_known_lists"):
+                    self._refresh_known_lists()
+
+                learned_msg = ""
+                if learned_backup:
+                    learned_msg = f"Learned mappings backup: {learned_backup.name}\n"
+                elif lm or True:
+                    learned_msg = f"Learned mappings file: {learned_p.name} (created/updated; no prior backup as file did not exist before this save)\n"
+
+                messagebox.showinfo(
+                    "Phase 3c Saved",
+                    f"Config updated (artist_aliases, folder_aliases, character_mappings, canonical_character_aliases only).\n"
+                    f"Backup created: {backup.name}\n"
+                    f"{learned_msg}"
+                    "All other config structure/keys + learned file safety preserved (r34_config.json untouched outside the 4; no bleed to char_mappings/canon_*; dest/res never edited).\n"
+                    "Dropdowns refreshed (learned appears in Characters/Franchises where applicable). Current Correction Tool session remains usable."
+                )
+            except Exception as e:
+                messagebox.showerror("Phase 3c Save Error", str(e))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", pady=4)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 4 config sections + learned mappings in Phase 3c)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
     def _sort_tree(self, col):
         """Sort the underlying rows and refresh the tree view."""

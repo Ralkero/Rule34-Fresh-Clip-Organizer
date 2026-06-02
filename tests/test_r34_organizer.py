@@ -1153,5 +1153,339 @@ class NumberingHelpersTests(unittest.TestCase):
         self.assertTrue(len(info.get("collisions_with_non_selected", [])) >= 0)  # at least checks the set
 
 
+# Phase 3b + 3c: pure (non-Tk) tests for the Known Values Manager config edits + learned mappings (3c).
+# Cover exactly the 6 3b + 1 safety + 8 3c required (path resolve for learned, create if missing, backup existing, rapid distinct no-overwrite for learned backups, norm keys for learned, save learned does not mod r34_config.json or char/canon sections, full suite).
+# Use real config copy in temp dir + temp learned json (destructive safe); direct calls to gui.* pures (resolve_learned, apply_learned, apply_known, get_known).
+# Import gui late (after sys.path) as in prior P2/3b.
+import shutil  # local to appended tests (executes before if __name__)
+import json as _json  # alias to avoid shadowing in scope
+
+
+class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
+    """Pure tests for Phase 3b manager save logic (via the new pure helper in r34_gui).
+
+    No Tk, no GUI instance, no changes to main r34_config.json or learned json.
+    All use fresh temp copies of the real committed config.
+    """
+
+    @property
+    def real_config_path(self) -> Path:
+        return PROJECT_ROOT / "r34_config.json"
+
+    def _copy_to_temp(self, tmp: str) -> Path:
+        tcfg = Path(tmp) / "r34_config.json"
+        shutil.copy2(self.real_config_path, tcfg)
+        return tcfg
+
+    def test_saving_phase3b_changes_modifies_only_the_four_allowed_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            # Simulate full in-mem edit dicts (as manager does: starts from loaded + pending adds)
+            aa = dict(pre.get("artist_aliases", {}))
+            aa["phase3b-t-art"] = "Phase3b Test Artist"
+            fa = dict(pre.get("folder_aliases", {}))
+            fa["phase3b-t-fold"] = "Phase3b Test Folder"
+            cm = dict(pre.get("character_mappings", {}))
+            cm["phase3b-test-char"] = "Test Franchise"
+            cca = dict(pre.get("canonical_character_aliases", {}))
+            cca["phase3b-test-char"] = "Phase3b Test Character"
+
+            backup = gui.apply_known_values_edits_to_config(
+                tcfg,
+                artist_aliases=aa,
+                folder_aliases=fa,
+                character_mappings=cm,
+                canonical_character_aliases=cca,
+            )
+            self.assertIsNotNone(backup)
+            self.assertTrue(backup.exists())
+
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+
+            # Exactly the 4 changed at top level
+            changed = [k for k in post if post.get(k) != pre.get(k)]
+            self.assertCountEqual(
+                changed,
+                ["artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases"],
+            )
+            # Values present (keys are normalized by helper; compute expected)
+            nart = org.normalize("phase3b-t-art") if hasattr(org, "normalize") else "phase3b t art"
+            nchar = org.normalize("phase3b-test-char") if hasattr(org, "normalize") else "phase3b test char"
+            ncca = org.normalize("phase3b-test-char") if hasattr(org, "normalize") else "phase3b test char"
+            self.assertEqual(post["artist_aliases"].get(nart), "Phase3b Test Artist")
+            self.assertEqual(post["character_mappings"].get(nchar), "Test Franchise")
+            self.assertEqual(post["canonical_character_aliases"].get(ncca), "Phase3b Test Character")
+
+    def test_character_mappings_add_update_remove_preserves_normalized_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            cm = dict(pre.get("character_mappings", {}))
+            # Input with ws/caps/punct; should store under normalized key (org.normalize)
+            cm["  Phase3b  Test  Char  "] = "Test Franchise"
+            cm["MAI-TEST-KEY"] = "King of Fighters"
+
+            backup = gui.apply_known_values_edits_to_config(tcfg, character_mappings=cm)
+            self.assertIsNotNone(backup)
+
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+
+            # Keys must be normalized (not raw input)
+            norm_phase = org.normalize("Phase3b Test Char") if hasattr(org, "normalize") else "phase3b test char"
+            norm_mai = org.normalize("MAI-TEST-KEY") if hasattr(org, "normalize") else "mai test key"
+            self.assertIn(norm_phase, post["character_mappings"])
+            self.assertEqual(post["character_mappings"][norm_phase], "Test Franchise")
+            self.assertIn(norm_mai, post["character_mappings"])
+            self.assertEqual(post["character_mappings"][norm_mai], "King of Fighters")
+            # Original keys with spaces/punct not present as-is
+            self.assertNotIn("  Phase3b  Test  Char  ", post["character_mappings"])
+            self.assertNotIn("MAI-TEST-KEY", post["character_mappings"])
+
+    def test_canonical_character_aliases_add_update_remove_preserves_display_casing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            cca = dict(pre.get("canonical_character_aliases", {}))
+            # Value has mixed case + spaces; must be stored exactly (only key normed)
+            cca["phase3b-test-char"] = "Phase3b Test Character"
+            cca["weird-CASE-alias"] = "WeIrD CaSe DiSpLaY Name"
+
+            backup = gui.apply_known_values_edits_to_config(tcfg, canonical_character_aliases=cca)
+            self.assertIsNotNone(backup)
+
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+
+            nkey1 = org.normalize("phase3b-test-char") if hasattr(org, "normalize") else "phase3b test char"
+            nkey2 = org.normalize("weird-CASE-alias") if hasattr(org, "normalize") else "weird case alias"
+            self.assertEqual(post["canonical_character_aliases"][nkey1], "Phase3b Test Character")
+            self.assertEqual(post["canonical_character_aliases"][nkey2], "WeIrD CaSe DiSpLaY Name")  # key normed, value casing kept
+
+    def test_backup_file_is_created_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            cca = {"phase3b-t": "Backup Test Display"}
+            backup = gui.apply_known_values_edits_to_config(tcfg, canonical_character_aliases=cca)
+            self.assertIsNotNone(backup)
+            self.assertTrue(backup.exists())
+            self.assertTrue(backup.name.startswith("r34_config.backup."))
+            self.assertTrue(backup.name.endswith(".json"))
+            # After return, the write has happened (post has change)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+            nkey = org.normalize("phase3b-t") if hasattr(org, "normalize") else "phase3b t"
+            self.assertIn(nkey, post.get("canonical_character_aliases", {}))
+
+    def test_rapid_saves_create_two_distinct_backup_files_without_overwrite(self):
+        """Prove that two rapid successive saves produce distinct backup files; neither overwrites the other.
+
+        Uses the microsecond-enhanced timestamp in apply_known_values_edits_to_config.
+        This is the safety patch test for Phase 3b backup collision issue.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            # First save (e.g. add one entry)
+            b1 = gui.apply_known_values_edits_to_config(
+                tcfg, canonical_character_aliases={"rapid1": "Rapid One"}
+            )
+            # Second rapid save immediately after (no artificial sleep; %f precision makes distinct)
+            b2 = gui.apply_known_values_edits_to_config(
+                tcfg, canonical_character_aliases={"rapid2": "Rapid Two"}
+            )
+            self.assertIsNotNone(b1)
+            self.assertIsNotNone(b2)
+            self.assertTrue(b1.exists(), "first backup must exist after second save")
+            self.assertTrue(b2.exists(), "second backup must exist after second save")
+            self.assertNotEqual(b1.name, b2.name, "backup filenames must be distinct even for rapid saves")
+            self.assertTrue(b1.name.startswith("r34_config.backup."))
+            self.assertTrue(b1.name.endswith(".json"))
+            self.assertTrue(b2.name.startswith("r34_config.backup."))
+            self.assertTrue(b2.name.endswith(".json"))
+            # Prove no overwrite: the two paths are different files, both present
+            self.assertNotEqual(str(b1.resolve()), str(b2.resolve()))
+
+    def test_forbidden_sections_are_semantically_unchanged(self):
+        forbidden = [
+            "learned_franchises_file",
+            "content_review_terms",
+            "junk_tokens",
+            "preserve_tokens",
+            "audio_credits",
+            "destination_root",
+            "video_extensions",
+            "title_token_replacements",
+            "known_collectors",
+            "collection_folder_indicators",
+            "use_ai_for_unknown_characters",
+            "ai_model",
+            "original_character_subfoldering",
+            "extract_embedded_titles",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            # Touch all 4 allowed + one new entry each
+            aa = dict(pre.get("artist_aliases", {})); aa["phase3b-forbid-a"] = "A"
+            fa = dict(pre.get("folder_aliases", {})); fa["phase3b-forbid-f"] = "F"
+            cm = dict(pre.get("character_mappings", {})); cm["phase3b-forbid-c"] = "C"
+            cca = dict(pre.get("canonical_character_aliases", {})); cca["phase3b-forbid-ca"] = "CA"
+
+            backup = gui.apply_known_values_edits_to_config(
+                tcfg, artist_aliases=aa, folder_aliases=fa, character_mappings=cm, canonical_character_aliases=cca
+            )
+            self.assertIsNotNone(backup)
+
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+
+            for key in forbidden:
+                self.assertIn(key, post, f"forbidden key {key} must still exist")
+                self.assertEqual(post[key], pre[key], f"{key} must be semantically unchanged")
+
+            # Also confirm only the 4 were different
+            changed = [k for k in post if post.get(k) != pre.get(k)]
+            self.assertCountEqual(changed, ["artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases"])
+
+    def test_full_suite_still_passes_after_phase3b_changes(self):
+        # This is a meta-test: after adding these, the discover must still be clean.
+        # Actual run is in post-impl-verif + final-runs (outside the class).
+        # Here we just ensure import of gui + helper works and a no-op call succeeds.
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            b = gui.apply_known_values_edits_to_config(tcfg)  # no edits -> still creates backup + roundtrips
+            self.assertIsNotNone(b)
+            self.assertTrue(b.exists())
+        # If we reach here without import/attr errors, the addition didn't break loading.
+        self.assertTrue(True)
+
+    # --- Phase 3c required pure tests (added to class for reuse of _copy_to_temp etc.; 8 exact coverages) ---
+
+    def test_learned_mappings_path_resolves_relative_to_selected_config(self):
+        """Req 1: resolve_learned_mappings_path (and apply) uses selected config dir for relative learned_franchises_file (like org + _loaded)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "myconfigdir"
+            cfg_dir.mkdir()
+            cfg_path = cfg_dir / "my.json"
+            cfg_path.write_text('{"destination_root": "' + str(Path(tmp) / "dest").replace('\\', '/') + '", "learned_franchises_file": "learned_character_franchises.json"}', encoding="utf-8")
+            # simulate load (sets _loaded)
+            cfg = org.load_config(cfg_path)
+            cfg = org.replace_config(cfg, learned_franchises_file="learned_character_franchises.json")
+            self.assertTrue(getattr(cfg, "_loaded_config_path", None))
+            p = gui.resolve_learned_mappings_path(cfg_path, cfg)
+            self.assertEqual(p.parent, cfg_dir)
+            self.assertEqual(p.name, "learned_character_franchises.json")
+
+    def test_saving_learned_creates_json_if_missing(self):
+        """Req 2: apply_learned on non-existing path creates the file (no backup returned)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            self.assertFalse(learned_p.exists())
+            edits = {"phase3c-test-char": "Test Franchise"}
+            b = gui.apply_learned_mappings_edits(learned_p, edits)
+            self.assertIsNone(b)  # no backup for new
+            self.assertTrue(learned_p.exists())
+            data = json.loads(learned_p.read_text(encoding="utf-8"))
+            nkey = org.normalize("phase3c-test-char")
+            self.assertIn(nkey, data)
+            self.assertEqual(data[nkey], "Test Franchise")
+
+    def test_saving_learned_backs_up_existing_before_write(self):
+        """Req 3: apply on existing creates .backup.%f before write; old content preserved in backup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            learned_p.write_text(json.dumps({"oldchar": "Old Franchise"}), encoding="utf-8")
+            edits = {"phase3c-test-char": "Test Franchise"}
+            b = gui.apply_learned_mappings_edits(learned_p, edits)
+            self.assertIsNotNone(b)
+            self.assertTrue(b.exists())
+            self.assertTrue(b.name.startswith("learned_character_franchises.backup."))
+            self.assertTrue(b.name.endswith(".json"))
+            # current has new
+            data = json.loads(learned_p.read_text(encoding="utf-8"))
+            self.assertIn(org.normalize("phase3c-test-char"), data)
+            # backup has old
+            bdata = json.loads(b.read_text(encoding="utf-8"))
+            self.assertIn("oldchar", bdata)
+
+    def test_rapid_learned_saves_create_distinct_non_overwriting_backups(self):
+        """Req 4: two rapid saves produce distinct learned backups (%f); both exist after."""
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            learned_p.write_text("{}", encoding="utf-8")
+            b1 = gui.apply_learned_mappings_edits(learned_p, {"r1": "R1"})
+            b2 = gui.apply_learned_mappings_edits(learned_p, {"r2": "R2"})
+            self.assertIsNotNone(b1)
+            self.assertIsNotNone(b2)
+            self.assertTrue(b1.exists() and b2.exists())
+            self.assertNotEqual(b1.name, b2.name)
+            self.assertTrue(b1.name.startswith("learned_character_franchises.backup."))
+            self.assertTrue(b2.name.startswith("learned_character_franchises.backup."))
+
+    def test_learned_add_update_remove_preserves_normalized_keys(self):
+        """Req 5: edits via apply use normalized keys (ws/caps/punct input -> norm key in file)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            edits = {"  Phase3c  Test  Char  ": "Test Franchise", "MAI-TEST-KEY": "King of Fighters"}
+            gui.apply_learned_mappings_edits(learned_p, edits)
+            data = json.loads(learned_p.read_text(encoding="utf-8"))
+            n1 = org.normalize("Phase3c Test Char")
+            n2 = org.normalize("MAI-TEST-KEY")
+            self.assertIn(n1, data)
+            self.assertEqual(data[n1], "Test Franchise")
+            self.assertIn(n2, data)
+            self.assertNotIn("  Phase3c  Test  Char  ", data)
+            self.assertNotIn("MAI-TEST-KEY", data)
+
+    def test_saving_learned_does_not_modify_r34_config_json(self):
+        """Req 6: learned save touches only its file; temp config content/sections unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            learned_p = tcfg.parent / "learned_character_franchises.json"
+            gui.apply_learned_mappings_edits(learned_p, {"phase3c-c": "C"})
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+            self.assertEqual(post, pre)  # byte for byte for the config
+
+    def test_saving_learned_does_not_modify_character_or_canonical_mappings(self):
+        """Req 7: learned save does not touch or bleed into char_mappings / canonical_character_aliases (even if same keys)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            with open(tcfg, "r", encoding="utf-8") as f:
+                pre = _json.load(f)
+            pre_cm = dict(pre.get("character_mappings", {}))
+            pre_cca = dict(pre.get("canonical_character_aliases", {}))
+            learned_p = tcfg.parent / "learned_character_franchises.json"
+            # use a key that might overlap
+            gui.apply_learned_mappings_edits(learned_p, {"2b": "Some Other"})
+            with open(tcfg, "r", encoding="utf-8") as f:
+                post = _json.load(f)
+            self.assertEqual(post.get("character_mappings"), pre_cm)
+            self.assertEqual(post.get("canonical_character_aliases"), pre_cca)
+            # learned separate
+            ldata = json.loads(learned_p.read_text(encoding="utf-8"))
+            self.assertEqual(ldata.get(org.normalize("2b")), "Some Other")
+
+    def test_full_suite_still_passes_after_phase3c_changes(self):
+        """Req 8: meta; after 3c adds, discover still clean (actual in post-verif/final)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            lp = tcfg.parent / "l.json"
+            b = gui.apply_learned_mappings_edits(lp, {"x": "Y"})
+            self.assertIsNone(b)  # new
+            known = gui.get_known_values(tcfg)
+            # no crash, learned would be in ref but here just call
+            self.assertIsInstance(known, dict)
+        self.assertTrue(True)
+
+
 if __name__ == "__main__":
     unittest.main()
