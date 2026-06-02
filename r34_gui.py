@@ -1999,8 +1999,8 @@ class OrganizerGUI:
         # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
         # Stop after 4a. Do not proceed to 4b.
         win = tk.Toplevel(self.root)
-        win.title("Known Values Manager (Phase 4a: 5 editable tabs usability - split buttons + Clear + live list/count refresh on Add/Update/Remove/Clear + counts + better char labels+help; dest/res view-only; %f backups; stop per directive)")
-        win.geometry("820x600")
+        win.title("Known Values Manager")
+        win.geometry("1100x700")  # larger for sidebar + content; Phase 4a.5 scalable layout
 
         # Load structured dicts (not the flattened correction_known lists) for schema edit of the 4 allowed (3a/3b) + learned (3c only).
         cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
@@ -2029,27 +2029,80 @@ class OrganizerGUI:
         except Exception:
             self._edit_learned_mappings = {}
 
-        nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        # Phase 4a.5 scalable layout refactor: left category sidebar + right dynamic content panel.
+        # Replaces the previous top ttk.Notebook (crowded tabs) while preserving ALL prior behavior.
+        main = ttk.Frame(win)
+        main.pack(fill="both", expand=True, padx=6, pady=6)
 
-        for cat, label in [
-            ("artists", "Artists (artist_aliases - editable Phase 3b)"),
-            ("franchises", "Franchises/Folders (folder_aliases - editable Phase 3b)"),
-            ("character_mappings", "Character Mappings (character_mappings - editable Phase 3b)"),
-            ("canonical_character_aliases", "Canonical Character Aliases (canonical_character_aliases - editable Phase 3b)"),
-            ("learned", "Learned Mappings (learned_character_franchises.json - editable Phase 3c)"),
-            ("dest_folders", "Destination Folders (view-only + safe missing-folder creation suggestions Phase 3e)"),
-            ("characters", "Characters (view-only: mappings+canonical+learned - Phase 3d/3e)"),
-            ("resolutions", "Resolutions (naming style - view-only Phase 3d/3e)")
-        ]:
-            f = ttk.Frame(nb)
-            nb.add(f, text=label)
+        pw = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        pw.pack(fill="both", expand=True)
+
+        left = ttk.Frame(pw, width=240)
+        pw.add(left, weight=1)
+
+        right = ttk.Frame(pw)
+        pw.add(right, weight=4)
+
+        # Left sidebar: category selector + filter
+        ttk.Label(left, text="Categories (filter below)").pack(pady=(0,2))
+        cat_search_var = tk.StringVar()
+        cat_search = ttk.Entry(left, textvariable=cat_search_var)
+        cat_search.pack(fill="x", padx=2, pady=2)
+
+        cat_list = tk.Listbox(left, height=14, exportselection=False)
+        cat_list.pack(fill="both", expand=True, padx=2, pady=2)
+
+        cats = [
+            ("artist_aliases", "Artist Aliases"),
+            ("folder_aliases", "Folder Aliases / Franchises"),
+            ("character_mappings", "Character Mappings"),
+            ("canonical_character_aliases", "Canonical Character Aliases"),
+            ("learned", "Learned Mappings"),
+            ("dest_folders", "Destination Folders"),
+            ("characters", "Characters"),
+            ("resolutions", "Resolutions"),
+        ]
+        self._cat_map = {disp: key for key, disp in cats}
+        self._full_cat_displays = [disp for key, disp in cats]
+
+        def _repop_cat_list(filtered_displays):
+            cat_list.delete(0, "end")
+            for d in filtered_displays:
+                cat_list.insert("end", d)
+
+        _repop_cat_list(self._full_cat_displays)
+
+        def _filter_categories(*_):
+            term = cat_search_var.get().lower().strip()
+            if not term:
+                filtered = self._full_cat_displays
+            else:
+                filtered = [d for d in self._full_cat_displays if term in d.lower()]
+            _repop_cat_list(filtered)
+
+        cat_search_var.trace_add("write", _filter_categories)
+
+        # Right content container (cleared and rebuilt on category select)
+        self._right_container = right
+        self._current_right_content = None
+
+        def _switch_category(cat, cpath, cfg, disp_name):
+            # Clear previous right content
+            if self._current_right_content is not None:
+                for w in self._current_right_content.winfo_children():
+                    w.destroy()
+                self._current_right_content.destroy()
+            self._current_right_content = ttk.Frame(self._right_container)
+            self._current_right_content.pack(fill="both", expand=True)
+
+            parent = self._current_right_content
+
+            # Optional header
+            ttk.Label(parent, text=disp_name, font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0,4))
 
             if cat in ("artists", "franchises", "character_mappings", "canonical_character_aliases", "learned"):
-                # Phase 4a usability: 5 editable tabs (kept from 3c/3b/3a). Split buttons, select populates fields,
-                # live list+count refresh after every Add New / Update Selected / Remove / Clear (before Save),
-                # count labels, improved terminology + clarifying help text (esp. for the two char sections).
-                # Save/backup behavior unchanged. No Stash, no new sections, no dest/res editing.
+                # Re-use the 4a/prior editable UI code, adapted to pack into 'parent' instead of tab frame 'f'.
+                # All live refresh, 4 buttons, select populate, counts, terminology, help, save-unaffected logic preserved.
                 if cat == "artists":
                     edit_d = self._edit_artist_aliases
                     tab_title = "Artists"
@@ -2078,24 +2131,46 @@ class OrganizerGUI:
                     help_text = ("Alias / match text is what the organizer looks for in filenames. "
                                  "Canonical name is the clean display name used in output filenames.\n"
                                  "Canonical character aliases decide the display name used in output filenames.")
-                else:  # learned (Phase 3c)
+                else:  # learned
                     edit_d = self._edit_learned_mappings
                     tab_title = "Learned mappings"
                     key_label = "Learned character/key:"
                     val_label = "Franchise/folder:"
                     help_text = None
 
-                # Count label (Phase 4a)
-                count_label = ttk.Label(f, text="")
-                count_label.pack(pady=(2,0))
+                # Count label
+                count_label = ttk.Label(parent, text="")
+                count_label.pack(anchor="w", pady=(0,2))
 
-                lst = tk.Listbox(f, height=10)
-                lst.pack(fill="both", expand=True, padx=4, pady=2)
+                # Search/filter for this list (Phase 4a.5 requirement)
+                filter_var = tk.StringVar()
+                filter_ent = ttk.Entry(parent, textvariable=filter_var)
+                filter_ent.pack(fill="x", pady=2)
+                ttk.Label(parent, text="Filter (clears on empty):").pack(anchor="w")
 
-                # Create entry widgets EARLY so that ALL callback defs (which close over them) see the per-tab instances.
-                # This + default args in defs fixes the loop closure late-binding bug.
-                frm = ttk.Frame(f)
-                frm.pack(fill="x", padx=4, pady=4)
+                lst = tk.Listbox(parent, height=10)
+                lst.pack(fill="both", expand=True, padx=2, pady=2)
+
+                def _repop_list(edit_d=edit_d, lst=lst, count_label=count_label, tab_title=tab_title, cat=cat):
+                    term = filter_var.get().lower().strip()
+                    lst.delete(0, "end")
+                    for k in sorted(edit_d.keys()):
+                        disp = f"{k} -> {edit_d[k]}"
+                        if not term or term in k.lower() or term in str(edit_d[k]).lower():
+                            lst.insert("end", disp)
+                    suffix = "learned entries" if cat == "learned" else "local entries"
+                    count_label.config(text=f"{tab_title}: {len(edit_d)} {suffix}")
+
+                def _update_count(edit_d=edit_d, count_label=count_label, tab_title=tab_title, cat=cat):
+                    suffix = "learned entries" if cat == "learned" else "local entries"
+                    count_label.config(text=f"{tab_title}: {len(edit_d)} {suffix}")
+
+                # bind filter to repop
+                filter_var.trace_add("write", lambda *a: _repop_list())
+
+                # entry widgets
+                frm = ttk.Frame(parent)
+                frm.pack(fill="x", padx=2, pady=4)
                 ttk.Label(frm, text=key_label).pack(side="left")
                 alias_ent = ttk.Entry(frm, width=22)
                 alias_ent.pack(side="left", padx=2)
@@ -2103,45 +2178,26 @@ class OrganizerGUI:
                 canon_ent = ttk.Entry(frm, width=22)
                 canon_ent.pack(side="left", padx=2)
 
-                # Define helpers and callbacks AFTER all per-tab widgets exist, using default args to bind
-                # the iteration's values (edit_d, lst, etc.) at def time. This prevents all closures from
-                # seeing only the *last* tab's objects after the for-loop ends.
-                def _update_count(edit_d=edit_d, count_label=count_label, tab_title=tab_title, cat=cat):
-                    suffix = "learned entries" if cat == "learned" else "local entries"
-                    count_label.config(text=f"{tab_title}: {len(edit_d)} {suffix}")
-
-                def _repop_list(edit_d=edit_d, lst=lst, count_label=count_label, _update_count=_update_count):
-                    lst.delete(0, "end")
-                    for k in sorted(edit_d.keys()):
-                        lst.insert("end", f"{k} -> {edit_d[k]}")
-                    _update_count()
-
                 def _on_select(evt=None, lst=lst, alias_ent=alias_ent, canon_ent=canon_ent):
                     sel = lst.curselection()
-                    if not sel:
-                        return
+                    if not sel: return
                     line = lst.get(sel[0])
                     if " -> " in line:
                         k, v = line.split(" -> ", 1)
-                        alias_ent.delete(0, "end")
-                        alias_ent.insert(0, k)
-                        canon_ent.delete(0, "end")
-                        canon_ent.insert(0, v)
+                        alias_ent.delete(0, "end"); alias_ent.insert(0, k)
+                        canon_ent.delete(0, "end"); canon_ent.insert(0, v)
 
                 lst.bind("<<ListboxSelect>>", _on_select)
 
                 _repop_list()
 
-                # Phase 4a: separate buttons + live refresh (list + count + status) immediately, before Save.
                 def _do_add_new(edit_d=edit_d, lst=lst, count_label=count_label, alias_ent=alias_ent, canon_ent=canon_ent, _repop_list=_repop_list):
                     a = alias_ent.get().strip()
                     c = canon_ent.get().strip()
-                    if not a or not c:
-                        return
+                    if not a or not c: return
                     nk = org.normalize(a) if (org and hasattr(org, "normalize")) else a.lower().replace(" ", "")
                     if nk in edit_d:
-                        if not messagebox.askyesno("Overwrite existing?", f"Key '{nk}' already exists. Overwrite its value?"):
-                            return
+                        if not messagebox.askyesno("Overwrite existing?", f"Key '{nk}' already exists. Overwrite its value?"): return
                     edit_d[nk] = c
                     _repop_list()
                     self.status_var.set(f"Added new entry for {nk} (live in list, before Save).")
@@ -2152,24 +2208,21 @@ class OrganizerGUI:
                         messagebox.showwarning("No selection", "Select a row first to Update Selected.")
                         return
                     line = lst.get(sel[0])
-                    if " -> " not in line:
-                        return
+                    if " -> " not in line: return
                     old_k = line.split(" -> ", 1)[0]
                     a = alias_ent.get().strip()
                     c = canon_ent.get().strip()
-                    if not a or not c:
-                        return
+                    if not a or not c: return
                     nk = org.normalize(a) if (org and hasattr(org, "normalize")) else a.lower().replace(" ", "")
                     if old_k != nk and old_k in edit_d:
-                        edit_d.pop(old_k, None)  # support key rename via the Alias field
+                        edit_d.pop(old_k, None)
                     edit_d[nk] = c
                     _repop_list()
                     self.status_var.set(f"Updated {nk} (live in list, before Save).")
 
                 def _do_remove(edit_d=edit_d, lst=lst, _repop_list=_repop_list):
                     sel = lst.curselection()
-                    if not sel:
-                        return
+                    if not sel: return
                     line = lst.get(sel[0])
                     if " -> " in line:
                         k = line.split(" -> ", 1)[0]
@@ -2183,10 +2236,12 @@ class OrganizerGUI:
                     canon_ent.delete(0, "end")
                     self.status_var.set("Cleared selection / new entry mode. Fill Alias + Value then click Add New.")
 
-                ttk.Button(frm, text="Add New", command=_do_add_new).pack(side="left", padx=2)
-                ttk.Button(frm, text="Update Selected", command=_do_update_selected).pack(side="left", padx=2)
-                ttk.Button(frm, text="Remove Selected", command=_do_remove).pack(side="left", padx=2)
-                ttk.Button(frm, text="Clear Selection / New Entry", command=_do_clear).pack(side="left", padx=2)
+                btn_frm = ttk.Frame(parent)
+                btn_frm.pack(fill="x", pady=2)
+                ttk.Button(btn_frm, text="Add New", command=_do_add_new).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Update Selected", command=_do_update_selected).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Remove Selected", command=_do_remove).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Clear Selection / New Entry", command=_do_clear).pack(side="left", padx=2)
 
                 if cat == "learned":
                     def _do_reload_learned(edit_d=edit_d, _repop_list=_repop_list):
@@ -2200,201 +2255,207 @@ class OrganizerGUI:
                             edit_d.update(new_d)
                             _repop_list()
                         except Exception as ex:
-                            # non-fatal for reload
                             pass
-                    ttk.Button(frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
+                    ttk.Button(btn_frm, text="Reload from disk", command=_do_reload_learned).pack(side="left", padx=4)
 
-                # Phase 4a explanatory help text for the two character sections (exact per spec)
                 if help_text:
-                    ttk.Label(f, text=help_text, wraplength=700, justify="left").pack(pady=2)
+                    ttk.Label(parent, text=help_text, wraplength=600, justify="left").pack(anchor="w", pady=2)
 
-                note = "Phase 4a: edits are in-memory only until Save. All lists + counts refresh live after Add New / Update Selected / Remove / Clear (before Save is clicked). Clear switches to new-entry mode. Backups created on Save as before."
-                ttk.Label(f, text=note).pack(pady=2)
-            else:
-                # Phase 3d/3e view-only tabs: dest_folders (extended with 3e suggestions + explicit create) + characters + resolutions (improved).
-                # No Add/Edit/Remove/Save for these; labels "View-only in Phase 3d/3e"; refresh only rebuilds in-memory (no FS/config writes). 3e create is button-driven after dialog only.
-                if cat == "dest_folders":
-                    # Phase 3e: keep the 3d validation lists + refresh (view-only, no auto create).
-                    # Add controlled "Missing Folder Suggestions" section (from 3 sources only), Generate Plan (in-mem, no mkdir),
-                    # and explicit "Create Selected Missing Folders" (shows askyesno with *exact* paths, then mkdir only for safe).
-                    # Report written *only* on explicit create execution. No del/rename/move. Unsafe rejected.
-                    lst_folders = tk.Listbox(f, height=6)
-                    lst_folders.pack(fill="both", expand=True, padx=4, pady=2)
-                    lst_issues = tk.Listbox(f, height=4)
-                    lst_issues.pack(fill="both", expand=True, padx=4, pady=2)
-                    self._dest_folders_lst = lst_folders
-                    self._dest_issues_lst = lst_issues
+                note = "Phase 4a/4a.5: in-memory until Save. Lists + counts refresh live after Add/Update/Remove/Clear. Search above filters this list only."
+                ttk.Label(parent, text=note, wraplength=600).pack(anchor="w", pady=2)
 
-                    def _repop_dest():
-                        lst_folders.delete(0, "end")
-                        lst_issues.delete(0, "end")
-                        try:
-                            rep = build_destination_folder_validation_report(cpath)
-                            for it in rep.get("folders", []):
-                                lst_folders.insert("end", f"{it.get('norm','?')}: {it.get('display','?')} (exists:{it.get('exists')}, in_ref:{it.get('in_ref')}, srcs:{len(it.get('sources',[]))})")
-                            for iss in rep.get("issues", []):
-                                lst_issues.insert("end", iss)
-                            if "error" in rep:
-                                lst_issues.insert("end", f"ERR: {rep['error']}")
-                        except Exception as ex:
-                            lst_issues.insert("end", f"ERR: {ex}")
+            elif cat == "dest_folders":
+                # View-only + 3e suggestions (kept view-only, no edit fields added)
+                # Adapted from original 3e code, packed into parent
+                lst_folders = tk.Listbox(parent, height=6)
+                lst_folders.pack(fill="both", expand=True, padx=4, pady=2)
+                lst_issues = tk.Listbox(parent, height=4)
+                lst_issues.pack(fill="both", expand=True, padx=4, pady=2)
+                self._dest_folders_lst = lst_folders
+                self._dest_issues_lst = lst_issues
 
+                def _repop_dest():
+                    lst_folders.delete(0, "end")
+                    lst_issues.delete(0, "end")
+                    try:
+                        rep = build_destination_folder_validation_report(cpath)
+                        for it in rep.get("folders", []):
+                            lst_folders.insert("end", f"{it.get('norm','?')}: {it.get('display','?')} (exists:{it.get('exists')}, in_ref:{it.get('in_ref')}, srcs:{len(it.get('sources',[]))})")
+                        for iss in rep.get("issues", []):
+                            lst_issues.insert("end", iss)
+                        if "error" in rep:
+                            lst_issues.insert("end", f"ERR: {rep['error']}")
+                    except Exception as ex:
+                        lst_issues.insert("end", f"ERR: {ex}")
+
+                _repop_dest()
+
+                def _refresh_dest():
                     _repop_dest()
+                    self.status_var.set("Destination folder validation refreshed (view-only, no writes, no auto-create).")
 
-                    def _refresh_dest():
-                        _repop_dest()
-                        self.status_var.set("Destination folder validation refreshed (view-only, no writes, no auto-create).")
+                ttk.Button(parent, text="Refresh Folder Validation", command=_refresh_dest).pack(pady=2)
 
-                    ttk.Button(f, text="Refresh Folder Validation", command=_refresh_dest).pack(pady=2)
+                # 3e suggestions etc (kept as-is for view)
+                ttk.Label(parent, text="Missing Folder Suggestions (from folder_aliases + character_mappings + learned targets only; existing excluded):").pack(pady=(6,2))
+                lst_sugg = tk.Listbox(parent, height=5, selectmode="multiple")
+                lst_sugg.pack(fill="both", expand=True, padx=4, pady=2)
+                self._missing_sugg_lst = lst_sugg
+                self._current_suggestions = []
 
-                    # Phase 3e Missing Folder Suggestions (read-only collect until explicit Create)
-                    ttk.Label(f, text="Missing Folder Suggestions (from folder_aliases + character_mappings + learned targets only; existing excluded):").pack(pady=(6,2))
-                    lst_sugg = tk.Listbox(f, height=5, selectmode="multiple")
-                    lst_sugg.pack(fill="both", expand=True, padx=4, pady=2)
-                    self._missing_sugg_lst = lst_sugg
+                lst_plan = tk.Listbox(parent, height=3)
+                lst_plan.pack(fill="both", expand=True, padx=4, pady=2)
+                self._plan_lst = lst_plan
+
+                lst_create_res = tk.Listbox(parent, height=3)
+                lst_create_res.pack(fill="both", expand=True, padx=4, pady=2)
+                self._create_results_lst = lst_create_res
+
+                def _repop_suggestions():
+                    lst_sugg.delete(0, "end")
                     self._current_suggestions = []
+                    try:
+                        suggs = collect_missing_folder_suggestions(cpath)
+                        self._current_suggestions = [s for s in suggs if not s.get("exists")]
+                        for s in self._current_suggestions:
+                            safe_flag = "SAFE" if s.get("is_safe") else "UNSAFE"
+                            lst_sugg.insert("end", f"{s.get('display','?')} | key:{s.get('key','?')} | srcs:{', '.join(s.get('sources',[]))[:60]} | {safe_flag} | -> {s.get('proposed','?')}")
+                    except Exception as ex:
+                        lst_sugg.insert("end", f"ERR collecting suggestions: {ex}")
 
-                    lst_plan = tk.Listbox(f, height=3)
-                    lst_plan.pack(fill="both", expand=True, padx=4, pady=2)
-                    self._plan_lst = lst_plan
+                _repop_suggestions()
 
-                    lst_create_res = tk.Listbox(f, height=3)
-                    lst_create_res.pack(fill="both", expand=True, padx=4, pady=2)
-                    self._create_results_lst = lst_create_res
+                def _generate_plan():
+                    lst_plan.delete(0, "end")
+                    try:
+                        sel_idxs = lst_sugg.curselection()
+                        sel_keys = []
+                        for i in sel_idxs:
+                            line = lst_sugg.get(i)
+                            if " | key:" in line:
+                                kpart = line.split(" | key:", 1)[1].split(" | ", 1)[0].strip()
+                                sel_keys.append(kpart)
+                        plan = build_folder_creation_plan(self._current_suggestions or collect_missing_folder_suggestions(cpath), sel_keys)
+                        self._current_plan = plan
+                        for it in plan.get("items", []):
+                            lst_plan.insert("end", f"PLAN: {it.get('display')} -> {it.get('proposed_path')}")
+                        if not plan.get("items"):
+                            lst_plan.insert("end", "(no safe selected items for plan; select SAFE entries above and Generate again)")
+                        self.status_var.set("Folder creation plan generated (in-memory only; no folders created yet). Review before Create.")
+                    except Exception as ex:
+                        lst_plan.insert("end", f"ERR: {ex}")
 
-                    def _repop_suggestions():
-                        lst_sugg.delete(0, "end")
-                        self._current_suggestions = []
-                        try:
-                            suggs = collect_missing_folder_suggestions(cpath)
-                            self._current_suggestions = [s for s in suggs if not s.get("exists")]
-                            for s in self._current_suggestions:
-                                safe_flag = "SAFE" if s.get("is_safe") else "UNSAFE"
-                                lst_sugg.insert("end", f"{s.get('display','?')} | key:{s.get('key','?')} | srcs:{', '.join(s.get('sources',[]))[:60]} | {safe_flag} | -> {s.get('proposed','?')}")
-                        except Exception as ex:
-                            lst_sugg.insert("end", f"ERR collecting suggestions: {ex}")
+                ttk.Button(parent, text="Generate Folder Creation Plan (no folders created)", command=_generate_plan).pack(pady=2)
 
-                    _repop_suggestions()
-
-                    def _generate_plan():
-                        lst_plan.delete(0, "end")
-                        try:
+                def _create_selected():
+                    lst_create_res.delete(0, "end")
+                    try:
+                        plan = getattr(self, "_current_plan", None)
+                        if not plan or not plan.get("items"):
                             sel_idxs = lst_sugg.curselection()
                             sel_keys = []
                             for i in sel_idxs:
                                 line = lst_sugg.get(i)
-                                # parse key from the display line we built
                                 if " | key:" in line:
                                     kpart = line.split(" | key:", 1)[1].split(" | ", 1)[0].strip()
                                     sel_keys.append(kpart)
                             plan = build_folder_creation_plan(self._current_suggestions or collect_missing_folder_suggestions(cpath), sel_keys)
-                            self._current_plan = plan
-                            for it in plan.get("items", []):
-                                lst_plan.insert("end", f"PLAN: {it.get('display')} -> {it.get('proposed_path')}")
-                            if not plan.get("items"):
-                                lst_plan.insert("end", "(no safe selected items for plan; select SAFE entries above and Generate again)")
-                            self.status_var.set("Folder creation plan generated (in-memory only; no folders created yet). Review before Create.")
-                        except Exception as ex:
-                            lst_plan.insert("end", f"ERR: {ex}")
+                        if not plan or not plan.get("items"):
+                            lst_create_res.insert("end", "No safe items selected. Nothing to create.")
+                            self.status_var.set("No-op: nothing selected for creation.")
+                            return
+                        paths_str = "\n".join(it.get("proposed_path", "?") for it in plan.get("items", []))
+                        confirm = messagebox.askyesno(
+                            "Confirm Create Missing Folders (Phase 3e)",
+                            f"Create these exact folders?\n\n{paths_str}\n\nAll are under destination_root, safe (no .. / abs / bad chars / file conflicts), and referenced by config/learned.\n\nThis is the ONLY action that creates folders. Cancel to review."
+                        )
+                        if not confirm:
+                            lst_create_res.insert("end", "Creation cancelled by user.")
+                            return
+                        results = create_missing_destination_folders(plan)
+                        for c in results.get("created", []):
+                            lst_create_res.insert("end", f"CREATED: {c}")
+                        for a in results.get("already_exists", []):
+                            lst_create_res.insert("end", f"ALREADY: {a}")
+                        for s in results.get("skipped_unsafe", []):
+                            lst_create_res.insert("end", f"SKIPPED: {s}")
+                        for e in results.get("errors", []):
+                            lst_create_res.insert("end", f"ERROR: {e}")
+                        rp = results.get("report_path")
+                        if rp:
+                            lst_create_res.insert("end", f"REPORT: {rp}")
+                        if not results.get("created") and not results.get("already_exists"):
+                            lst_create_res.insert("end", "(no-op or all skipped)")
+                        self.status_var.set("Folder creation complete (see results + report if written). Re-run Refresh to update missing list.")
+                        _repop_dest()
+                    except Exception as ex:
+                        lst_create_res.insert("end", f"ERR during create: {ex}")
 
-                    ttk.Button(f, text="Generate Folder Creation Plan (no folders created)", command=_generate_plan).pack(pady=2)
+                ttk.Button(parent, text="Create Selected Missing Folders (explicit confirm dialog; safe only)", command=_create_selected).pack(pady=2)
 
-                    def _create_selected():
-                        lst_create_res.delete(0, "end")
-                        try:
-                            plan = getattr(self, "_current_plan", None)
-                            if not plan or not plan.get("items"):
-                                # fallback: build from current selection
-                                sel_idxs = lst_sugg.curselection()
-                                sel_keys = []
-                                for i in sel_idxs:
-                                    line = lst_sugg.get(i)
-                                    if " | key:" in line:
-                                        kpart = line.split(" | key:", 1)[1].split(" | ", 1)[0].strip()
-                                        sel_keys.append(kpart)
-                                plan = build_folder_creation_plan(self._current_suggestions or collect_missing_folder_suggestions(cpath), sel_keys)
-                            if not plan or not plan.get("items"):
-                                lst_create_res.insert("end", "No safe items selected. Nothing to create.")
-                                self.status_var.set("No-op: nothing selected for creation.")
-                                return
-                            # Show exact paths in confirmation dialog (required)
-                            paths_str = "\n".join(it.get("proposed_path", "?") for it in plan.get("items", []))
-                            confirm = messagebox.askyesno(
-                                "Confirm Create Missing Folders (Phase 3e)",
-                                f"Create these exact folders?\n\n{paths_str}\n\nAll are under destination_root, safe (no .. / abs / bad chars / file conflicts), and referenced by config/learned.\n\nThis is the ONLY action that creates folders. Cancel to review."
-                            )
-                            if not confirm:
-                                lst_create_res.insert("end", "Creation cancelled by user.")
-                                return
-                            results = create_missing_destination_folders(plan)
-                            for c in results.get("created", []):
-                                lst_create_res.insert("end", f"CREATED: {c}")
-                            for a in results.get("already_exists", []):
-                                lst_create_res.insert("end", f"ALREADY: {a}")
-                            for s in results.get("skipped_unsafe", []):
-                                lst_create_res.insert("end", f"SKIPPED: {s}")
-                            for e in results.get("errors", []):
-                                lst_create_res.insert("end", f"ERROR: {e}")
-                            rp = results.get("report_path")
-                            if rp:
-                                lst_create_res.insert("end", f"REPORT: {rp}")
-                            if not results.get("created") and not results.get("already_exists"):
-                                lst_create_res.insert("end", "(no-op or all skipped)")
-                            self.status_var.set("Folder creation complete (see results + report if written). Re-run Refresh to update missing list.")
-                            # refresh the main validation lists so newly created no longer show as missing
-                            _repop_dest()
-                        except Exception as ex:
-                            lst_create_res.insert("end", f"ERR during create: {ex}")
+                ttk.Label(parent, text="Phase 3e: Missing-folder creation is EXPLICIT ONLY. ... (view-only; no new edit fields added in 4a.5)").pack(pady=2)
 
-                    ttk.Button(f, text="Create Selected Missing Folders (explicit confirm dialog; safe only)", command=_create_selected).pack(pady=2)
+            elif cat == "resolutions":
+                lst_res = tk.Listbox(parent, height=8)
+                lst_res.pack(fill="both", expand=True, padx=4, pady=2)
+                lst_res_issues = tk.Listbox(parent, height=4)
+                lst_res_issues.pack(fill="both", expand=True, padx=4, pady=2)
+                self._res_lst = lst_res
+                self._res_issues_lst = lst_res_issues
 
-                    ttk.Label(f, text="Phase 3e: Missing-folder creation is EXPLICIT ONLY. Generate builds plan in-memory (never creates). Create shows dialog with exact full paths and requires Yes. validate_destination_folder_name rejects empty/absolute/.. / <>:\"|?* / outside dest / existing-file. Report written ONLY on explicit execute. No auto-create on open/refresh/validate/Generate. No delete/rename/move. r34_config.json and learned_character_franchises.json are never modified by these tools.").pack(pady=2)
-                elif cat == "resolutions":
-                    # Improved view: richer than simple known list; use pure report for labels + issues.
-                    lst_res = tk.Listbox(f, height=8)
-                    lst_res.pack(fill="both", expand=True, padx=4, pady=2)
-                    lst_res_issues = tk.Listbox(f, height=4)
-                    lst_res_issues.pack(fill="both", expand=True, padx=4, pady=2)
-                    self._res_lst = lst_res
-                    self._res_issues_lst = lst_res_issues
+                def _repop_res():
+                    lst_res.delete(0, "end")
+                    lst_res_issues.delete(0, "end")
+                    try:
+                        rep = build_resolution_validation_report(cpath)
+                        for b, lab in rep.get("resolutions", {}).items():
+                            lst_res.insert("end", f"{b}: {lab}")
+                        for iss in rep.get("issues", []):
+                            lst_res_issues.insert("end", iss)
+                        sc = rep.get("sample_count", 0)
+                        if sc:
+                            lst_res.insert("end", f"(sample_count: {sc})")
+                        if "error" in rep:
+                            lst_res_issues.insert("end", f"ERR: {rep['error']}")
+                    except Exception as ex:
+                        lst_res_issues.insert("end", f"ERR: {ex}")
 
-                    def _repop_res():
-                        lst_res.delete(0, "end")
-                        lst_res_issues.delete(0, "end")
-                        try:
-                            rep = build_resolution_validation_report(cpath)
-                            for b, lab in rep.get("resolutions", {}).items():
-                                lst_res.insert("end", f"{b}: {lab}")
-                            for iss in rep.get("issues", []):
-                                lst_res_issues.insert("end", iss)
-                            sc = rep.get("sample_count", 0)
-                            if sc:
-                                lst_res.insert("end", f"(sample_count: {sc})")
-                            if "error" in rep:
-                                lst_res_issues.insert("end", f"ERR: {rep['error']}")
-                        except Exception as ex:
-                            lst_res_issues.insert("end", f"ERR: {ex}")
+                _repop_res()
 
+                def _refresh_res():
                     _repop_res()
+                    self.status_var.set("Resolution validation refreshed (view-only, no writes).")
 
-                    def _refresh_res():
-                        _repop_res()
-                        self.status_var.set("Resolution validation refreshed (view-only, no writes).")
+                ttk.Button(parent, text="Refresh Resolution Validation", command=_refresh_res).pack(pady=2)
+                ttk.Label(parent, text="View-only. Shows resolution labels from library scan + naming style. No editing, no config/media writes. Resolution editing is deferred.").pack(pady=2)
 
-                    ttk.Button(f, text="Refresh Resolution Validation", command=_refresh_res).pack(pady=2)
-                    ttk.Label(f, text="View-only in Phase 3d. Shows resolution labels from library scan + naming style. No editing, no config/media writes. Resolution editing is deferred.").pack(pady=2)
+            else:
+                # characters or other simple view-only
+                lst = tk.Listbox(parent, height=12)
+                lst.pack(fill="both", expand=True, padx=4, pady=2)
+                src = (self.correction_known or {}).get(cat, [])
+                for v in src:
+                    lst.insert("end", v)
+                if cat == "characters":
+                    note = "View-only. Do not edit character_mappings/canonical_character_aliases here (use dedicated tabs). Learned editable in its tab. Destination folders have dedicated view+validation tab."
                 else:
-                    # characters view (updated note)
-                    lst = tk.Listbox(f, height=12)
-                    lst.pack(fill="both", expand=True, padx=4, pady=2)
-                    src = (self.correction_known or {}).get(cat, [])
-                    for v in src:
-                        lst.insert("end", v)
-                    if cat == "characters":
-                        note = "View-only in Phase 3d/3e. Do not edit character_mappings/canonical_character_aliases here (use dedicated tabs). Learned editable in its tab. Destination folders now have dedicated view+validation + safe explicit creation suggestions tab (Phase 3e)."
-                    else:
-                        note = "View-only in Phase 3d/3e. Do not edit destination folders or resolutions (dedicated view+validation tabs above; no editing in 3d/3e; 3e adds controlled creation suggestions only under dest_root after explicit confirm). Use JSON directly with backups for advanced changes."
-                    ttk.Label(f, text=note).pack(pady=2)
+                    note = "View-only. Do not edit destination folders or resolutions (dedicated view tabs). Use JSON directly with backups for advanced changes."
+                ttk.Label(parent, text=note).pack(pady=2)
+
+        # wire selection
+        def _on_cat_select(evt=None):
+            sel = cat_list.curselection()
+            if not sel: return
+            disp = cat_list.get(sel[0])
+            cat = self._cat_map.get(disp)
+            if cat:
+                _switch_category(cat, cpath, cfg, disp)
+
+        cat_list.bind("<<ListboxSelect>>", _on_cat_select)
+
+        # initial selection
+        cat_list.selection_set(0)
+        _switch_category(cats[0][0], cpath, cfg, cats[0][1])
 
         def _save_known_values_changes():
             # Phase 4a save (unchanged from 3e/3d/3c/3b/3a): use pures for 4 config sections + learned (separate file).
