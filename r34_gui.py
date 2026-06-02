@@ -770,6 +770,16 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
             performer_status = "success"
             if result["performers"]:
                 result["meta"]["connected"] = True
+            # Phase 4b.6: capture rich data
+            performer_data = []
+            for p in (fp.get("performers") or []):
+                if isinstance(p, dict):
+                    performer_data.append({
+                        "id": p.get("id"),
+                        "name": p.get("name"),
+                        "alias_list": p.get("alias_list", []),
+                    })
+            result["performer_data"] = performer_data
         else:
             if isinstance(data, dict) and data.get("errors"):
                 gerr = data["errors"][0] if data["errors"] else {}
@@ -814,6 +824,16 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
                             grps.append(al)
             result["groups"] = sorted(set(n for n in grps if n))
             group_status = "success"
+            # Phase 4b.6 rich data
+            group_data = []
+            for g in (fg.get("groups") or []):
+                if isinstance(g, dict):
+                    group_data.append({
+                        "id": g.get("id"),
+                        "name": g.get("name"),
+                        "aliases": g.get("aliases", []),
+                    })
+            result["group_data"] = group_data
         else:
             if isinstance(data, dict) and data.get("errors"):
                 gerr = data["errors"][0] if data["errors"] else {}
@@ -869,7 +889,7 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
         group_status = f"error: {type(e).__name__}: {e}"
         result["errors"].append(f"groups query failed: {group_status}")
 
-    # Tags (character candidates)
+    # Tags (character candidates) - Phase 4b.6: fetch richer data for classification using parents/ancestors/aliases
     tag_status = "not run"
     tag_resp_count = 0
     try:
@@ -880,19 +900,33 @@ def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeou
             tags {
               id
               name
+              aliases
+              parents { id name }
+              children { id name }
             }
           }
         }
         """
         data = _post_graphql(q)
         tgs = []
+        tag_data = []
         if isinstance(data, dict) and data.get("data") and data["data"].get("findTags"):
             ft = data["data"]["findTags"]
             tag_resp_count = ft.get("count", 0) or len(ft.get("tags", []) or [])
             for t in (ft.get("tags") or []):
-                if isinstance(t, dict) and t.get("name"):
-                    tgs.append(t["name"])
+                if isinstance(t, dict):
+                    nm = t.get("name")
+                    if nm:
+                        tgs.append(nm)
+                    tag_data.append({
+                        "id": t.get("id"),
+                        "name": nm,
+                        "aliases": t.get("aliases", []),
+                        "parents": t.get("parents", []),
+                        "children": t.get("children", []),
+                    })
             result["tags"] = sorted(set(n for n in tgs if n))
+            result["tag_data"] = tag_data
             tag_status = "success"
         else:
             if isinstance(data, dict) and data.get("errors"):
@@ -949,6 +983,9 @@ def get_sample_stash_data() -> dict:
             "New Character Tag",
             "Eve",
             "TestChar",
+            "ArtistTagUnderArtists",
+            "FranchiseTag",
+            "AmbiguousMixed",
         ],
         "errors": [],
         "meta": {
@@ -964,9 +1001,96 @@ def get_sample_stash_data() -> dict:
         "response_counts": {
             "performers": 5,
             "groups": 3,
-            "tags": 5,
+            "tags": 8,
         },
+        # Phase 4b.6 rich data for classification (used by build and tests)
+        "performer_data": [
+            {"id": "p1", "name": "Pantsushi", "alias_list": []},
+            {"id": "p2", "name": "New Performer One", "alias_list": []},
+            {"id": "p3", "name": "New Performer Two", "alias_list": []},
+            {"id": "p4", "name": "bulging senpai", "alias_list": []},
+            {"id": "p5", "name": "Some Artist", "alias_list": []},
+        ],
+        "group_data": [
+            {"id": "g1", "name": "New Franchise Group", "aliases": []},
+            {"id": "g2", "name": "Baldur's Gate 3", "aliases": []},
+            {"id": "g3", "name": "Another Group", "aliases": []},
+        ],
+        "tag_data": [
+            {"id": "t1", "name": "2b", "aliases": ["2B"], "parents": [{"id": "pc", "name": "Characters"}], "children": []},
+            {"id": "t2", "name": "New Character Tag", "aliases": [], "parents": [{"name": "Characters"}], "children": []},
+            {"id": "t3", "name": "Eve", "aliases": [], "parents": [{"name": "Characters"}], "children": []},
+            {"id": "t4", "name": "TestChar", "aliases": [], "parents": [], "children": []},  # general -> ignored
+            {"id": "t5", "name": "ArtistTagUnderArtists", "aliases": [], "parents": [{"name": "Artists"}], "children": []},  # artist_candidate
+            {"id": "t6", "name": "FranchiseTag", "aliases": [], "parents": [{"name": "Franchises"}], "children": []},  # franchise
+            {"id": "t7", "name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []},  # ambiguous
+        ],
     }
+
+
+def classify_stash_tag(tag_info: dict) -> tuple:
+    """Pure: classify Stash tag using parent/ancestor names and aliases for safe suggested target.
+
+    Returns (detected_tag_role, suggested_section, classification_reason)
+    Roles: artist_candidate, character_candidate, franchise_candidate, general_tag, ambiguous
+    """
+    if not isinstance(tag_info, dict):
+        return "general_tag", "ignored_or_review", "invalid tag data"
+
+    # Collect clues from parents (and their aliases), and self name/aliases for robustness
+    clues = set()
+    def add_clue(n):
+        if n:
+            clues.add(str(n).lower().strip())
+
+    # self
+    add_clue(tag_info.get("name"))
+    for a in (tag_info.get("aliases") or tag_info.get("alias_list") or []):
+        add_clue(a)
+
+    # parents + ancestors (direct parents; recurse if nested but Stash parents are direct)
+    for p in (tag_info.get("parents") or []):
+        if isinstance(p, dict):
+            add_clue(p.get("name"))
+            for pa in (p.get("aliases") or p.get("alias_list") or []):
+                add_clue(pa)
+            # also check parent's parents if present in data
+            for gp in (p.get("parents") or []):
+                if isinstance(gp, dict):
+                    add_clue(gp.get("name"))
+
+    # children not used for classification per rules (focus on parents/ancestors)
+
+    artist_kws = ["artist", "artists", "creator", "creators", "r34 artist", "rule34 artist", "animator", "animators"]
+    char_kws = ["character", "characters"]
+    fran_kws = ["franchise", "franchises", "series", "game", "games", "source", "sources", "universe"]
+
+    matched = set()
+    for cl in clues:
+        cll = cl
+        if any(kw in cll for kw in artist_kws):
+            matched.add("artist")
+        if any(kw in cll for kw in char_kws):
+            matched.add("character")
+        if any(kw in cll for kw in fran_kws):
+            matched.add("franchise")
+
+    if len(matched) > 1:
+        return "ambiguous", "ignored_or_review", f"conflicting parents/ancestors: {sorted(clues)}"
+
+    if "artist" in matched:
+        return "artist_candidate", "artist_aliases", f"parent/ancestor matches artist/creator keywords (clues: {sorted(clues)})"
+
+    if "character" in matched:
+        return "character_candidate", "canonical_character_aliases", f"parent/ancestor matches character keywords (clues: {sorted(clues)})"
+
+    if "franchise" in matched:
+        return "franchise_candidate", "folder_aliases", f"parent/ancestor matches franchise/series/game keywords (clues: {sorted(clues)})"
+
+    if clues:
+        return "general_tag", "ignored_or_review", f"has parents/ancestors but no recognized category (clues: {sorted(clues)})"
+
+    return "general_tag", "ignored_or_review", "no parent or category clues available"
 
 
 def build_stash_import_preview(
@@ -976,15 +1100,17 @@ def build_stash_import_preview(
     local_character_mappings: dict,
     local_canonical_character_aliases: dict,
     local_learned: Optional[dict] = None,
+    group_role_override: str = "auto",
 ) -> dict:
     """Pure comparison: turn Stash lists + local dicts into preview items + summary counts.
 
     - Stash performers -> artist_aliases candidates
-    - Stash groups -> folder_aliases / franchise candidates
-    - Stash tags -> canonical_character_aliases candidates ONLY (never auto character_mappings)
+    - Stash groups -> controlled by group_role_override (franchises / rule34_artists / ignore / auto)
+    - Stash tags -> canonical_character_aliases candidates ONLY (never auto character_mappings) unless classified otherwise
       (note explains that franchise mapping is still required)
     - Statuses: missing_local, already_exists_local, possible_duplicate (within this preview load)
     - No writes, no mutations, fully testable.
+    - group_role_override: "auto" | "franchises" | "rule34_artists" | "ignore_review"
     """
     if local_learned is None:
         local_learned = {}
@@ -1009,10 +1135,10 @@ def build_stash_import_preview(
             return norm_key in lcca_keys
         return False
 
-    # Track dups within this stash preview (per suggested section)
-    seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set()}
+    # Track dups within this stash preview (per suggested section) - Phase 4b.6 add ignored
+    seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set(), "ignored_or_review": set()}
 
-    def _make_item(source: str, original: str, suggested: str, note: str = ""):
+    def _make_item(source: str, original: str, suggested: str, note: str = "", detected_role: str = None, classification_reason: str = ""):
         nk = normalize_stash_name(original)
         if not nk:
             return
@@ -1023,6 +1149,14 @@ def build_stash_import_preview(
             status = "possible_duplicate"
         seen.setdefault(suggested, set()).add(nk)
 
+        if detected_role is None:
+            if source == "stash_performer":
+                detected_role = "artist_candidate"
+            elif source == "stash_group":
+                detected_role = "franchise_candidate"
+            else:
+                detected_role = "general_tag"
+
         items.append({
             "source": source,
             "original": original,
@@ -1030,20 +1164,60 @@ def build_stash_import_preview(
             "suggested_section": suggested,
             "status": status,
             "note": note,
+            "detected_tag_role": detected_role,
+            "classification_reason": classification_reason or note,
         })
 
-    # Map categories per spec
-    for name in (stash_data or {}).get("performers", []) or []:
-        _make_item("stash_performer", name, "artist_aliases", "")
+    # Phase 4b.6: use rich data if available (from updated queries), fallback to name lists
+    # Performers always artist_candidate
+    performer_infos = (stash_data or {}).get("performer_data") or []
+    if not performer_infos:
+        for nm in (stash_data or {}).get("performers", []) or []:
+            performer_infos.append({"name": nm})
+    for p in performer_infos:
+        orig = p.get("name") or ""
+        if not orig: continue
+        _make_item("stash_performer", orig, "artist_aliases", "", "artist_candidate", "Stash performer")
 
-    for name in (stash_data or {}).get("groups", []) or []:
-        _make_item("stash_group", name, "folder_aliases", "")
+    # Groups: respect group_role_override (Phase 4b.6 source vs role separation)
+    group_infos = (stash_data or {}).get("group_data") or []
+    if not group_infos:
+        for nm in (stash_data or {}).get("groups", []) or []:
+            group_infos.append({"name": nm})
+    for g in group_infos:
+        orig = g.get("name") or ""
+        if not orig: continue
+        if group_role_override == "rule34_artists":
+            role = "artist_candidate"
+            sugg = "artist_aliases"
+            reason = "User configured Stash Groups as Rule34 artists"
+        elif group_role_override == "franchises":
+            role = "franchise_candidate"
+            sugg = "folder_aliases"
+            reason = "User configured Stash Groups as franchises/folders"
+        elif group_role_override == "ignore_review":
+            role = "ignored_or_review"
+            sugg = "ignored_or_review"
+            reason = "User configured Stash Groups as review-only"
+        else:
+            # auto: default to franchise (current behavior); could enhance with name heuristics later
+            role = "franchise_candidate"
+            sugg = "folder_aliases"
+            reason = "Stash group (auto)"
+        _make_item("stash_group", orig, sugg, "", role, reason)
 
-    tag_note = "canonical alias candidate only; franchise mapping still required"
-    for name in (stash_data or {}).get("tags", []) or []:
-        _make_item("stash_tag", name, "canonical_character_aliases", tag_note)
+    # Tags: classify using rich data
+    tag_infos = (stash_data or {}).get("tag_data") or []
+    if not tag_infos:
+        for nm in (stash_data or {}).get("tags", []) or []:
+            tag_infos.append({"name": nm})
+    for t in tag_infos:
+        orig = t.get("name") or ""
+        if not orig: continue
+        role, sugg, reason = classify_stash_tag(t)
+        _make_item("stash_tag", orig, sugg, "", role, reason)
 
-    # Counts (as required)
+    # Counts (as required) - Phase 4b.6 extended with role and ignored counts
     counts = {
         "stash_performers": len((stash_data or {}).get("performers", []) or []),
         "stash_groups": len((stash_data or {}).get("groups", []) or []),
@@ -1062,6 +1236,12 @@ def build_stash_import_preview(
         ),
         "already_exists_local": sum(1 for i in items if i["status"] == "already_exists_local"),
         "possible_duplicates": sum(1 for i in items if i["status"] == "possible_duplicate"),
+        # 4b.6 new
+        "ignored_or_review": sum(1 for i in items if i.get("suggested_section") == "ignored_or_review"),
+        "ambiguous": sum(1 for i in items if i.get("detected_tag_role") == "ambiguous" or i.get("status") == "ambiguous"),
+        "artist_candidate_tags": sum(1 for i in items if i.get("detected_tag_role") == "artist_candidate" and i.get("source") == "stash_tag"),
+        "character_candidate_tags": sum(1 for i in items if i.get("detected_tag_role") == "character_candidate"),
+        "franchise_candidate_tags": sum(1 for i in items if i.get("detected_tag_role") == "franchise_candidate" and i.get("source") == "stash_tag"),
     }
 
     return {
@@ -3005,6 +3185,16 @@ class OrganizerGUI:
                 debug_var = tk.StringVar(value="Schema Compatibility / Debug: (load or test to populate)")
                 ttk.Label(debug_frm, textvariable=debug_var, font=("TkDefaultFont", 8), foreground="gray", wraplength=750).pack(anchor="w")
 
+                # Phase 4b.6: Stash source vs role separation - group override control
+                group_frm = ttk.Frame(parent_frame)
+                group_frm.pack(fill="x", pady=4)
+                ttk.Label(group_frm, text="Treat Stash Groups as:").pack(side="left")
+                group_role_var = tk.StringVar(value="auto")
+                group_role_cb = ttk.Combobox(group_frm, textvariable=group_role_var, width=22, state="readonly",
+                                             values=["auto", "franchises", "rule34_artists", "ignore_review"])
+                group_role_cb.pack(side="left", padx=4)
+                ttk.Label(group_frm, text="(auto = current default to franchises; requires Reload Preview)").pack(side="left", padx=4)
+
                 # Filters
                 filter_frm = ttk.Frame(parent_frame)
                 filter_frm.pack(fill="x", pady=2)
@@ -3022,8 +3212,21 @@ class OrganizerGUI:
                 ttk.Label(filter_frm, text="Section:").pack(side="left", padx=(8,0))
                 section_filter_var = tk.StringVar(value="all")
                 section_cb = ttk.Combobox(filter_frm, textvariable=section_filter_var, width=18, state="readonly",
-                                          values=["all", "artist_aliases", "folder_aliases", "canonical_character_aliases"])
+                                          values=["all", "artist_aliases", "folder_aliases", "canonical_character_aliases", "ignored_or_review"])
                 section_cb.pack(side="left", padx=2)
+
+                # 4b.6 additional filters for classification
+                ttk.Label(filter_frm, text="Source:").pack(side="left", padx=(8,0))
+                source_filter_var = tk.StringVar(value="all")
+                source_cb = ttk.Combobox(filter_frm, textvariable=source_filter_var, width=16, state="readonly",
+                                         values=["all", "stash_performer", "stash_group", "stash_tag"])
+                source_cb.pack(side="left", padx=2)
+
+                ttk.Label(filter_frm, text="Role:").pack(side="left", padx=(8,0))
+                role_filter_var = tk.StringVar(value="all")
+                role_cb = ttk.Combobox(filter_frm, textvariable=role_filter_var, width=18, state="readonly",
+                                       values=["all", "artist_candidate", "character_candidate", "franchise_candidate", "general_tag", "ambiguous"])
+                role_cb.pack(side="left", padx=2)
 
                 # Preview list (filterable)
                 preview_lst = tk.Listbox(parent_frame, height=14)
@@ -3036,19 +3239,29 @@ class OrganizerGUI:
                     term = filter_var.get().lower().strip()
                     sf = status_filter_var.get()
                     secf = section_filter_var.get()
+                    srcf = source_filter_var.get()
+                    rolef = role_filter_var.get()
                     for it in getattr(self, "_stash_preview_items", []):
                         if sf != "all" and it.get("status") != sf:
                             continue
                         if secf != "all" and it.get("suggested_section") != secf:
                             continue
+                        if srcf != "all" and it.get("source") != srcf:
+                            continue
+                        if rolef != "all" and it.get("detected_tag_role") != rolef:
+                            continue
                         if term and term not in it.get("original", "").lower() and term not in it.get("norm_key", ""):
                             continue
-                        line = f"[{it.get('source')}] {it.get('original')} (norm:{it.get('norm_key')}) -> {it.get('suggested_section')} | {it.get('status')} | {it.get('note','')}"[:180]
+                        role = it.get("detected_tag_role", "")
+                        reason = it.get("classification_reason", it.get("note", ""))[:40]
+                        line = f"[{it.get('source')}] {it.get('original')} (norm:{it.get('norm_key')}) role:{role} -> {it.get('suggested_section')} | {it.get('status')} | {reason}"[:200]
                         preview_lst.insert("end", line)
 
                 filter_var.trace_add("write", lambda *a: _repop_stash_preview())
                 status_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
                 section_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
+                source_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
+                role_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
 
                 def _update_counts_from_preview(preview_dict):
                     c = (preview_dict or {}).get("counts", {})
@@ -3121,6 +3334,7 @@ class OrganizerGUI:
                             getattr(self, "_edit_character_mappings", {}),
                             getattr(self, "_edit_canonical_character_aliases", {}),
                             getattr(self, "_edit_learned_mappings", {}),
+                            group_role_override=group_role_var.get(),
                         )
                         self._stash_preview_items = preview.get("items", [])
                         self._last_stash_preview = preview
@@ -3192,8 +3406,12 @@ class OrganizerGUI:
                 import_btn.pack(side="left", padx=2)
                 ttk.Label(parent_frame, text="Import/apply will be implemented in Phase 4c. This phase is read-only preview + export only.", foreground="gray").pack(anchor="w")
 
-                note = "Phase 4b.5 read-only: queries only. Data shown is preview/comparison. Export writes a report (no config changes). All prior editable categories and view-only tabs remain fully functional."
-                ttk.Label(parent_frame, text=note, wraplength=700).pack(anchor="w", pady=4)
+                note = "Phase 4b.6 read-only classification preview: Tags classified by parent/ancestor tags (artist/character/franchise). Unclassified tags go to ignored_or_review (not auto characters). All prior editable + view-only tabs remain fully functional. Export is report only."
+                ttk.Label(parent_frame, text=note, wraplength=700).pack(anchor="w", pady=2)
+
+                # Required note per spec
+                class_note = "Tags are classified by parent/category tags when available. Unclassified tags are not treated as characters automatically. Use filters (Section/Source/Role/Status) to review."
+                ttk.Label(parent_frame, text=class_note, wraplength=700, foreground="gray").pack(anchor="w", pady=2)
 
                 # Auto-offer sample on first open of this cat (helpful for manual)
                 # (do not auto-query network)
