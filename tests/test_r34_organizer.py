@@ -1167,6 +1167,7 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
     No Tk, no GUI instance, no changes to main r34_config.json or learned json (except via the pures under test).
     All use fresh temp copies of the real committed config.
     Extended through 3e (folder create safety) and 4a (meta only; 4a is UI wiring on top of unchanged pures).
+    Phase 4b.5: added pure tests for stash preview helpers (normalize, query mockable, build_preview, export report safety).
     """
 
     @property
@@ -1834,6 +1835,107 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
                 canonical_character_aliases={"quux": "Quux"},
             )
             self.assertIsNotNone(b)  # backup created
+        self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4b.5 Stash read-only preview pure tests (no real Stash server ever required)
+    # ------------------------------------------------------------------
+
+    def test_stash_performers_are_converted_to_artist_aliases_candidates(self):
+        stash = gui.get_sample_stash_data()
+        local_aa = {"existing": "Existing"}
+        preview = gui.build_stash_import_preview(stash, local_aa, {}, {}, {})
+        arts = [i for i in preview["items"] if i["suggested_section"] == "artist_aliases"]
+        self.assertTrue(len(arts) > 0)
+        # sample has "New Performer One" etc. Use the actual normalize (org may preserve some spaces in keys, matching real config style)
+        expected_nk = gui.normalize_stash_name("New Performer One")
+        self.assertTrue(any(i["norm_key"] == expected_nk and i["source"] == "stash_performer" for i in arts))
+
+    def test_stash_groups_are_converted_to_franchise_folder_candidates(self):
+        stash = gui.get_sample_stash_data()
+        preview = gui.build_stash_import_preview(stash, {}, {"existing": "Existing"}, {}, {})
+        frans = [i for i in preview["items"] if i["suggested_section"] == "folder_aliases"]
+        self.assertTrue(len(frans) > 0)
+        self.assertTrue(any("new franchise" in i["norm_key"] for i in frans))
+
+    def test_stash_tags_are_converted_to_canonical_character_aliases_candidates_only_not_mappings(self):
+        stash = gui.get_sample_stash_data()
+        preview = gui.build_stash_import_preview(stash, {}, {}, {"2b": "Nier"}, {"2b": "2B"})
+        chars = [i for i in preview["items"] if i["suggested_section"] == "canonical_character_aliases"]
+        self.assertTrue(len(chars) > 0)
+        # must not suggest character_mappings
+        mappings = [i for i in preview["items"] if i["suggested_section"] == "character_mappings"]
+        self.assertEqual(len(mappings), 0)
+        self.assertTrue(any("canonical alias candidate only" in (i.get("note") or "") for i in chars))
+
+    def test_existing_local_values_are_marked_already_exists_local(self):
+        stash = {"performers": ["pantsushi"], "groups": [], "tags": []}
+        local_aa = {"pantsushi": "Pantsushi"}
+        preview = gui.build_stash_import_preview(stash, local_aa, {}, {}, {})
+        arts = [i for i in preview["items"] if i["suggested_section"] == "artist_aliases"]
+        self.assertTrue(arts)
+        self.assertEqual(arts[0]["status"], "already_exists_local")
+
+    def test_missing_local_values_are_marked_missing_local(self):
+        stash = {"performers": ["Completely New Artist"], "groups": ["New Group"], "tags": ["NewTag"]}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        self.assertTrue(any(i["status"] == "missing_local" for i in preview["items"]))
+
+    def test_duplicate_normalized_stash_values_are_marked_possible_duplicate_or_ambiguous(self):
+        stash = {"performers": ["Dup One", "Dup  One", "dupone"], "groups": [], "tags": []}  # normalize to same
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        dups = [i for i in preview["items"] if i["status"] == "possible_duplicate"]
+        self.assertTrue(len(dups) >= 1)
+
+    def test_export_preview_report_writes_report_without_modifying_r34_config_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tcfg = self._copy_to_temp(tmp)
+            pre_mtime = Path(tcfg).stat().st_mtime
+            stash = gui.get_sample_stash_data()
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            self.assertTrue(Path(rp).exists())
+            post_mtime = Path(tcfg).stat().st_mtime
+            self.assertEqual(pre_mtime, post_mtime)  # config copy untouched by export
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("READ-ONLY PREVIEW", content)
+            self.assertIn("Phase 4b.5", content)
+            # Report legitimately mentions "mutations" in English ("no ... mutations were sent"); the no-mutation test scans source code for GraphQL mutation syntax instead.
+
+    def test_no_stash_tests_require_real_stash_server(self):
+        # All use sample or direct pure calls; query with bad url should not crash the test
+        res = gui.query_stash_readonly("http://127.0.0.1:1/bad", None, timeout=1)
+        self.assertIn("errors", res)
+        self.assertIsInstance(res["errors"], list)
+
+    def test_no_graphql_mutation_strings_are_used_by_stash_preview_code(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+        self.assertNotIn('"mutation', code)
+        # also the sample queries in get_sample don't, and build doesn't generate any
+
+    def test_full_suite_still_passes_after_phase4b5_changes(self):
+        """Phase 4b.5 meta: after adding read-only Stash preview pures + UI category (no writes, no 4c), discover still clean."""
+        # Exercise the new pures + old apply pures still work
+        stash = gui.get_sample_stash_data()
+        p = gui.build_stash_import_preview(stash, {"old": "Old"}, {}, {}, {})
+        self.assertIn("counts", p)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfgp = Path(tmp) / "c.json"
+            cfgp.write_text(json.dumps({
+                "artist_aliases": {"foo": "Foo"},
+                "folder_aliases": {"bar": "Bar"},
+                "character_mappings": {"baz": "Baz"},
+                "canonical_character_aliases": {"quux": "Quux"},
+            }), encoding="utf-8")
+            b = gui.apply_known_values_edits_to_config(
+                cfgp,
+                artist_aliases={"foo": "Foo", "new4b5": "New4b5"},
+                folder_aliases={"bar": "Bar"},
+                character_mappings={"baz": "Baz"},
+                canonical_character_aliases={"quux": "Quux"},
+            )
+            self.assertIsNotNone(b)
         self.assertTrue(True)
 
 

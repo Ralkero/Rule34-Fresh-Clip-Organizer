@@ -18,6 +18,8 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -660,6 +662,404 @@ def create_missing_destination_folders(plan: dict) -> dict:
         "errors": errors,
         "report_path": report_path,
     }
+
+
+# ------------------------------------------------------------------
+# Phase 4b.5: Stash read-only import preview pure helpers (module-level, testable, no Tk)
+# All network isolated in query_stash_readonly (mockable for tests; no mutations ever).
+# build_ and export_ are pure (no FS writes except the explicit report on user Export).
+# normalize re-uses org.normalize when available for consistency with existing known-values.
+# ------------------------------------------------------------------
+
+def normalize_stash_name(name: str) -> str:
+    """Normalize a Stash performer/group/tag name for key comparison.
+    Uses org.normalize if available (preferred for consistency with artist_aliases etc),
+    else the fallback used in the Known Values Manager editable paths.
+    """
+    if not name:
+        return ""
+    s = str(name).strip()
+    if org is not None and hasattr(org, "normalize"):
+        try:
+            return org.normalize(s)
+        except Exception:
+            pass
+    return s.lower().replace(" ", "")
+
+
+def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeout: int = 10) -> dict:
+    """Perform read-only GraphQL queries against a Stash instance.
+
+    NEVER sends mutations. Uses only query operations for performers, groups/studios, tags.
+    Returns a dict with lists of names + errors list (per-category graceful failure) + meta.
+    Connection uses the standard Stash 'ApiKey' header when a key is supplied.
+    Timeouts and network errors are caught and reported so the GUI remains usable.
+    This function is the ONLY place with network/URL logic: designed for easy mocking in tests.
+    """
+    result = {
+        "performers": [],
+        "groups": [],
+        "tags": [],
+        "errors": [],
+        "meta": {"endpoint": graphql_url, "connected": False, "version": None},
+    }
+    if not graphql_url or not str(graphql_url).strip():
+        result["errors"].append("No GraphQL URL provided")
+        return result
+
+    url = str(graphql_url).strip()
+
+    def _post_graphql(query_str: str) -> dict:
+        payload = json.dumps({"query": query_str}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        if api_key:
+            req.add_header("ApiKey", api_key)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    # Lightweight probe (version or similar; many Stash installs expose this or stats)
+    try:
+        probe = _post_graphql("{ version { version } }")
+        if isinstance(probe, dict) and probe.get("data"):
+            result["meta"]["connected"] = True
+            ver = (probe.get("data") or {}).get("version") or {}
+            if ver.get("version"):
+                result["meta"]["version"] = ver["version"]
+    except Exception as e:
+        result["errors"].append(f"probe failed: {type(e).__name__}: {e}")
+
+    # Performers (artists)
+    try:
+        q = """
+        query {
+          performers {
+            performers {
+              name
+            }
+          }
+        }
+        """
+        data = _post_graphql(q)
+        perfs = []
+        if isinstance(data, dict) and data.get("data") and data["data"].get("performers"):
+            perfs = [
+                p.get("name")
+                for p in (data["data"]["performers"].get("performers") or [])
+                if isinstance(p, dict) and p.get("name")
+            ]
+        result["performers"] = sorted(set(n for n in perfs if n))
+        if result["performers"]:
+            result["meta"]["connected"] = True
+    except Exception as e:
+        result["errors"].append(f"performers query failed: {type(e).__name__}: {e}")
+
+    # Groups / franchise groups (try groups first, fallback to studios)
+    try:
+        q = """
+        query {
+          groups {
+            groups {
+              name
+            }
+          }
+        }
+        """
+        data = _post_graphql(q)
+        grps = []
+        if isinstance(data, dict) and data.get("data") and data["data"].get("groups"):
+            grps = [
+                g.get("name")
+                for g in (data["data"]["groups"].get("groups") or [])
+                if isinstance(g, dict) and g.get("name")
+            ]
+        if not grps:
+            q2 = """
+            query {
+              studios {
+                studios {
+                  name
+                }
+              }
+            }
+            """
+            data2 = _post_graphql(q2)
+            if isinstance(data2, dict) and data2.get("data") and data2["data"].get("studios"):
+                grps = [
+                    s.get("name")
+                    for s in (data2["data"]["studios"].get("studios") or [])
+                    if isinstance(s, dict) and s.get("name")
+                ]
+        result["groups"] = sorted(set(n for n in grps if n))
+    except Exception as e:
+        result["errors"].append(f"groups/studios query failed: {type(e).__name__}: {e}")
+
+    # Tags (character candidates)
+    try:
+        q = """
+        query {
+          tags {
+            tags {
+              name
+            }
+          }
+        }
+        """
+        data = _post_graphql(q)
+        tgs = []
+        if isinstance(data, dict) and data.get("data") and data["data"].get("tags"):
+            tgs = [
+                t.get("name")
+                for t in (data["data"]["tags"].get("tags") or [])
+                if isinstance(t, dict) and t.get("name")
+            ]
+        result["tags"] = sorted(set(n for n in tgs if n))
+    except Exception as e:
+        result["errors"].append(f"tags query failed: {type(e).__name__}: {e}")
+
+    if result["performers"] or result["groups"] or result["tags"]:
+        result["meta"]["connected"] = True
+
+    return result
+
+
+def get_sample_stash_data() -> dict:
+    """Return realistic sample Stash data for tests and manual verification when no live Stash is available.
+    Matches the spirit of the user's reported library sizes (small representative slice).
+    """
+    return {
+        "performers": [
+            "Pantsushi",
+            "New Performer One",
+            "New Performer Two",
+            "bulging senpai",
+            "Some Artist",
+        ],
+        "groups": [
+            "New Franchise Group",
+            "Baldur's Gate 3",
+            "Another Group",
+        ],
+        "tags": [
+            "2b",
+            "2B",
+            "New Character Tag",
+            "Eve",
+            "TestChar",
+        ],
+        "errors": [],
+        "meta": {
+            "endpoint": "sample://mock-data-for-phase-4b5",
+            "connected": True,
+            "note": "Sample data (no network). Use for verification without requiring Stash server.",
+        },
+    }
+
+
+def build_stash_import_preview(
+    stash_data: dict,
+    local_artist_aliases: dict,
+    local_folder_aliases: dict,
+    local_character_mappings: dict,
+    local_canonical_character_aliases: dict,
+    local_learned: Optional[dict] = None,
+) -> dict:
+    """Pure comparison: turn Stash lists + local dicts into preview items + summary counts.
+
+    - Stash performers -> artist_aliases candidates
+    - Stash groups -> folder_aliases / franchise candidates
+    - Stash tags -> canonical_character_aliases candidates ONLY (never auto character_mappings)
+      (note explains that franchise mapping is still required)
+    - Statuses: missing_local, already_exists_local, possible_duplicate (within this preview load)
+    - No writes, no mutations, fully testable.
+    """
+    if local_learned is None:
+        local_learned = {}
+
+    items = []
+
+    # Build normalized local sets (keys primarily; some values for artists)
+    laa_keys = {normalize_stash_name(k) for k in (local_artist_aliases or {}).keys()}
+    laa_vals = {normalize_stash_name(v) for v in (local_artist_aliases or {}).values()}
+    lfa_keys = {normalize_stash_name(k) for k in (local_folder_aliases or {}).keys()}
+    lcm_keys = {normalize_stash_name(k) for k in (local_character_mappings or {}).keys()}
+    lcca_keys = {normalize_stash_name(k) for k in (local_canonical_character_aliases or {}).keys()}
+
+    def _already_exists(norm_key: str, section: str) -> bool:
+        if section == "artist_aliases":
+            return norm_key in laa_keys or norm_key in laa_vals
+        if section == "folder_aliases":
+            return norm_key in lfa_keys
+        if section == "character_mappings":
+            return norm_key in lcm_keys
+        if section == "canonical_character_aliases":
+            return norm_key in lcca_keys
+        return False
+
+    # Track dups within this stash preview (per suggested section)
+    seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set()}
+
+    def _make_item(source: str, original: str, suggested: str, note: str = ""):
+        nk = normalize_stash_name(original)
+        if not nk:
+            return
+        status = "missing_local"
+        if _already_exists(nk, suggested):
+            status = "already_exists_local"
+        if nk in seen.get(suggested, set()):
+            status = "possible_duplicate"
+        seen.setdefault(suggested, set()).add(nk)
+
+        items.append({
+            "source": source,
+            "original": original,
+            "norm_key": nk,
+            "suggested_section": suggested,
+            "status": status,
+            "note": note,
+        })
+
+    # Map categories per spec
+    for name in (stash_data or {}).get("performers", []) or []:
+        _make_item("stash_performer", name, "artist_aliases", "")
+
+    for name in (stash_data or {}).get("groups", []) or []:
+        _make_item("stash_group", name, "folder_aliases", "")
+
+    tag_note = "canonical alias candidate only; franchise mapping still required"
+    for name in (stash_data or {}).get("tags", []) or []:
+        _make_item("stash_tag", name, "canonical_character_aliases", tag_note)
+
+    # Counts (as required)
+    counts = {
+        "stash_performers": len((stash_data or {}).get("performers", []) or []),
+        "stash_groups": len((stash_data or {}).get("groups", []) or []),
+        "stash_tags": len((stash_data or {}).get("tags", []) or []),
+        "local_artist_aliases": len(local_artist_aliases or {}),
+        "local_folder_aliases": len(local_folder_aliases or {}),
+        "local_canonical_character_aliases": len(local_canonical_character_aliases or {}),
+        "missing_artist_candidates": sum(
+            1 for i in items if i["suggested_section"] == "artist_aliases" and i["status"] == "missing_local"
+        ),
+        "missing_franchise_candidates": sum(
+            1 for i in items if i["suggested_section"] == "folder_aliases" and i["status"] == "missing_local"
+        ),
+        "missing_character_candidates": sum(
+            1 for i in items if i["suggested_section"] == "canonical_character_aliases" and i["status"] == "missing_local"
+        ),
+        "already_exists_local": sum(1 for i in items if i["status"] == "already_exists_local"),
+        "possible_duplicates": sum(1 for i in items if i["status"] == "possible_duplicate"),
+    }
+
+    return {
+        "items": items,
+        "counts": counts,
+        "errors": (stash_data or {}).get("errors", []),
+        "meta": (stash_data or {}).get("meta", {}),
+    }
+
+
+def export_stash_preview_report(
+    preview: dict,
+    stash_endpoint: str,
+    api_key_was_supplied: bool = False,
+    dest_dir: Optional[Path] = None,
+) -> str:
+    """Write a timestamped Markdown report for the preview.
+
+    The report explicitly states that this is read-only, no imports applied, no writes to config/learned,
+    no Stash mutations. Never modifies r34_config.json or learned_character_franchises.json.
+    Returns the full path written.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"stash_import_preview_{ts}.md"
+    base = Path(dest_dir) if dest_dir else Path.cwd()
+    path = base / fname
+
+    lines = []
+    lines.append(f"# Stash Import Preview Report {ts}")
+    lines.append("")
+    lines.append("**THIS IS A READ-ONLY PREVIEW (Phase 4b.5)**")
+    lines.append("No Stash values were written to r34_config.json or learned_character_franchises.json.")
+    lines.append("No GraphQL mutations were sent.")
+    lines.append("No import/apply occurred. Import behavior will be added in Phase 4c.")
+    lines.append("")
+    lines.append(f"Generated: {datetime.now().isoformat()}")
+    ep = stash_endpoint or "(no endpoint)"
+    lines.append(f"Stash GraphQL endpoint: {ep}")
+    if api_key_was_supplied:
+        lines.append("API key: (supplied for this preview; not persisted or logged)")
+    else:
+        lines.append("API key: (none / not supplied)")
+    lines.append("")
+
+    counts = (preview or {}).get("counts", {})
+    lines.append("## Summary Counts")
+    for k, v in sorted(counts.items()):
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+
+    items = (preview or {}).get("items", []) or []
+    missing_a = [i for i in items if i.get("suggested_section") == "artist_aliases" and i.get("status") == "missing_local"]
+    missing_f = [i for i in items if i.get("suggested_section") == "folder_aliases" and i.get("status") == "missing_local"]
+    missing_c = [i for i in items if i.get("suggested_section") == "canonical_character_aliases" and i.get("status") == "missing_local"]
+    dups = [i for i in items if i.get("status") in ("possible_duplicate", "ambiguous")]
+    exists = [i for i in items if i.get("status") == "already_exists_local"]
+
+    def fmt(it):
+        n = it.get("note", "")
+        return f"- {it.get('original','?')} (norm_key: {it.get('norm_key','?')}) [{it.get('source','?')}] {n}".strip()
+
+    if missing_a:
+        lines.append("## Missing artist/performer candidates (would target artist_aliases)")
+        for it in missing_a:
+            lines.append(fmt(it))
+        lines.append("")
+    if missing_f:
+        lines.append("## Missing franchise/group candidates (would target folder_aliases)")
+        for it in missing_f:
+            lines.append(fmt(it))
+        lines.append("")
+    if missing_c:
+        lines.append("## Missing character/tag candidates (would target canonical_character_aliases only)")
+        for it in missing_c:
+            lines.append(fmt(it))
+        lines.append("")
+
+    if dups:
+        lines.append("## Possible duplicates or ambiguous within this preview")
+        for it in dups:
+            lines.append(fmt(it))
+        lines.append("")
+    if exists:
+        lines.append("## Already present in local config (already_exists_local)")
+        for it in exists[:30]:
+            lines.append(fmt(it))
+        if len(exists) > 30:
+            lines.append(f"... ({len(exists)-30} more)")
+        lines.append("")
+
+    errs = (preview or {}).get("errors", [])
+    if errs:
+        lines.append("## Query / Partial Errors (some categories may be incomplete)")
+        for e in errs:
+            lines.append(f"- {e}")
+        lines.append("")
+
+    lines.append("## Important Notes")
+    lines.append("- Stash data was read-only.")
+    lines.append("- This preview did not modify any local files.")
+    lines.append("- Tags from Stash are treated as canonical_character_aliases candidates only.")
+    lines.append("  A separate franchise/folder mapping (via character_mappings) is still required for full use.")
+    lines.append("- Exporting this report does not perform any import.")
+    lines.append("- Phase 4c (when implemented) will provide controlled import/apply with previews and confirmations.")
+    lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
 
 
 # ------------------------------------------------------------------
@@ -1995,9 +2395,12 @@ class OrganizerGUI:
         # Selecting row populates fields. Live list + count refresh immediately after Add/Update/Remove/Clear (before Save).
         # Count labels + improved terminology + clarifying help text (exact for the two char sections).
         # dest_folders/resolutions remain view-only validation (3d/3e). Save/backup logic 100% unchanged.
-        # No Stash import, no new sections, no name-gen/preview/apply changes, no org.py edits.
+        # Phase 4b.5: added "Stash Import Preview" (read-only sidebar category). Connection + preview load + filters + export report.
+        # All Stash access is read-only queries (no mutations). No writes to config or learned. No import/apply (Phase 4c deferred).
+        # Prior 5 editables + dest/res/characters views 100% preserved.
+        # No Stash import (write), no new sections beyond preview, no name-gen/preview/apply changes, no org.py edits.
         # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
-        # Stop after 4a. Do not proceed to 4b.
+        # Stop after 4b.5. Do not proceed to 4c.
         win = tk.Toplevel(self.root)
         win.title("Known Values Manager")
         win.geometry("1100x700")  # larger for sidebar + content; Phase 4a.5 scalable layout
@@ -2061,6 +2464,7 @@ class OrganizerGUI:
             ("dest_folders", "Destination Folders"),
             ("characters", "Characters"),
             ("resolutions", "Resolutions"),
+            ("stash_preview", "Stash Import Preview"),
         ]
         self._cat_map = {disp: key for key, disp in cats}
         self._full_cat_displays = [disp for key, disp in cats]
@@ -2268,7 +2672,7 @@ class OrganizerGUI:
                 if help_text:
                     ttk.Label(parent, text=help_text, wraplength=600, justify="left").pack(anchor="w", pady=2)
 
-                note = "Phase 4a/4a.5: in-memory until Save. Lists + counts refresh live after Add/Update/Remove/Clear. Search above filters this list only."
+                note = "Phase 4a/4a.5/4b.5: in-memory until Save. Lists + counts refresh live after Add/Update/Remove/Clear. Search above filters this list only. Stash preview is separate read-only category."
                 ttk.Label(parent, text=note, wraplength=600).pack(anchor="w", pady=2)
 
             elif cat == "dest_folders":
@@ -2436,6 +2840,216 @@ class OrganizerGUI:
                 ttk.Button(parent, text="Refresh Resolution Validation", command=_refresh_res).pack(pady=2)
                 ttk.Label(parent, text="View-only. Shows resolution labels from library scan + naming style. No editing, no config/media writes. Resolution editing is deferred.").pack(pady=2)
 
+            elif cat == "stash_preview":
+                # Phase 4b.5: read-only Stash import preview. Reachable from sidebar.
+                # Connection fields + Test/Load (sample supported) + filters + counts + list + Export report.
+                # NO import/apply (button disabled + label says Phase 4c). No writes to any json.
+                # Uses the pure query_ / build_ / export_ helpers (network isolated for mocking).
+                parent_frame = parent  # for clarity
+
+                # Connection controls
+                conn_frm = ttk.Frame(parent_frame)
+                conn_frm.pack(fill="x", pady=2)
+
+                ttk.Label(conn_frm, text="Stash GraphQL URL:").pack(side="left")
+                url_var = tk.StringVar(value="http://localhost:9999/graphql")
+                url_ent = ttk.Entry(conn_frm, textvariable=url_var, width=40)
+                url_ent.pack(side="left", padx=4)
+
+                ttk.Label(conn_frm, text="API Key (optional, session only; never saved to git-tracked files):").pack(side="left", padx=(8,0))
+                key_var = tk.StringVar(value="")
+                key_ent = ttk.Entry(conn_frm, textvariable=key_var, width=20, show="*")
+                key_ent.pack(side="left", padx=4)
+
+                status_lbl = ttk.Label(parent_frame, text="Not connected. Enter URL and click Test Connection or Load Sample (no Stash required).", foreground="gray")
+                status_lbl.pack(anchor="w", pady=2)
+
+                # Counts display (updated on load)
+                counts_frm = ttk.Frame(parent_frame)
+                counts_frm.pack(fill="x", pady=4)
+                counts_vars = {}  # name -> StringVar
+                count_labels = [
+                    ("stash_performers", "Stash performers:"),
+                    ("stash_groups", "Stash groups:"),
+                    ("stash_tags", "Stash tags:"),
+                    ("local_artist_aliases", "Local artist aliases:"),
+                    ("local_folder_aliases", "Local folder aliases:"),
+                    ("local_canonical_character_aliases", "Local canonical char aliases:"),
+                    ("missing_artist_candidates", "Missing artist candidates:"),
+                    ("missing_franchise_candidates", "Missing franchise candidates:"),
+                    ("missing_character_candidates", "Missing char/tag candidates:"),
+                ]
+                for i, (ckey, clabel) in enumerate(count_labels):
+                    if i % 3 == 0:
+                        row = ttk.Frame(counts_frm)
+                        row.pack(fill="x")
+                    var = tk.StringVar(value=f"{clabel} ?")
+                    counts_vars[ckey] = var
+                    ttk.Label(row, textvariable=var).pack(side="left", padx=6)
+
+                # Filters
+                filter_frm = ttk.Frame(parent_frame)
+                filter_frm.pack(fill="x", pady=2)
+                ttk.Label(filter_frm, text="Filter text:").pack(side="left")
+                filter_var = tk.StringVar()
+                filter_ent = ttk.Entry(filter_frm, textvariable=filter_var, width=25)
+                filter_ent.pack(side="left", padx=2)
+
+                ttk.Label(filter_frm, text="Status:").pack(side="left", padx=(8,0))
+                status_filter_var = tk.StringVar(value="all")
+                status_cb = ttk.Combobox(filter_frm, textvariable=status_filter_var, width=18, state="readonly",
+                                         values=["all", "missing_local", "already_exists_local", "possible_duplicate", "ambiguous"])
+                status_cb.pack(side="left", padx=2)
+
+                ttk.Label(filter_frm, text="Section:").pack(side="left", padx=(8,0))
+                section_filter_var = tk.StringVar(value="all")
+                section_cb = ttk.Combobox(filter_frm, textvariable=section_filter_var, width=18, state="readonly",
+                                          values=["all", "artist_aliases", "folder_aliases", "canonical_character_aliases"])
+                section_cb.pack(side="left", padx=2)
+
+                # Preview list (filterable)
+                preview_lst = tk.Listbox(parent_frame, height=14)
+                preview_lst.pack(fill="both", expand=True, padx=4, pady=4)
+                self._stash_preview_lst = preview_lst
+                self._stash_preview_items = []  # populated by load
+
+                def _repop_stash_preview():
+                    preview_lst.delete(0, "end")
+                    term = filter_var.get().lower().strip()
+                    sf = status_filter_var.get()
+                    secf = section_filter_var.get()
+                    for it in getattr(self, "_stash_preview_items", []):
+                        if sf != "all" and it.get("status") != sf:
+                            continue
+                        if secf != "all" and it.get("suggested_section") != secf:
+                            continue
+                        if term and term not in it.get("original", "").lower() and term not in it.get("norm_key", ""):
+                            continue
+                        line = f"[{it.get('source')}] {it.get('original')} (norm:{it.get('norm_key')}) -> {it.get('suggested_section')} | {it.get('status')} | {it.get('note','')}"[:180]
+                        preview_lst.insert("end", line)
+
+                filter_var.trace_add("write", lambda *a: _repop_stash_preview())
+                status_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
+                section_filter_var.trace_add("write", lambda *a: _repop_stash_preview())
+
+                def _update_counts_from_preview(preview_dict):
+                    c = (preview_dict or {}).get("counts", {})
+                    mapping = {
+                        "stash_performers": "Stash performers:",
+                        "stash_groups": "Stash groups:",
+                        "stash_tags": "Stash tags:",
+                        "local_artist_aliases": "Local artist aliases:",
+                        "local_folder_aliases": "Local folder aliases:",
+                        "local_canonical_character_aliases": "Local canonical char aliases:",
+                        "missing_artist_candidates": "Missing artist candidates:",
+                        "missing_franchise_candidates": "Missing franchise candidates:",
+                        "missing_character_candidates": "Missing char/tag candidates:",
+                    }
+                    for ckey, var in counts_vars.items():
+                        val = c.get(ckey, 0)
+                        var.set(f"{mapping.get(ckey, ckey)} {val}")
+
+                def _load_stash_preview(use_sample: bool = False):
+                    self._stash_preview_items = []
+                    preview_lst.delete(0, "end")
+                    ep = url_var.get().strip()
+                    key = key_var.get().strip() or None
+                    try:
+                        if use_sample:
+                            raw = get_sample_stash_data()
+                            status_lbl.config(text="Loaded SAMPLE data (no network call).", foreground="blue")
+                        else:
+                            status_lbl.config(text="Querying Stash (read-only)...", foreground="black")
+                            raw = query_stash_readonly(ep, key)
+                            if raw.get("meta", {}).get("connected"):
+                                status_lbl.config(text=f"Connected. Found performers:{len(raw.get('performers',[]))} groups:{len(raw.get('groups',[]))} tags:{len(raw.get('tags',[]))}", foreground="green")
+                            else:
+                                status_lbl.config(text=f"Partial/failed. Errors: {'; '.join(raw.get('errors',[])[:2])}", foreground="orange")
+                        # Build using CURRENT in-memory local edit dicts (so pending local edits in manager are reflected if user added before opening preview)
+                        preview = build_stash_import_preview(
+                            raw,
+                            getattr(self, "_edit_artist_aliases", {}),
+                            getattr(self, "_edit_folder_aliases", {}),
+                            getattr(self, "_edit_character_mappings", {}),
+                            getattr(self, "_edit_canonical_character_aliases", {}),
+                            getattr(self, "_edit_learned_mappings", {}),
+                        )
+                        self._stash_preview_items = preview.get("items", [])
+                        self._last_stash_preview = preview
+                        self._last_stash_endpoint = ep
+                        self._last_stash_key_supplied = bool(key)
+                        _update_counts_from_preview(preview)
+                        _repop_stash_preview()
+                        errs = preview.get("errors") or raw.get("errors", [])
+                        if errs:
+                            status_lbl.config(text=status_lbl.cget("text") + " | Some queries had errors (see list or export).")
+                    except Exception as ex:
+                        status_lbl.config(text=f"Error during load: {ex}", foreground="red")
+                        self._stash_preview_items = []
+                        _repop_stash_preview()
+
+                def _test_connection():
+                    ep = url_var.get().strip()
+                    key = key_var.get().strip() or None
+                    try:
+                        status_lbl.config(text="Testing connection (read-only probe)...", foreground="black")
+                        # Use the query func with a probe; it populates meta
+                        res = query_stash_readonly(ep, key)
+                        if res.get("meta", {}).get("connected"):
+                            ver = res.get("meta", {}).get("version") or "?"
+                            status_lbl.config(text=f"OK: connected to Stash (version {ver}). performers:{len(res.get('performers',[]))}", foreground="green")
+                        else:
+                            status_lbl.config(text=f"Could not confirm connection. Errors: {'; '.join(res.get('errors',[])[:1])} (check URL, Stash running?, key if required)", foreground="orange")
+                    except Exception as ex:
+                        status_lbl.config(text=f"Test failed: {ex} (Stash may not be running; use Load Sample for offline verification)", foreground="red")
+
+                def _export_preview_report():
+                    preview = getattr(self, "_last_stash_preview", None)
+                    if not preview:
+                        # allow export of current (empty or last)
+                        preview = {"items": getattr(self, "_stash_preview_items", []), "counts": {}, "errors": []}
+                    ep = getattr(self, "_last_stash_endpoint", url_var.get().strip())
+                    key_sup = getattr(self, "_last_stash_key_supplied", False)
+                    try:
+                        # Write to a non-committed location if possible (validation style), else cwd (user can ignore)
+                        out_dir = None
+                        try:
+                            vtmp = Path("validation_tmp") / "phase4b5_manual_tmp"
+                            vtmp.mkdir(parents=True, exist_ok=True)
+                            out_dir = vtmp
+                        except Exception:
+                            out_dir = None
+                        rp = export_stash_preview_report(preview, ep, key_sup, dest_dir=out_dir)
+                        status_lbl.config(text=f"Report exported: {rp} (read-only; no imports applied)", foreground="green")
+                        # also show in list for visibility
+                        preview_lst.insert("end", f"REPORT WRITTEN: {rp} (open the .md to review; contains 'NO IMPORT' note)")
+                    except Exception as ex:
+                        status_lbl.config(text=f"Export failed: {ex}", foreground="red")
+
+                # Buttons row
+                btn_frm = ttk.Frame(parent_frame)
+                btn_frm.pack(fill="x", pady=4)
+                ttk.Button(btn_frm, text="Test Connection (read-only)", command=_test_connection).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Load Preview (live Stash)", command=lambda: _load_stash_preview(use_sample=False)).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Load Sample Data (no Stash needed)", command=lambda: _load_stash_preview(use_sample=True)).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Export Preview Report", command=_export_preview_report).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Clear Preview", command=lambda: (setattr(self, "_stash_preview_items", []), preview_lst.delete(0, "end"), status_lbl.config(text="Cleared."))).pack(side="left", padx=2)
+
+                # Disabled placeholder for future import (per spec: must be disabled + label Phase 4c)
+                import_btn = ttk.Button(btn_frm, text="Import Selected (Phase 4c - not implemented)", state="disabled")
+                import_btn.pack(side="left", padx=2)
+                ttk.Label(parent_frame, text="Import/apply will be implemented in Phase 4c. This phase is read-only preview + export only.", foreground="gray").pack(anchor="w")
+
+                note = "Phase 4b.5 read-only: queries only. Data shown is preview/comparison. Export writes a report (no config changes). All prior editable categories and view-only tabs remain fully functional."
+                ttk.Label(parent_frame, text=note, wraplength=700).pack(anchor="w", pady=4)
+
+                # Auto-offer sample on first open of this cat (helpful for manual)
+                # (do not auto-query network)
+                if not getattr(self, "_stash_preview_items", None):
+                    # populate a hint
+                    preview_lst.insert("end", "(Click 'Load Sample Data (no Stash needed)' to populate preview lists using built-in sample data for verification.)")
+                    preview_lst.insert("end", "(Or enter your Stash URL + optional key and use Load Preview / Test Connection.)")
+
             else:
                 # characters or other simple view-only
                 lst = tk.Listbox(parent, height=12)
@@ -2521,7 +3135,7 @@ class OrganizerGUI:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; Phase 4a UI polish only - live edits before Save; dest/res views untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; Phase 4a/4b.5 UI only - live edits before Save; Stash preview read-only + export; dest/res untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
     def _sort_tree(self, col):
