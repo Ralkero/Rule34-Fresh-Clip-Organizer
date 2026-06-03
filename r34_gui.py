@@ -986,6 +986,7 @@ def get_sample_stash_data() -> dict:
             "New Performer Two",
             "bulging senpai",
             "Some Artist",
+            "Hentai",  # preflight: generic performer name should be review-only, not artist
         ],
         "groups": [
             "New Franchise Group",
@@ -1021,7 +1022,7 @@ def get_sample_stash_data() -> dict:
             "tags": "success (sample)",
         },
         "response_counts": {
-            "performers": 5,
+            "performers": 6,
             "groups": 9,
             "tags": 9,
         },
@@ -1032,6 +1033,7 @@ def get_sample_stash_data() -> dict:
             {"id": "p3", "name": "New Performer Two", "alias_list": []},
             {"id": "p4", "name": "bulging senpai", "alias_list": []},
             {"id": "p5", "name": "Some Artist", "alias_list": []},
+            {"id": "p6", "name": "Hentai", "alias_list": []},  # preflight: generic performer name -> review-only
         ],
         "group_data": [
             {"id": "g1", "name": "New Franchise Group", "aliases": []},
@@ -1293,6 +1295,11 @@ def build_stash_import_preview(
     for p in performer_infos:
         orig = p.get("name") or ""
         if not orig: continue
+        # Small 4c classification fix: apply review-only check to performers too (Hentai etc. as generic performer names should not become artist_aliases)
+        rev = _get_review_only_reason(orig, p.get("aliases") or p.get("alias_list"))
+        if rev:
+            _make_item("stash_performer", orig, "ignored_or_review", "", "ignored_or_review", rev, forced_status="ignored_or_review")
+            continue
         _make_item("stash_performer", orig, "artist_aliases", "", "artist_candidate", "Stash performer")
 
     # Groups: respect group_role_override (Phase 4b.6 source vs role separation)

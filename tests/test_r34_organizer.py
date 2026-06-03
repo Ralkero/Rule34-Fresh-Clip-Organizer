@@ -2496,6 +2496,29 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
             self.assertIn("status:missing_local", content)
             self.assertIn("source:stash_performer", content)
 
+    def test_preflight_hentai_performer_is_review_only_not_artist(self):
+        # Small 4c fix: Hentai (and other denylist) as stash_performer must become ignored_or_review
+        # (not artist_aliases), even though previous logic always forced performers to artist.
+        stash = {"performer_data": [{"name": "Hentai", "alias_list": []}], "groups": [], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        h = [i for i in preview["items"] if i.get("original", "").lower() == "hentai"]
+        self.assertTrue(h)
+        self.assertEqual(h[0]["source"], "stash_performer")
+        self.assertEqual(h[0]["detected_tag_role"], "ignored_or_review")
+        self.assertEqual(h[0]["suggested_section"], "ignored_or_review")
+        self.assertEqual(h[0]["status"], "ignored_or_review")
+        self.assertIn("review-only denylist match", h[0].get("classification_reason", "").lower())
+
+    def test_preflight_normal_performer_still_artist_alias(self):
+        # Normal names (e.g. Pantsushi) must still become artist_aliases candidates.
+        stash = {"performer_data": [{"name": "Pantsushi", "alias_list": []}], "groups": [], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        p = [i for i in preview["items"] if i.get("original", "").lower() == "pantsushi"]
+        self.assertTrue(p)
+        self.assertEqual(p[0]["source"], "stash_performer")
+        self.assertEqual(p[0]["suggested_section"], "artist_aliases")
+        self.assertEqual(p[0]["status"], "missing_local")
+
 
 if __name__ == "__main__":
     unittest.main()
