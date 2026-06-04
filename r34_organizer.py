@@ -27,10 +27,10 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 CSV_COLUMNS = [
     "approved",
@@ -94,6 +94,29 @@ PRECEDENT_STOP_TOKENS = {
     "the",
     "valentine",
     "wife",
+}
+
+CHARACTER_DESCRIPTOR_STOP_TOKENS = {
+    "all",
+    "angle",
+    "angles",
+    "beach",
+    "bj",
+    "cam",
+    "camera",
+    "compilation",
+    "cowgirl",
+    "doggy",
+    "doggystyle",
+    "missionary",
+    "multiaudio",
+    "nude",
+    "prone",
+    "reverse",
+    "ride",
+    "riding",
+    "solo",
+    "standing",
 }
 
 GENERIC_SOURCE_FOLDER_NAMES = {
@@ -567,10 +590,46 @@ def build_reference_data(destination_root: Path, config: Optional[Config] = None
     return ReferenceData(folders, artist_precedent, token_precedent, canonical_character_aliases, naming_style, learned_franchises=ref_learned)
 
 
+def sanitize_character_candidate(candidate: str) -> str:
+    """Remove title/camera descriptors from a candidate character segment.
+
+    This prevents already-bad filenames in the destination library from teaching
+    polluted aliases such as "Kaisa Beach Nude All Angles" or
+    "Power Cowgirl, Power" to future preview runs.
+    """
+    if not candidate:
+        return ""
+    cleaned_parts: List[str] = []
+    seen_norms: Set[str] = set()
+    for raw_part in re.split(r"\s*,\s*|\s+&\s+", candidate):
+        part = raw_part.strip(" -_.,;")
+        if not part:
+            continue
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9']*", part)
+        if not tokens:
+            continue
+        keep_tokens: List[str] = []
+        for token in tokens:
+            token_norm = normalize(token)
+            if token_norm in CHARACTER_DESCRIPTOR_STOP_TOKENS:
+                break
+            if token_norm.isdigit():
+                break
+            keep_tokens.append(token)
+        if not keep_tokens:
+            continue
+        cleaned = " ".join(keep_tokens).strip(" -_.,;")
+        cleaned_norm = normalize(cleaned)
+        if cleaned_norm and cleaned_norm not in seen_norms:
+            cleaned_parts.append(cleaned)
+            seen_norms.add(cleaned_norm)
+    return ", ".join(cleaned_parts)
+
+
 def likely_canonical_character_from_title(title: str) -> str:
     if " - " not in title:
         return ""
-    candidate = title.split(" - ", 1)[0].strip()
+    candidate = sanitize_character_candidate(title.split(" - ", 1)[0].strip())
     normalized = normalize(candidate)
     if not normalized:
         return ""
@@ -643,10 +702,10 @@ def infer_unmatched_character(text: str, reference: ReferenceData, config: Confi
         return ""
 
     # Collect leading name-like tokens. Stop at clear action/stop words.
-    stop_words = set(PRECEDENT_STOP_TOKENS) | {
+    stop_words = set(PRECEDENT_STOP_TOKENS) | set(CHARACTER_DESCRIPTOR_STOP_TOKENS) | {
         "with", "and", "getting", "fucked", "pounded", "riding", "sucking",
         "fucking", "creampie", "anal", "pov", "bj", "from", "by", "in", "on",
-        "hard", "deep", "fast", "slow"
+        "hard", "deep", "fast", "slow", "audiodude", "blowjob"
     }
     name_tokens: List[str] = []
     for t in tokens:
@@ -997,7 +1056,12 @@ def clean_position_descriptors(title: str) -> str:
         # Remove Cam tags, extra numbers, etc.
         cleaned_rest = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d*|\d+)\b.*$", "", rest, count=1)
 
-        return pos + variant + cleaned_rest
+        pieces = [] if normalize(pos) == "blowjob" else [pos]
+        if variant.strip():
+            pieces.append(variant.strip())
+        if cleaned_rest.strip():
+            pieces.append(cleaned_rest.strip(" -_.,;"))
+        return " ".join(pieces)
 
     value = re.sub(position_words, _clean_after_position, value)
 
@@ -1040,6 +1104,35 @@ def strip_known_franchises_from_title(title: str, reference: ReferenceData, targ
     return value
 
 
+def normalize_repeated_title_descriptors(title: str) -> str:
+    """Compress repeated descriptor fragments left after character stripping."""
+    if not title:
+        return title
+    value = re.sub(r"\s+", " ", title).strip(" -_.,;")
+    for _ in range(3):
+        previous = value
+        value = re.sub(r"(?i)\b(nude|bj|cam|beach|missionary|doggy|cowgirl|all angles)\s+\1\b", r"\1", value)
+        value = re.sub(
+            r"(?i)\b(?P<phrase>(?:beach|missionary|doggy|cowgirl|cam)?\s*nude)\s+all angles\s+(?P=phrase)\b",
+            r"\g<phrase> All Angles",
+            value,
+        )
+        value = re.sub(
+            r"(?i)\ball angles\s+(?P<phrase>(?:beach|missionary|doggy|cowgirl|cam)?\s*nude)\s+all angles\b",
+            r"\g<phrase> All Angles",
+            value,
+        )
+        value = re.sub(
+            r"(?i)\b(?P<phrase>(?:doggy|missionary|cowgirl)?\s*nude\s+cam)\s+nude\s+cam\s+nude(?P<num>\s+\d+)?\b",
+            lambda m: (m.group("phrase") + (m.group("num") or "")).strip(),
+            value,
+        )
+        value = re.sub(r"\s+", " ", value).strip(" -_.,;")
+        if value == previous:
+            break
+    return value
+
+
 def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: int = 3) -> Tuple[str, List[str], float]:
     """
     Remove tokens from the title that appear very rarely (or never) in the existing library.
@@ -1062,6 +1155,9 @@ def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: i
     for token in tokens:
         token_norm = normalize(token)
         if len(token_norm) < 2:
+            kept.append(token)
+            continue
+        if token_norm in CHARACTER_DESCRIPTOR_STOP_TOKENS and token_norm != "blowjob":
             kept.append(token)
             continue
 
@@ -2079,6 +2175,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
 
     # Clean sex position descriptors + trailing artifacts (e.g. "Doggy 2 1 Cam 3")
     title = clean_position_descriptors(title)
+    title = normalize_repeated_title_descriptors(title)
 
     # Detect outlier / extra parameters using the existing library as reference
     # (must happen after all title cleaning so we evaluate the final proposed title)
@@ -2086,6 +2183,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     outlier_conf = 1.0
     if reference and title:
         title, outlier_removed, outlier_conf = strip_outlier_tokens(title, reference)
+        title = normalize_repeated_title_descriptors(title)
 
     extract_title = getattr(config, "extract_embedded_titles", False)
     resolution, probe_reason, embedded_title = probe_resolution(path, config.ffprobe_path, extract_title=extract_title)
@@ -2321,6 +2419,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     # Strip known franchise/folder names from the title (they belong in the folder, not the filename)
     if target_folder or reference:
         title = strip_known_franchises_from_title(title, reference, target_folder, config)
+        title = normalize_repeated_title_descriptors(title)
 
     target_filename = ""
     target_path = ""
@@ -2828,6 +2927,15 @@ def content_review_path(source: Path, source_root: Path, content_review_folder_n
         idx += 1
 
 
+def path_is_inside(path: Path, root: Path) -> bool:
+    """Return True when path resolves inside root, without requiring the file to exist."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def apply_row(
     row: Dict[str, str],
     source_root: Path,
@@ -2838,6 +2946,7 @@ def apply_row(
     silent_animations_folder_name: str = "_r34_silent",
     angle_variants_folder_name: str = "_r34_angle_variants",
     review_items_folder_name: str = None,  # for "review" status outliers
+    destination_root: Path | None = None,
 ) -> Dict[str, str]:
     result = dict(row)
     source = Path(row.get("source_path", ""))
@@ -2858,6 +2967,17 @@ def apply_row(
         _safe_shutil_move(source, dest)
         result["apply_result"] = "held_content_review"
         result["apply_message"] = str(dest)
+        return result
+
+    if not approved:
+        if quarantine_unapproved and source.exists():
+            dest = quarantine_path(source, source_root, review_folder_name, run)
+            _safe_shutil_move(source, dest)
+            result["apply_result"] = "quarantined_unapproved"
+            result["apply_message"] = str(dest)
+        else:
+            result["apply_result"] = "skipped_unapproved"
+            result["apply_message"] = "approved is not true/yes"
         return result
 
     if status_raw == "silent" or status == "silent":
@@ -2883,17 +3003,6 @@ def apply_row(
         result["apply_message"] = str(dest)
         return result
 
-    if not approved:
-        if quarantine_unapproved and source.exists():
-            dest = quarantine_path(source, source_root, review_folder_name, run)
-            _safe_shutil_move(source, dest)
-            result["apply_result"] = "quarantined_unapproved"
-            result["apply_message"] = str(dest)
-        else:
-            result["apply_result"] = "skipped_unapproved"
-            result["apply_message"] = "approved is not true/yes"
-        return result
-
     if status_raw in BLOCKED_STATUSES or status in BLOCKED_STATUSES or status.startswith("blocked"):
         result["apply_result"] = "skipped_blocked"
         result["apply_message"] = f"status={row.get('status', '')}"
@@ -2910,6 +3019,11 @@ def apply_row(
         return result
 
     target = Path(target_text)
+    if destination_root is not None and not path_is_inside(target, Path(destination_root)):
+        result["apply_result"] = "invalid_target"
+        result["apply_message"] = f"target_path is outside destination_root: {target}"
+        return result
+
     if target.exists():
         dest = quarantine_path(source, source_root, review_folder_name, run)
         _safe_shutil_move(source, dest)
@@ -3023,7 +3137,8 @@ def command_apply(args: argparse.Namespace) -> int:
                 args.quarantine_unapproved,
                 config.content_review_folder_name,
                 getattr(config, "silent_animations_folder_name", "_r34_silent"),
-                config.review_folder_name,  # folder for "review" status outlier items
+                review_items_folder_name=config.review_folder_name,
+                destination_root=config.destination_root,
             )
         except Exception as ex:
             # Never let one locked/missing file kill the entire apply batch.

@@ -9,7 +9,7 @@ The tool is intentionally two-step:
 
 1. `preview` recursively scans one source folder and writes an editable CSV plan plus a Markdown summary.
 
-2. `apply` reads the reviewed CSV and moves only approved rows.
+2. `apply` reads the reviewed CSV and moves only approved rows, except `content_review` safety holds.
 
 It does not talk to Stash. After files are moved, rescan/import in Stash separately.
 
@@ -92,9 +92,9 @@ Date-prefixed artist batches such as `Nodu 2023` are handled as source-artist fo
 
 Collection source folders are also handled as artist context. For example, `Lazy Procrastinator Collection\2B - Cowgirl.mp4` previews as `Lazy Procrastinator - 2B - Cowgirl [1080P].mp4`, and nested generic folders such as `SageOfOsiris collection\Animations\...` use the parent collection name as the artist. Known artist prefixes still win, so `Pantsushi - ...` remains `Pantsushi`.
 
-Content-review terms in `r34_config.json` hold configured non-vanilla/fetish keywords out of the main library. Preview marks matching rows as `content_review`, and apply moves them to `_r34_content_review\<run-id>` under the source root for manual review.
+Content-review terms in `r34_config.json` hold configured non-vanilla/fetish keywords out of the main library. Preview marks matching rows as `content_review`, and apply moves them to `_r34_content_review\<run-id>` under the source root for manual review even when `approved=no`.
 
-Silent animations (files with no audio stream) are automatically detected via ffprobe during preview and can be routed to a separate folder (configurable via `silent_animations_folder_name`, default `_r34_silent`) on apply. This is useful for separating silent loops from voiced content in large collections.
+Silent animations (files with no audio stream) are automatically detected via ffprobe during preview and can be routed to a separate folder (configurable via `silent_animations_folder_name`, default `_r34_silent`) on apply after you approve the row. This is useful for separating silent loops from voiced content in large collections.
 
 Known compact title tokens can be expanded through `title_token_replacements` in `r34_config.json`, such as `bonusmotion` -> `Bonus Motion` and `kitchenmissionary` -> `Kitchen Missionary`.
 
@@ -105,7 +105,7 @@ r34_preview_YYYYMMDD-HHMMSS.csv
 r34_preview_YYYYMMDD-HHMMSS.md
 ```
 
-Review/edit the CSV. Rows with `approved` set to `yes`/`true`/`1` and a non-blocked `status` move to the library. Rows with `status=content_review` move to the source-root content review folder.
+Review/edit the CSV. Rows with `approved` set to `yes`/`true`/`1` and a non-blocked `status` move to the library. Approved rows with `status=silent` or `status=review` move to their source-root holding folders instead. Rows with `status=content_review` move to the source-root content review folder as an automatic safety hold.
 
 Apply the reviewed CSV:
 
@@ -141,7 +141,10 @@ python r34_organizer.py apply --plan "C:\path\to\r34_preview_YYYYMMDD-HHMMSS.csv
 - Normalizes all generated bracketed resolution tags to uppercase house style; 1440-tier files are labeled `[4K]`.
 - Can create missing destination folders when `allow_create_destination_folders` is `true`; only folders named by explicit config mappings are eligible.
 - Unapproved rows stay in place by default.
+- `content_review` rows are the exception: they are always moved to the source-root content review hold folder so flagged content does not enter the library by accident.
+- `silent` and `review` rows require approval before they are moved to their source-root hold folders.
 - Approved rows with destination conflicts are moved to `_r34_review/<run-id>` inside the source folder.
+- Apply rejects any approved `target_path` that resolves outside the configured destination root.
 - Apply writes `r34_apply_<run-id>.csv` with one result per row.
 
 ## Apply-Driven Learning (Reversible)
@@ -214,4 +217,10 @@ Every button has a detailed hover tooltip (pause the mouse cursor over any butto
 ### Requirements for the GUI
 
 - Same as the CLI (Python 3.10+, ffprobe on PATH)
-- The GUI itself has no extra runtime dependencies beyond the standard library (Tkinter is included with Python on Windows).
+- Core CLI/GUI (without AI features): no extra Python runtime packages (stdlib + ffprobe).
+- Grok/xAI assistance (`use_ai_for_unknown_characters` or during inference fallbacks): requires the `requests` package.
+- Building the portable GUI (optional): `pyinstaller`.
+
+Install with `pip install -r requirements.txt` (or just `pip install requests` if you only need AI assistance and are not rebuilding the exe).
+
+**Note:** The previous statement "GUI has no extra runtime dependencies" applies only to core operation without Grok. When AI assistance is enabled, `requests` is required.

@@ -1,6 +1,8 @@
 {
   "destination_root": "E:\\James' Stuff\\Rule34",
-  "video_extensions": [".mp4"],
+  "video_extensions": [
+    ".mp4"
+  ],
   "ffprobe_path": "ffprobe",
   "review_folder_name": "_r34_review",
   "content_review_folder_name": "_r34_content_review",
@@ -22,8 +24,8 @@
     "bg3": "Baldur's Gate 3",
     "cyberpunk 2077": "Cyberpunk",
     "dc": "DC Comics",
-    "dbh": "Detroit  Become Human",
-    "detroit become human": "Detroit  Become Human",
+    "dbh": "Detroit Become Human",
+    "detroit become human": "Detroit Become Human",
     "ff": "Final Fantasy",
     "genshin": "Genshin Impact",
     "kof": "King of Fighters",
@@ -52,7 +54,8 @@
     "aerith gainsborough": "Final Fantasy",
     "ahri": "League of Legends",
     "akali": "League of Legends",
-    "alice": "Detroit  Become Human",
+    "alice": "Detroit Become Human",
+    "anran": "Final Fantasy",
     "asuka": "Tekken",
     "asuka kazama": "Tekken",
     "aunt cass": "Pixar",
@@ -93,8 +96,13 @@
     "jessie's mom": "Final Fantasy",
     "jessie rasberry": "Final Fantasy",
     "juri": "Street Fighter",
+    "juri han": "Street Fighter",
+    "juliet": "Lollipop Chainsaw",
+    "juliet starling": "Lollipop Chainsaw",
+    "kaisa": "League of Legends",
+    "kai sa": "League of Legends",
     "kasumi": "Dead or Alive",
-    "kara": "Detroit  Become Human",
+    "kara": "Detroit Become Human",
     "kyrie": "Final Fantasy",
     "kyrie canaan": "Final Fantasy",
     "lili": "Tekken",
@@ -112,6 +120,7 @@
     "madam m": "Final Fantasy",
     "mai": "King of Fighters",
     "mai shiranui": "King of Fighters",
+    "makima": "Chainsaw Man",
     "marie": "Dead or Alive",
     "marie rose": "Dead or Alive",
     "marika": "Elden Ring",
@@ -125,6 +134,7 @@
     "morrigan": "Darkstalkers",
     "morrigan aensland": "Darkstalkers",
     "mythra": "Xenoblade Chronicles",
+    "nami": "One Piece",
     "nessa": "Pokemon",
     "nia": "Xenoblade Chronicles",
     "nyotengu": "Dead or Alive",
@@ -157,14 +167,13 @@
     "yoruichi": "Bleach",
     "yoruichi shihoin": "Bleach",
     "yorha": "Nier Automata",
-    "power": "Final Fantasy",
-    "power cowgirl": "Final Fantasy",
+    "power": "Chainsaw Man",
     "marin": "Final Fantasy",
-    "marin cowgirl": "Final Fantasy",
     "juno": "Overwatch",
     "juno teo minh": "Overwatch",
-    "honoka": "Dead or Alive",
-    "commander white": "Nier Automata"
+    "commander white": "Nier Automata",
+    "sue": "Marvel",
+    "sue storm": "Marvel"
   },
   "canonical_character_aliases": {
     "2b": "2B",
@@ -178,6 +187,7 @@
     "aunt cass": "Cass Hamada",
     "ashley": "Ashley Graham",
     "ashley graham": "Ashley Graham",
+    "anran": "Anran",
     "asuka": "Asuka Kazama",
     "asuka kazama": "Asuka Kazama",
     "ballerina": "Ballerina (Atomic Heart Android)",
@@ -223,6 +233,10 @@
     "juri": "Juri Han",
     "juri han": "Juri Han",
     "juno": "Juno Teo Minh",
+    "juliet": "Juliet Starling",
+    "juliet starling": "Juliet Starling",
+    "kaisa": "Kai'Sa",
+    "kai sa": "Kai'Sa",
     "kiriko": "Kiriko Kamori",
     "kyrie": "Kyrie Canaan",
     "kyrie canaan": "Kyrie Canaan",
@@ -241,6 +255,7 @@
     "madam m": "Madam M",
     "mai": "Mai Shiranui",
     "mai shiranui": "Mai Shiranui",
+    "makima": "Makima",
     "marika": "Marika the Eternal",
     "marika the eternal": "Marika the Eternal",
     "marie": "Marie Rose",
@@ -252,6 +267,7 @@
     "morrigan": "Morrigan Aensland",
     "morrigan aensland": "Morrigan Aensland",
     "mythra": "Mythra",
+    "nami": "Nami",
     "nessa": "Nessa",
     "nia": "Nia",
     "nyo": "Nyotengu",
@@ -260,6 +276,7 @@
     "peach": "Princess Peach",
     "princess peach": "Princess Peach",
     "pharah": "Pharah",
+    "power": "Power",
     "pyra": "Pyra",
     "pythra": "Pyra, Mythra",
     "ranni": "Ranni the Witch",
@@ -274,6 +291,8 @@
     "shadowheart": "Shadowheart",
     "sophitia": "Sophitia",
     "starfire": "Starfire",
+    "sue": "Sue Storm",
+    "sue storm": "Sue Storm",
     "symmetra": "Symmetra (Satya Vaswani)",
     "tatsumaki": "Tatsumaki",
     "tifa": "Tifa Lockhart",
@@ -300,13 +319,67 @@
     "suddenstamina": "sudden stamina"
   },
   "content_review_terms": {
-    "futa": ["futa", "futanari", "dickgirl", "newhalf", "shemale"],
-    "male_male": ["gay", "m/m", "male only", "male-only", "male male", "male on male", "mlm", "yaoi", "boys love"],
-    "bisexual": ["bi", "bisexual", "mmf", "mfm", "m/m/f", "m/f/m"],
-    "group": ["threesome", "foursome", "orgy", "gangbang", "double penetration", "dp"],
-    "bdsm": ["bdsm", "bondage", "bound", "shibari", "gagged", "collar", "leash"],
-    "noncon": ["noncon", "non-con", "forced", "rape"],
-    "extreme": ["scat", "watersports", "piss", "vore", "gore", "blood", "snuff", "bestiality", "zoophilia", "tentacle", "monster"]
+    "futa": [
+      "futa",
+      "futanari",
+      "dickgirl",
+      "newhalf",
+      "shemale"
+    ],
+    "male_male": [
+      "gay",
+      "m/m",
+      "male only",
+      "male-only",
+      "male male",
+      "male on male",
+      "mlm",
+      "yaoi",
+      "boys love"
+    ],
+    "bisexual": [
+      "bi",
+      "bisexual",
+      "mmf",
+      "mfm",
+      "m/m/f",
+      "m/f/m"
+    ],
+    "group": [
+      "threesome",
+      "foursome",
+      "orgy",
+      "gangbang",
+      "double penetration",
+      "dp"
+    ],
+    "bdsm": [
+      "bdsm",
+      "bondage",
+      "bound",
+      "shibari",
+      "gagged",
+      "collar",
+      "leash"
+    ],
+    "noncon": [
+      "noncon",
+      "non-con",
+      "forced",
+      "rape"
+    ],
+    "extreme": [
+      "scat",
+      "watersports",
+      "piss",
+      "vore",
+      "gore",
+      "blood",
+      "snuff",
+      "bestiality",
+      "zoophilia",
+      "tentacle"
+    ]
   },
   "junk_tokens": [
     "full hd",
@@ -331,13 +404,24 @@
     "audio dude",
     "evil audio"
   ],
-  "preserve_tokens": ["2B", "2P", "9S", "A2", "D.Va", "BotW", "XC2", "BJ", "POV", "RRH", "MAX"],
-
+  "preserve_tokens": [
+    "2B",
+    "2P",
+    "9S",
+    "A2",
+    "D.Va",
+    "BotW",
+    "XC2",
+    "BJ",
+    "Kai'Sa",
+    "POV",
+    "RRH",
+    "MAX"
+  ],
   "known_collectors": [
     "Akiryo",
     "Audio Collection"
   ],
-
   "collection_folder_indicators": [
     "collection",
     "audio collection",
@@ -349,7 +433,6 @@
     "downloads",
     "new clips"
   ],
-
   "use_ai_for_unknown_characters": true,
   "ai_model": "grok-3",
   "ai_api_key_env_var": "XAI_API_KEY",

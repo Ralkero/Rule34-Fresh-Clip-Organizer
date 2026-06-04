@@ -387,6 +387,77 @@ class PreviewAndApplyTests(unittest.TestCase):
             self.assertIn("Held for content review", row["notes"])
             self.assertEqual(row["target_folder"], "Nier Automata")
 
+    def test_collector_descriptor_words_do_not_pollute_inferred_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "Rogowski collection"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            for folder in ("League of Legends", "Final Fantasy", "Chainsaw Man"):
+                (dest / folder).mkdir(parents=True)
+
+            config = make_config(dest)
+            config = org.replace_config(
+                config,
+                character_mappings={
+                    **config.character_mappings,
+                    "kaisa": "League of Legends",
+                    "kai sa": "League of Legends",
+                    "anran": "Final Fantasy",
+                    "power": "Chainsaw Man",
+                },
+                canonical_character_aliases={
+                    **config.canonical_character_aliases,
+                    "kaisa": "Kai'Sa",
+                    "kai sa": "Kai'Sa",
+                    "anran": "Anran",
+                    "power": "Power",
+                },
+                preserve_tokens=(*config.preserve_tokens, "Kai'Sa"),
+            )
+            reference = org.build_reference_data(dest, config)
+
+            cases = [
+                (
+                    "Megaera - Kaisa Beach Nude All Angles - Beach Nude 10 [4K].mp4",
+                    "Kai'Sa",
+                    "League of Legends",
+                    "Kaisa Beach Nude All Angles",
+                ),
+                (
+                    "Megaera - Anran Missionary Nude All Angles - 3 [4K].mp4",
+                    "Anran",
+                    "Final Fantasy",
+                    "Anran Missionary Nude All Angles",
+                ),
+                (
+                    "Megaera - Power Cowgirl, Power - BJ 4 [1080P].mp4",
+                    "Power",
+                    "Chainsaw Man",
+                    "Power Cowgirl, Power",
+                ),
+            ]
+
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), \
+                 patch.object(org, "has_audio_stream", return_value=True):
+                for filename, expected_character, expected_folder, polluted_phrase in cases:
+                    video = source / filename
+                    video.write_bytes(b"fake")
+                    row = org.analyze_file(video, source, config, reference)
+                    self.assertEqual(row["character"], expected_character)
+                    self.assertEqual(row["target_folder"], expected_folder)
+                    self.assertNotIn(polluted_phrase, row["character"])
+                    self.assertNotIn(polluted_phrase, row["target_filename"])
+                    self.assertIn(f"Megaera - {expected_character} - ", row["target_filename"])
+
+    def test_default_content_review_terms_do_not_flag_monster_hunter_franchise(self):
+        config = org.load_config(PROJECT_ROOT / "r34_config.json")
+        self.assertEqual(org.detect_content_review(("Monster Hunter Gemma Ride.mp4",), config), ())
+        self.assertIn(
+            "extreme:tentacle",
+            org.detect_content_review(("Tentacle scene.mp4",), config),
+        )
+
     def test_max_quality_token_is_not_learned_as_first_name_character(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -637,6 +708,63 @@ class PreviewAndApplyTests(unittest.TestCase):
             self.assertFalse(video.exists())
             self.assertTrue(expected.exists())
             self.assertEqual(result["apply_message"], str(expected))
+
+    def test_apply_rejects_target_path_outside_destination_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "incoming"
+            destination_root = base / "Rule34"
+            source.mkdir()
+            destination_root.mkdir()
+            video = source / "clip.mp4"
+            video.write_bytes(b"fake")
+            outside_target = base / "NotRule34" / "clip.mp4"
+            row = {column: "" for column in org.CSV_COLUMNS}
+            row.update({
+                "approved": "yes",
+                "source_path": str(video),
+                "original_name": video.name,
+                "status": "ready",
+                "target_path": str(outside_target),
+            })
+
+            result = org.apply_row(row, source, "run", "_r34_review", False, destination_root=destination_root)
+
+            self.assertEqual(result["apply_result"], "invalid_target")
+            self.assertIn("outside destination_root", result["apply_message"])
+            self.assertTrue(video.exists())
+            self.assertFalse(outside_target.exists())
+
+    def test_silent_and_review_rows_require_approval_before_hold_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            silent = source / "silent.mp4"
+            review = source / "review.mp4"
+            silent.write_bytes(b"fake")
+            review.write_bytes(b"fake")
+
+            silent_row = {column: "" for column in org.CSV_COLUMNS}
+            silent_row.update({"approved": "no", "source_path": str(silent), "status": "silent"})
+            review_row = {column: "" for column in org.CSV_COLUMNS}
+            review_row.update({"approved": "no", "source_path": str(review), "status": "review"})
+
+            silent_result = org.apply_row(silent_row, source, "run", "_r34_review", False)
+            review_result = org.apply_row(review_row, source, "run", "_r34_review", False)
+
+            self.assertEqual(silent_result["apply_result"], "skipped_unapproved")
+            self.assertEqual(review_result["apply_result"], "skipped_unapproved")
+            self.assertTrue(silent.exists())
+            self.assertTrue(review.exists())
+
+            silent_row["approved"] = "yes"
+            review_row["approved"] = "yes"
+            silent_result = org.apply_row(silent_row, source, "run", "_r34_review", False)
+            review_result = org.apply_row(review_row, source, "run", "_r34_review", False)
+
+            self.assertEqual(silent_result["apply_result"], "held_silent")
+            self.assertEqual(review_result["apply_result"], "held_for_review")
+            self.assertTrue((source / "_r34_silent" / "run" / "silent.mp4").exists())
+            self.assertTrue((source / "_r34_review" / "run" / "review.mp4").exists())
 
     def test_apply_creates_missing_destination_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1134,6 +1262,392 @@ class NumberingHelpersTests(unittest.TestCase):
         self.assertEqual(point, "after_character")
         variants = gui.build_numbered_filename_variants(base, 1, point, set())
         self.assertIn("Megaera - 2B 2 - Training [1080P].mp4", variants)
+
+    def test_two_part_artist_title_filename_numbers_title_not_fake_character(self):
+        base = "Aerith Gainsborough - Cowgirl [1080P].mp4"
+        parts = gui.parse_target_filename_parts(base)
+        self.assertEqual(parts["artist"], "Aerith Gainsborough")
+        self.assertIsNone(parts["character"])
+        self.assertEqual(parts["title"], "Cowgirl")
+        self.assertEqual(parts["sex_descriptor"], "Cowgirl")
+        point = gui.choose_number_insertion_point(parts, base)
+        self.assertEqual(point, "after_sex")
+        variants = gui.build_numbered_filename_variants(base, 1, point, set())
+        self.assertEqual(variants[0], "Aerith Gainsborough - Cowgirl 2 [1080P].mp4")
+
+    def test_known_value_filename_edit_replaces_slots_without_duplication(self):
+        base = "Aerith Gainsborough - Cowgirl [1080P].mp4"
+        self.assertEqual(
+            gui.apply_known_value_to_filename("character", "Aerith Gainsborough", base),
+            base,
+        )
+        self.assertEqual(
+            gui.apply_known_value_to_filename("artist", "Nodu", base),
+            "Nodu - Cowgirl [1080P].mp4",
+        )
+        self.assertEqual(
+            gui.apply_known_value_to_filename("resolution", "4K", base),
+            "Aerith Gainsborough - Cowgirl [4K].mp4",
+        )
+
+    def test_quick_pick_filter_prefers_prefix_then_contains(self):
+        values = ["Tifa Lockhart", "Aerith Gainsborough", "Barret Wallace", "Gainsborough Aerith"]
+        self.assertEqual(
+            gui.filter_known_values(values, "aer"),
+            ["Aerith Gainsborough", "Gainsborough Aerith"],
+        )
+
+    def test_quick_pick_arrow_navigation_uses_filtered_results(self):
+        class FakeCombo:
+            def __init__(self, value=""):
+                self.value = value
+                self.values = []
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+            def __setitem__(self, key, value):
+                if key == "values":
+                    self.values = list(value)
+            def selection_range(self, *_args):
+                pass
+            def focus_set(self):
+                pass
+
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_known = {"characters": ["Aerith Gainsborough", "Gainsborough Aerith", "Tifa Lockhart"]}
+        fake.corr_character_cb = FakeCombo("aer")
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._quick_pick_key = lambda category: "characters" if category == "character" else None
+        fake._known_combo_state = lambda category: gui.OrganizerGUI._known_combo_state(fake, category)
+        fake._post_known_combo_dropdown = lambda _combo: None
+
+        gui.OrganizerGUI._refresh_known_combo_search(fake, "character", "aer", post=False)
+        gui.OrganizerGUI._navigate_known_combo_results(fake, "character", 1)
+        self.assertEqual(fake.corr_character_cb.get(), "Aerith Gainsborough")
+        gui.OrganizerGUI._navigate_known_combo_results(fake, "character", 1)
+        self.assertEqual(fake.corr_character_cb.get(), "Gainsborough Aerith")
+        self.assertEqual(fake._quick_pick_combo_states["character"]["query"], "aer")
+
+    def test_quick_pick_enter_accepts_result_without_applying_rows(self):
+        class FakeCombo:
+            def __init__(self, value=""):
+                self.value = value
+                self.values = []
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+            def __setitem__(self, key, value):
+                if key == "values":
+                    self.values = list(value)
+            def icursor(self, *_args):
+                pass
+            def focus_set(self):
+                pass
+
+        accepted = []
+        applied = []
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_known = {"characters": ["Aerith Gainsborough", "Gainsborough Aerith"]}
+        fake.corr_character_cb = FakeCombo("aer")
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._quick_pick_key = lambda category: "characters" if category == "character" else None
+        fake._known_combo_state = lambda category: gui.OrganizerGUI._known_combo_state(fake, category)
+        fake._on_known_pick = lambda category, value: accepted.append((category, value))
+        fake._apply_picked_value = lambda category: applied.append(category)
+
+        gui.OrganizerGUI._refresh_known_combo_search(fake, "character", "aer", post=False)
+        gui.OrganizerGUI._accept_known_combo_selection(fake, "character")
+
+        self.assertEqual(fake.corr_character_cb.get(), "Aerith Gainsborough")
+        self.assertEqual(accepted, [("character", "Aerith Gainsborough")])
+        self.assertEqual(applied, [])
+
+    def test_quick_pick_add_and_remove_are_case_insensitive(self):
+        known = {"characters": ["Aerith Gainsborough"]}
+        self.assertFalse(gui.add_quick_pick_known_value(known, "character", "aerith gainsborough"))
+        self.assertTrue(gui.add_quick_pick_known_value(known, "character", "Tifa Lockhart"))
+        self.assertIn("Tifa Lockhart", known["characters"])
+        self.assertTrue(gui.remove_quick_pick_known_value(known, "character", "tifa lockhart"))
+        self.assertNotIn("Tifa Lockhart", known["characters"])
+
+    def test_apply_picked_value_uses_typed_quick_pick_text(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "artist": "Aerith Gainsborough",
+            "character": "",
+            "target_folder": "Final Fantasy",
+            "target_filename": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_artist_cb = Var("Nodu")
+        fake.corr_character_cb = Var("")
+        fake.corr_franchise_cb = Var("")
+        fake.corr_resolution_cb = Var("")
+        fake.corr_folder_var = Var("")
+        fake.corr_filename_var = Var("Aerith Gainsborough - Cowgirl [1080P].mp4")
+        fake.corr_notes_var = Var("")
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._quick_pick_combo = lambda category: {
+            "artist": fake.corr_artist_cb,
+            "character": fake.corr_character_cb,
+            "franchise": fake.corr_franchise_cb,
+            "resolution": fake.corr_resolution_cb,
+        }.get(category)
+        fake._set_known_combo_values = lambda _category: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+        fake._apply_correction = lambda: gui.OrganizerGUI._apply_correction(fake)
+
+        gui.OrganizerGUI._apply_picked_value(fake, "artist")
+
+        self.assertEqual(row["target_filename"], "Nodu - Cowgirl [1080P].mp4")
+        self.assertEqual(fake.corr_artist_cb.get(), "")
+        self.assertEqual(fake._last_picked_artist, "Nodu")
+
+    def test_apply_correction_overwrites_existing_target_filename_live(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "artist": "Aerith Gainsborough",
+            "character": "",
+            "target_folder": "Final Fantasy",
+            "target_filename": "Aerith Gainsborough - Cowgirl [1080P].mp4 2 - Cowgirl [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_folder_var = Var("")
+        fake.corr_filename_var = Var("Aerith Gainsborough - Cowgirl [1080P].mp4")
+        fake.corr_notes_var = Var("manual cleanup")
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+
+        gui.OrganizerGUI._apply_correction(fake)
+
+        self.assertEqual(row["target_filename"], "Aerith Gainsborough - Cowgirl [1080P].mp4")
+        self.assertTrue(row["target_path"].endswith(r"Final Fantasy\Aerith Gainsborough - Cowgirl [1080P].mp4"))
+        self.assertIn("manual_filename_correction", row["reason"])
+        self.assertEqual(fake.correction_tree.values["0"][4], "Final Fantasy")
+        self.assertTrue(fake.correction_tree.values["0"][5].endswith(r"Final Fantasy"))
+        self.assertNotIn("Aerith Gainsborough - Cowgirl [1080P].mp4", fake.correction_tree.values["0"][5])
+        self.assertEqual(fake.correction_tree.values["0"][6], "Aerith Gainsborough - Cowgirl [1080P].mp4")
+        self.assertEqual(fake.correction_tree.values["0"][7], "[1080P]")
+
+    def test_append_character_to_filename_preserves_structure_and_dedupes(self):
+        original = "Artist - Kiriko - Rescue [1080P].mp4"
+
+        updated = gui.append_character_to_filename("Mercy", original)
+        repeated = gui.append_character_to_filename("Mercy", updated)
+
+        self.assertEqual(updated, "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(repeated, updated)
+
+    def test_append_picked_character_updates_selected_row_and_live_log(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Artist - Rescue [1080P].mp4",
+            "artist": "Artist",
+            "character": "Kiriko",
+            "target_folder": "Overwatch",
+            "target_filename": "Artist - Kiriko - Rescue [1080P].mp4",
+            "target_path": r"E:\Library\Overwatch\Artist - Kiriko - Rescue [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        logs = []
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_character_cb = Var("Mercy")
+        fake.corr_filename_var = Var(row["target_filename"])
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._set_known_combo_values = lambda _category: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+        fake._correction_row_label = lambda row_arg: gui.OrganizerGUI._correction_row_label(fake, row_arg)
+        fake._log_correction_change = logs.append
+        fake._log_row_changes = lambda row_arg, action, before: gui.OrganizerGUI._log_row_changes(fake, row_arg, action, before)
+
+        gui.OrganizerGUI._append_picked_character(fake)
+
+        self.assertEqual(row["target_filename"], "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(row["character"], "Kiriko, Mercy")
+        self.assertTrue(row["target_path"].endswith(r"Overwatch\Artist - Kiriko, Mercy - Rescue [1080P].mp4"))
+        self.assertEqual(fake.correction_tree.values["0"][3], "Kiriko, Mercy")
+        self.assertEqual(fake.correction_tree.values["0"][6], "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(fake.corr_character_cb.get(), "")
+        self.assertTrue(any("Add Character" in entry and "Mercy" in entry for entry in logs))
+
+    def test_correction_tree_values_show_path_filename_franchise_and_resolution(self):
+        fake = type("FakeCorrectionGui", (), {})()
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        row = {
+            "original_name": "clip.mp4",
+            "artist": "Megaera",
+            "character": "Kai'Sa",
+            "target_folder": "League of Legends",
+            "target_path": r"E:\James' Stuff\Rule34\League of Legends\Megaera - Kai'Sa - Beach Nude [4K].mp4",
+            "target_filename": "Megaera - Kai'Sa - Beach Nude [4K].mp4",
+            "resolution": "4K",
+            "status": "ready",
+            "approved": "yes",
+            "_bulk_checked": True,
+        }
+
+        values = gui.OrganizerGUI._correction_tree_values(fake, row)
+
+        self.assertEqual(values[4], "League of Legends")
+        self.assertEqual(values[5], r"E:\James' Stuff\Rule34\League of Legends")
+        self.assertNotIn("Megaera - Kai'Sa - Beach Nude [4K].mp4", values[5])
+        self.assertEqual(values[6], "Megaera - Kai'Sa - Beach Nude [4K].mp4")
+        self.assertEqual(values[7], "[4K]")
+
+    def test_correction_tree_sort_uses_logical_column_ordering(self):
+        fake = type("FakeCorrectionGui", (), {})()
+        fake._sort_state = {}
+        fake._refresh_correction_tree = lambda: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._natural_sort_key = lambda value: gui.OrganizerGUI._natural_sort_key(fake, value)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._resolution_sort_value = lambda row_arg: gui.OrganizerGUI._resolution_sort_value(fake, row_arg)
+        fake._approved_sort_value = lambda row_arg: gui.OrganizerGUI._approved_sort_value(fake, row_arg)
+        fake._checked_sort_value = lambda row_arg: gui.OrganizerGUI._checked_sort_value(fake, row_arg)
+        fake.correction_rows = [
+            {"original_name": "clip10.mp4", "target_filename": "B [4K].mp4", "resolution": "4K", "approved": "yes"},
+            {"original_name": "clip2.mp4", "target_filename": "A [1080P].mp4", "resolution": "1080P", "approved": "no"},
+            {"original_name": "clip1.mp4", "target_filename": "C [720P].mp4", "resolution": "720P", "approved": "yes"},
+        ]
+
+        gui.OrganizerGUI._sort_tree(fake, "original")
+        self.assertEqual([r["original_name"] for r in fake.correction_rows], ["clip1.mp4", "clip2.mp4", "clip10.mp4"])
+
+        gui.OrganizerGUI._sort_tree(fake, "resolution")
+        self.assertEqual([r["resolution"] for r in fake.correction_rows], ["720P", "1080P", "4K"])
+
+    def test_approval_status_can_be_changed_live(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.columns = {}
+            def selection(self):
+                return ("0",)
+            def set(self, iid, column, value):
+                self.columns[(iid, column)] = value
+
+        row = {
+            "original_name": "Needs Review.mp4",
+            "status": "unmatched",
+            "approved": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._set_row_approved = (
+            lambda row_arg, approved, iid=None, tree=None, promote_ready=False:
+            gui.OrganizerGUI._set_row_approved(fake, row_arg, approved, iid, tree, promote_ready)
+        )
+
+        gui.OrganizerGUI._approve_row(fake, row, "0", fake.correction_tree)
+        self.assertEqual(row["approved"], "yes")
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(fake.correction_tree.columns[("0", "approved")], "yes")
+        self.assertEqual(fake.correction_tree.columns[("0", "status")], "ready")
+
+        gui.OrganizerGUI._unapprove_selected(fake)
+        self.assertEqual(row["approved"], "no")
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(fake.correction_tree.columns[("0", "approved")], "no")
+        self.assertIn("unapproved", fake.status_var.get())
 
     def test_ambiguous_parse_requires_dialog(self):
         base = "weirdtitle without dashes or sex [4K].mp4"

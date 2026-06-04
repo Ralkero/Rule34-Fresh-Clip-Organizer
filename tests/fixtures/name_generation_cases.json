@@ -1,0 +1,92 @@
+[
+  {
+    "original_name": "Mai 201113 multiaudio.mp4",
+    "source_parent": "Audio Collection",
+    "expected": {
+      "artist": "Mai",
+      "character": "Mai Shiranui",
+      "target_folder": "King of Fighters",
+      "status": "ready"
+    }
+  },
+  {
+    "original_name": "Mai 210102 evilaudio.mp4",
+    "source_parent": "Audio Collection",
+    "expected": {
+      "artist": "Mai",
+      "character": "Mai Shiranui",
+      "target_folder": "King of Fighters",
+      "status": "ready"
+    }
+  },
+  {
+    "original_name": "Sinia 210422 multiaudio.mp4",
+    "source_parent": "Audio Collection",
+    "expected": {
+      "artist": "Sinia",
+      "character": "",
+      "target_folder": "",
+      "status": "needs review"
+    }
+  },
+  {
+    "original_name": "Bewyx - Mei fucks in the office [720p].mp4",
+    "source_parent": "Overwatch",
+    "expected": {
+      "artist": "Bewyx",
+      "character": "Mei",
+      "target_folder": "Overwatch",
+      "status": "ready"
+    }
+  },
+  {
+    "original_name": "2B Training 1080p Unwatermarked.mp4",
+    "source_parent": "Pantsushi",
+    "expected": {
+      "artist": "Pantsushi",
+      "character": "2B",
+      "target_folder": "Nier Automata",
+      "status": "ready"
+    }
+  },
+  {
+    "original_name": "MEGAERA 2025 Elf BJ Nude All Angles-48FPS.mp4",
+    "source_parent": "src",
+    "expected": {
+      "artist": "Megaera",
+      "character": "Megaera",
+      "target_folder": "",
+      "status": "needs review"
+    }
+  },
+  {
+    "original_name": "random clip no signals.mp4",
+    "source_parent": "misc",
+    "expected": {
+      "artist": "",
+      "character": "",
+      "target_folder": "",
+      "status": "needs review"
+    }
+  },
+  {
+    "original_name": "D.Va and Mercy fun [1080P].mp4",
+    "source_parent": "Overwatch",
+    "expected": {
+      "artist": "",
+      "character": "D.Va",
+      "target_folder": "Overwatch",
+      "status": "ready"
+    }
+  },
+  {
+    "original_name": "Collector OC special.mp4",
+    "source_parent": "src",
+    "expected": {
+      "artist": "",
+      "character": "",
+      "target_folder": "Original Character",
+      "status": "needs review"
+    }
+  }
+]

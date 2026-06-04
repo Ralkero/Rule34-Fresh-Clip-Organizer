@@ -4,7 +4,7 @@ setlocal
 echo Building Rule34 Fresh Clip Organizer GUI (portable folder)...
 
 python -m pip install --upgrade pip
-python -m pip install pyinstaller
+python -m pip install -r requirements.txt
 
 pyinstaller ^
   --noconfirm ^
