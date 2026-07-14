@@ -13,6 +13,9 @@ The tool is intentionally two-step:
 
 It does not talk to Stash. After files are moved, rescan/import in Stash separately.
 
+The complete product, naming, variant-policy, and safety baseline is documented in
+[`docs/ORGANIZER_DESIGN_BASELINE.md`](docs/ORGANIZER_DESIGN_BASELINE.md).
+
 ## Requirements
 
 - Python 3.10+

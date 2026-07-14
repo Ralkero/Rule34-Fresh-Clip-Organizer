@@ -13,6 +13,7 @@ to the existing .ps1 / .cmd launchers.
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,58 @@ try:
     import r34_organizer as org
 except ImportError:
     org = None  # Will handle gracefully in the correction tool
+
+
+SOURCE_COLLECTION_DATE_FALLBACK_RE = r"(?:19|20)\d{2}(?:[-_. ]\d{1,2}(?:[-_. ]\d{1,2})?)?"
+SOURCE_COLLECTION_RANGE_FALLBACK_RE = (
+    rf"(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE})"
+    rf"(?:[-_. ]*(?:to|through|thru|until|up[-_. ]*to)[-_. ]*(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE}))?"
+)
+SOURCE_ARTIST_SUFFIX_FALLBACK_RE = re.compile(
+    rf"(?i)[\s_.-]+(?:artist[\s_.-]+)?"
+    rf"(?:collection|clips?|videos?|animations?|animation|packs?|batches|archives?|uploads?|downloads?)"
+    rf"(?:[\s_.-]+(?:(?:from[\s_.-]+)?(?:{SOURCE_COLLECTION_RANGE_FALLBACK_RE})|"
+    rf"(?:to|through|thru|until|up[-_. ]*to)[\s_.-]+(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE})))?\s*$"
+)
+COLLECTION_EXPORT_PREFIX_RE = re.compile(
+    rf"(?i)^(?P<artist>.+?[\s_.-]+(?:artist[\s_.-]+)?"
+    rf"(?:collection|clips?|videos?|animations?|animation|packs?|batches|archives?|uploads?|downloads?)"
+    rf"(?:[\s_.-]+(?:(?:from[\s_.-]+)?(?:{SOURCE_COLLECTION_RANGE_FALLBACK_RE})|"
+    rf"(?:to|through|thru|until|up[-_. ]*to)[\s_.-]+(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE}))))"
+    rf"\s*-\s*(?P<rest>.+)$"
+)
+
+
+def normalize_output_artist(artist: str) -> str:
+    value = str(artist or "").strip(" -_.")
+    if not value:
+        return ""
+    if org is not None and hasattr(org, "strip_source_artist_suffix"):
+        stripped = org.strip_source_artist_suffix(value)
+        if stripped:
+            return stripped
+    return SOURCE_ARTIST_SUFFIX_FALLBACK_RE.sub("", value).strip(" -_.") or value
+
+
+def normalize_collection_export_filename_prefix(filename: str) -> str:
+    value = str(filename or "").strip()
+    match = COLLECTION_EXPORT_PREFIX_RE.match(value)
+    if not match:
+        return value
+    artist = normalize_output_artist(match.group("artist"))
+    rest = match.group("rest").strip()
+    return f"{artist} - {rest}" if artist and rest else value
+
+
+def build_correction_target_path(dest_root: str, target_folder: str, target_filename: str) -> Path:
+    if org is not None and hasattr(org, "build_target_path"):
+        return org.build_target_path(Path(dest_root), target_folder, target_filename)
+    target = Path(dest_root)
+    for part in re.split(r"[\\/]+", str(target_folder or "")):
+        clean = part.strip(" .\t\r\n")
+        if clean:
+            target = target / clean
+    return target / target_filename
 
 
 def get_known_values(config_path: Optional[Path] = None, dest_root_override: Optional[Path] = None) -> dict:
@@ -83,7 +136,7 @@ def parse_target_filename_parts(fname: str) -> Dict[str, Optional[str]]:
     if not fname:
         return {"artist": None, "character": None, "title": None, "res": None, "ext": None, "sex_descriptor": None}
     # normalize common
-    fname = fname.strip()
+    fname = normalize_collection_export_filename_prefix(fname)
     m = re.match(r"^(?P<artist>.*?)\s*-\s*(?P<char>.*?)\s*-\s*(?P<title>.*?)\s*(?P<res>\[[^\]]+\])?(?P<ext>\.[^.]+)?$", fname)
     sex_words = r"(?i)\b(Nude|BJ|Blowjob|Doggy|Cowgirl|Missionary|Anal|Creampie|Facial|69|Spoon|Prone|Standing|Doggystyle|Reverse.?Cowgirl)\b"
     if not m:
@@ -134,6 +187,7 @@ def choose_number_insertion_point(parts: Dict[str, Optional[str]], proposed_base
     return "ambiguous"
 
 def _format_target_filename_parts(artist: str, character: str, title: str, res: str, ext: str) -> str:
+    artist = normalize_output_artist(artist)
     stem = " - ".join(p.strip() for p in (artist, character, title) if p and p.strip())
     return f"{stem} {res}{ext}".strip()
 
@@ -181,6 +235,59 @@ def apply_known_value_to_filename(category: str, value: str, current: str) -> st
         res = f"[{value.strip('[]')}]"
 
     return _format_target_filename_parts(artist, character, title, res, ext)
+
+
+def apply_filename_component_to_filename(category: str, value: str, current: str) -> str:
+    """Replace one parsed filename component while preserving every other component."""
+    category = (category or "").strip().lower()
+    value = (value or "").strip()
+    current = (current or "").strip()
+    if category in {"artist", "character", "resolution"} and value:
+        return apply_known_value_to_filename(category, value, current)
+    if not current:
+        return current
+
+    parts = parse_target_filename_parts(current)
+    artist = parts.get("artist") or ""
+    character = parts.get("character") or ""
+    title = parts.get("title") or ""
+    res = parts.get("res") or ""
+    ext = parts.get("ext") or ".mp4"
+    if category == "artist":
+        artist = value
+    elif category == "character":
+        character = value
+    elif category == "title":
+        title = value
+    elif category == "resolution":
+        res = f"[{value.strip('[]')}]" if value else ""
+    else:
+        return current
+    return _format_target_filename_parts(artist, character, title, res, ext)
+
+
+def infer_filename_component_edit(original: str, edited: str):
+    """Return (component, value) when exactly one structured filename part changed."""
+    if not original or not edited:
+        return None
+    before = parse_target_filename_parts(original)
+    after = parse_target_filename_parts(edited)
+    if (before.get("ext") or ".mp4").lower() != (after.get("ext") or ".mp4").lower():
+        return None
+
+    fields = (
+        ("artist", "artist"),
+        ("character", "character"),
+        ("title", "title"),
+        ("res", "resolution"),
+    )
+    changed = []
+    for part_key, category in fields:
+        old_value = (before.get(part_key) or "").strip()
+        new_value = (after.get(part_key) or "").strip()
+        if old_value != new_value:
+            changed.append((category, new_value.strip("[]") if category == "resolution" else new_value))
+    return changed[0] if len(changed) == 1 else None
 
 def append_character_to_filename(value: str, current: str) -> str:
     """Append a character to the parsed character slot using comma separation.
@@ -319,6 +426,16 @@ def remove_quick_pick_known_value(known: dict, category: str, value: str) -> boo
     return True
 
 
+def unique_backup_path(path: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    candidate = path.with_name(f"{path.stem}.backup.{ts}{path.suffix}")
+    counter = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.backup.{ts}-{counter}{path.suffix}")
+        counter += 1
+    return candidate
+
+
 def apply_known_values_edits_to_config(
     config_path: Path,
     *,
@@ -351,8 +468,7 @@ def apply_known_values_edits_to_config(
     if not cpath.exists():
         return None
     try:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        backup = cpath.with_name(f"{cpath.stem}.backup.{ts}.json")
+        backup = unique_backup_path(cpath)
         shutil.copy2(str(cpath), str(backup))  # timestamped backup BEFORE any write (hard requirement)
 
         with open(cpath, "r", encoding="utf-8") as fh:
@@ -393,6 +509,19 @@ def apply_known_values_edits_to_config(
     except Exception:
         # Surface to caller (manager shows error dialog); any backup created before failure is left on disk.
         raise
+
+
+def apply_variant_policy_edits_to_config(config_path: Path, variant_policy: dict) -> Optional[Path]:
+    """Backup-first, explicit save for the independently managed variant policy."""
+    if config_path is None or not Path(config_path).exists():
+        return None
+    cpath = Path(config_path)
+    backup = unique_backup_path(cpath)
+    shutil.copy2(str(cpath), str(backup))
+    raw = json.loads(cpath.read_text(encoding="utf-8-sig"))
+    raw["variant_policy"] = json.loads(json.dumps(variant_policy or {}))
+    cpath.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    return backup
 
 
 def resolve_learned_mappings_path(config_path: Path, cfg: Optional["org.Config"] = None) -> Path:
@@ -439,8 +568,7 @@ def apply_learned_mappings_edits(learned_path: Path, edits: Optional[dict] = Non
     try:
         backup = None
         if p.exists():
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            backup = p.with_name(f"{p.stem}.backup.{ts}.json")
+            backup = unique_backup_path(p)
             shutil.copy2(str(p), str(backup))  # collision-proof backup BEFORE any write
 
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1982,6 +2110,11 @@ class OrganizerGUI:
         chk.grid(row=4, column=1, sticky="w", padx=5, pady=(2, 0))
         Tooltip(chk, "When enabled, the GUI will automatically attempt to load the xAI API key from the configured env var or r34_xai_key.txt on startup and show its status. Disable this if you prefer to never have the GUI read the key file automatically.")
 
+        self.variant_analysis_var = tk.BooleanVar(value=True)
+        variant_chk = ttk.Checkbutton(path_frame, text="Analyze collection variants", variable=self.variant_analysis_var)
+        variant_chk.grid(row=5, column=1, sticky="w", padx=5, pady=(2, 0))
+        Tooltip(variant_chk, "Compare related clips during Preview, retain clear winners, route optional variants to review, and mark equivalent lower-resolution files for reversible holding during Apply.")
+
         path_frame.columnconfigure(1, weight=1)
 
         # Action buttons
@@ -2233,6 +2366,8 @@ class OrganizerGUI:
         cmd = base_cmd + ["--config", config, "preview", "--source", source]
         if dest:
             cmd += ["--dest-root", dest]
+        if not self.variant_analysis_var.get():
+            cmd += ["--no-variant-analysis"]
 
         self._start_command(cmd, "Running preview...")
 
@@ -2471,6 +2606,8 @@ class OrganizerGUI:
             "current_target",
             "output_filename",
             "resolution",
+            "variant",
+            "decision",
             "status",
             "approved",
         )
@@ -2483,6 +2620,8 @@ class OrganizerGUI:
         tree.heading("current_target", text="Target Path")
         tree.heading("output_filename", text="Output Filename")
         tree.heading("resolution", text="Resolution")
+        tree.heading("variant", text="Variant")
+        tree.heading("decision", text="Decision")
         tree.heading("status", text="Status")
         tree.heading("approved", text="Approved")
 
@@ -2494,6 +2633,8 @@ class OrganizerGUI:
         tree.column("current_target", width=420)
         tree.column("output_filename", width=320)
         tree.column("resolution", width=90, anchor="center")
+        tree.column("variant", width=190)
+        tree.column("decision", width=150)
         tree.column("status", width=90)
         tree.column("approved", width=80)
 
@@ -2542,9 +2683,12 @@ class OrganizerGUI:
         self.corr_notes_var = tk.StringVar()
         ttk.Entry(edit_frame, textvariable=self.corr_notes_var, width=50).grid(row=2, column=1, sticky="w")
 
+        self.corr_variant_evidence_var = tk.StringVar(value="Variant evidence: none")
+        ttk.Label(edit_frame, textvariable=self.corr_variant_evidence_var, foreground="#555555", wraplength=900).grid(row=3, column=0, columnspan=2, sticky="w", padx=5)
+
         # Buttons
         btn_frame = ttk.Frame(edit_frame)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
 
         btn_apply_corr = ttk.Button(btn_frame, text="Apply Correction to Selected Row(s)", command=self._apply_correction)
         btn_apply_corr.pack(side="left", padx=5)
@@ -2590,6 +2734,11 @@ class OrganizerGUI:
         # User highlights a batch (or many), right-clicks anywhere, chooses the item
         # to batch-toggle those rows' _bulk_checked state + the visible symbol.
         context_menu = tk.Menu(tree, tearoff=0)
+        context_menu.add_command(
+            label="Show Source File in Explorer",
+            command=self._show_correction_file_in_explorer
+        )
+        context_menu.add_separator()
         context_menu.add_command(
             label="Select multiple (toggle checkboxes)",
             command=self._toggle_checkboxes_for_selected
@@ -2749,6 +2898,9 @@ class OrganizerGUI:
         self.corr_folder_var.set(row.get("target_folder", ""))
         self.corr_filename_var.set(row.get("target_filename", ""))
         self.corr_notes_var.set(row.get("notes", ""))
+        evidence = row.get("variant_reason", "") or "none"
+        family = row.get("variant_family", "") or "standalone"
+        self.corr_variant_evidence_var.set(f"Variant family: {family} | {evidence}")
 
     def _on_correction_tree_click(self, event):
         """Handle click on checkbox column to toggle bulk selection."""
@@ -2785,6 +2937,7 @@ class OrganizerGUI:
         if not tree or not hasattr(self, "correction_context_menu"):
             return
         item = tree.identify_row(event.y)
+        self._correction_context_iid = item or None
         if item:
             # Preserve an existing multi-selection if the user right-clicks inside it.
             # Only change selection if the clicked row is outside the current set.
@@ -2798,6 +2951,66 @@ class OrganizerGUI:
             self.correction_context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.correction_context_menu.grab_release()
+
+    def _correction_context_row(self):
+        tree = getattr(self, "correction_tree", None)
+        rows = getattr(self, "correction_rows", [])
+        iid = getattr(self, "_correction_context_iid", None)
+        if not iid and tree:
+            selection = tree.selection()
+            iid = selection[0] if selection else None
+        if iid is None:
+            return None
+        try:
+            return rows[int(iid)]
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def _correction_explorer_target_for_row(self, row: dict):
+        """Return (path, select_file) for the best Explorer target for a correction row."""
+        for key in ("source_path", "target_path"):
+            raw = (row or {}).get(key, "")
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.is_file():
+                return path, True
+            if path.is_dir():
+                return path, False
+            parent = path.parent
+            if parent and parent.exists():
+                return parent, False
+        return None, False
+
+    def _explorer_select_command(self, path: Path) -> str:
+        # Explorer's /select parser is picky; this exact command-line shape
+        # opens the source folder and highlights the file.
+        return f'explorer.exe /select,"{str(path)}"'
+
+    def _open_in_explorer(self, path: Path, select_file: bool = False):
+        if select_file:
+            subprocess.Popen(self._explorer_select_command(path))
+        else:
+            subprocess.Popen(["explorer.exe", str(path)])
+
+    def _show_correction_file_in_explorer(self):
+        row = self._correction_context_row()
+        if not row:
+            self.status_var.set("No correction row selected to show in Explorer.")
+            return
+        path, select_file = self._correction_explorer_target_for_row(row)
+        if not path:
+            messagebox.showwarning(
+                "File Not Found",
+                "Could not find this row's source file, target file, or containing folder."
+            )
+            return
+        try:
+            self._open_in_explorer(path, select_file=select_file)
+            label = Path(row.get("source_path") or row.get("target_path") or path).name
+            self.status_var.set(f"Opened in Explorer: {label}")
+        except Exception as e:
+            messagebox.showerror("Explorer Error", f"Failed to open Windows Explorer: {e}")
 
     def _toggle_checkboxes_for_selected(self):
         """Toggle _bulk_checked (and the ✓/☐ symbol) for every row in the current
@@ -2831,10 +3044,11 @@ class OrganizerGUI:
             self.append_output(msg)
             self.status_var.set(msg)
 
-    def _apply_correction(self):
+    def _apply_correction(self, filename_component: str = None, component_value: str = None, folder_only: bool = False):
         """Apply the edit fields to ALL selected rows (supports multi-select via Ctrl/Shift).
 
         - Only non-empty fields are applied (enables folder-only or filename-only bulk edits).
+        - Single-component filename edits preserve each selected row's other generated parts.
         - A correction note is appended to every affected row.
         - target_path is recomputed per row using the (updated) folder + filename for that row.
         - Changes are reflected LIVE in the tree immediately (no popups, no confirmation dialogs).
@@ -2848,10 +3062,20 @@ class OrganizerGUI:
             return
 
         new_folder = self.corr_folder_var.get().strip()
-        new_filename = self.corr_filename_var.get().strip()
+        new_filename = "" if folder_only else self.corr_filename_var.get().strip()
         notes = self.corr_notes_var.get().strip()
 
-        if not new_folder and not new_filename:
+        component_edit = None
+        if filename_component:
+            component_edit = (filename_component, (component_value or "").strip())
+        elif new_filename and len(selection) > 1:
+            try:
+                anchor_row = self.correction_rows[int(selection[0])]
+                component_edit = infer_filename_component_edit(anchor_row.get("target_filename", ""), new_filename)
+            except (ValueError, IndexError, KeyError):
+                component_edit = None
+
+        if not new_folder and not new_filename and not component_edit:
             self.status_var.set("Enter a folder and/or filename to apply.")
             return
 
@@ -2874,7 +3098,7 @@ class OrganizerGUI:
 
         # P2: smart dup numbering for multi filename edit (wired after pure helpers + tests).
         # Check only "rest of the selected files"; auto number per scheme (after sex or char); dialog if ambiguous.
-        if new_filename and len(selection) > 1:
+        if new_filename and len(selection) > 1 and not component_edit:
             sel_rows = []
             for iid in selection:
                 try:
@@ -2907,7 +3131,17 @@ class OrganizerGUI:
                 if new_folder:
                     row["target_folder"] = new_folder
                     changed = True
-                if new_filename:
+                if component_edit:
+                    category, value = component_edit
+                    current_filename = row.get("target_filename", "")
+                    updated_filename = apply_filename_component_to_filename(category, value, current_filename)
+                    if updated_filename != current_filename:
+                        row["target_filename"] = updated_filename
+                        parsed = parse_target_filename_parts(updated_filename)
+                        if parsed.get("character") is not None:
+                            row["character"] = parsed.get("character") or ""
+                        changed = True
+                elif new_filename:
                     row["target_filename"] = numbered_filenames.get(str(iid), new_filename)
                     parsed = parse_target_filename_parts(row["target_filename"])
                     if parsed.get("character") is not None:
@@ -2921,7 +3155,7 @@ class OrganizerGUI:
                 row_folder = row.get("target_folder", "")
                 row_fname = row.get("target_filename", "")
                 if dest_root and row_folder and row_fname:
-                    target_path = str(Path(dest_root) / row_folder / row_fname)
+                    target_path = str(build_correction_target_path(dest_root, row_folder, row_fname))
                     row["target_path"] = target_path
 
                 # Append audit note to this row
@@ -2934,7 +3168,7 @@ class OrganizerGUI:
                 # If correcting an unmatched (or similar) row by providing target, auto-promote to ready+approved
                 # so bulk "apply correction" makes it apply-able instead of still blocked on status=unmatched.
                 cur_stat = (row.get("status") or "").strip().lower()
-                if (new_folder or new_filename) and cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
+                if (new_folder or new_filename or component_edit) and cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
                     row["status"] = "ready"
                     row["approved"] = "yes"
 
@@ -3157,6 +3391,11 @@ class OrganizerGUI:
         key = self._quick_pick_key(category)
         if not combo or not key:
             return []
+        cursor_index = None
+        try:
+            cursor_index = combo.index("insert")
+        except Exception:
+            cursor_index = None
         if query is None:
             query = combo.get() if hasattr(combo, "get") else ""
         state = self._known_combo_state(category)
@@ -3166,10 +3405,11 @@ class OrganizerGUI:
         combo["values"] = values
         if post and values:
             self._post_known_combo_dropdown(combo)
-        try:
-            combo.icursor("end")
-        except Exception:
-            pass
+        if cursor_index is not None:
+            try:
+                combo.icursor(min(int(cursor_index), len(query or "")))
+            except Exception:
+                pass
         return values
 
     def _navigate_known_combo_results(self, category: str, direction: int):
@@ -3254,15 +3494,11 @@ class OrganizerGUI:
                 "Alt_L", "Alt_R", "Caps_Lock"
             }:
                 return None
-            self._refresh_known_combo_search(category, post=True)
+            self._refresh_known_combo_search(category, post=False)
             return None
 
         def _on_open(event=None):
             self._refresh_known_combo_search(category, post=False)
-            try:
-                combo.focus_set()
-            except Exception:
-                pass
 
         combo.bind("<KeyPress>", _on_keypress)
         combo.bind("<KeyRelease>", _on_keyrelease)
@@ -3402,7 +3638,7 @@ class OrganizerGUI:
 
         if category == "franchise":
             self.corr_folder_var.set(value)
-            self._apply_correction()
+            self._apply_correction(folder_only=True)
             if combo and hasattr(combo, "set"):
                 combo.set("")
             if hasattr(self, "_set_known_combo_values"):
@@ -3428,7 +3664,7 @@ class OrganizerGUI:
                             except Exception:
                                 dest_root = ""
                         if dest_root:
-                            row["target_path"] = str(Path(dest_root) / row_folder / row_fname)
+                            row["target_path"] = str(build_correction_target_path(dest_root, row_folder, row_fname))
                     tree.item(iid, values=self._correction_tree_values(row))
                     updated += 1
                 except Exception:
@@ -3441,7 +3677,7 @@ class OrganizerGUI:
             # For P1, always populate the filename field (user confirms before Apply Correction or explicit future).
             if category in ("artist", "character", "resolution"):
                 self.corr_filename_var.set(apply_known_value_to_filename(category, value, self.corr_filename_var.get()))
-            self._apply_correction()
+            self._apply_correction(filename_component=category, component_value=value)
             if combo and hasattr(combo, "set"):
                 combo.set("")
             if hasattr(self, "_set_known_combo_values"):
@@ -3491,7 +3727,7 @@ class OrganizerGUI:
 
                 row_folder = row.get("target_folder", "")
                 if dest_root and row_folder and new_filename:
-                    row["target_path"] = str(Path(dest_root) / row_folder / new_filename)
+                    row["target_path"] = str(build_correction_target_path(dest_root, row_folder, new_filename))
 
                 existing_notes = row.get("notes", "")
                 row["notes"] = f"{existing_notes}; {correction_note}".strip("; ")
@@ -3566,6 +3802,7 @@ class OrganizerGUI:
         self._edit_folder_aliases = dict(getattr(cfg, 'folder_aliases', {})) if cfg else {}
         self._edit_character_mappings = dict(getattr(cfg, 'character_mappings', {})) if cfg else {}
         self._edit_canonical_character_aliases = dict(getattr(cfg, 'canonical_character_aliases', {})) if cfg else {}
+        self._edit_variant_policy = json.loads(json.dumps(getattr(cfg, 'variant_policy', {}) or {})) if cfg else {}
 
         # Phase 3c: load learned mappings from its own file (resolved rel to selected config via _loaded or sibling).
         # In-mem only until Save. No write on open. Uses pure resolve (duplicates org logic without editing org.py).
@@ -3610,6 +3847,7 @@ class OrganizerGUI:
             ("character_mappings", "Character Mappings"),
             ("canonical_character_aliases", "Canonical Character Aliases"),
             ("learned", "Learned Mappings"),
+            ("variant_policy", "Variant Policy"),
             ("dest_folders", "Destination Folders"),
             ("characters", "Characters"),
             ("resolutions", "Resolutions"),
@@ -3653,7 +3891,137 @@ class OrganizerGUI:
             # Optional header
             ttk.Label(parent, text=disp_name, font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0,4))
 
-            if cat in ("artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases", "learned"):
+            if cat == "variant_policy":
+                policy = self._edit_variant_policy
+                enabled_var = tk.BooleanVar(value=bool(policy.get("enabled", True)))
+                ttk.Checkbutton(parent, text="Enable variant analysis by default", variable=enabled_var,
+                                command=lambda: policy.__setitem__("enabled", enabled_var.get())).pack(anchor="w", pady=2)
+
+                limits = ttk.Frame(parent)
+                limits.pack(fill="x", pady=2)
+                ttk.Label(limits, text="Maximum retained performances:").pack(side="left")
+                max_var = tk.IntVar(value=int(policy.get("max_preferred_performances", 2)))
+                max_spin = ttk.Spinbox(limits, from_=0, to=10, textvariable=max_var, width=5)
+                max_spin.pack(side="left", padx=5)
+                def _stage_max_performances(*_):
+                    try:
+                        policy["max_preferred_performances"] = max(0, int(max_var.get()))
+                    except (TypeError, ValueError, tk.TclError):
+                        pass
+                max_var.trace_add("write", _stage_max_performances)
+
+                editors = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+                editors.pack(fill="both", expand=True, pady=4)
+
+                alias_frame = ttk.LabelFrame(editors, text="Aliases (one alias = output per line)", padding=5)
+                editors.add(alias_frame, weight=2)
+                ttk.Label(alias_frame, text="Descriptor abbreviations").pack(anchor="w")
+                descriptor_text = tk.Text(alias_frame, height=10, width=42)
+                descriptor_text.pack(fill="both", expand=True)
+                descriptor_text.insert("1.0", "\n".join(f"{k} = {v}" for k, v in sorted((policy.get("descriptor_aliases") or {}).items())))
+                ttk.Label(alias_frame, text="Credit aliases").pack(anchor="w", pady=(6, 0))
+                credit_text = tk.Text(alias_frame, height=10, width=42)
+                credit_text.pack(fill="both", expand=True)
+                credit_text.insert("1.0", "\n".join(f"{k} = {v}" for k, v in sorted((policy.get("credit_aliases") or {}).items())))
+
+                def _parse_alias_editor(widget):
+                    result = {}
+                    for line in widget.get("1.0", "end").splitlines():
+                        if "=" not in line:
+                            continue
+                        alias, output = (part.strip() for part in line.split("=", 1))
+                        if alias and output:
+                            result[alias] = output
+                    return result
+
+                def _stage_aliases(_evt=None):
+                    policy["descriptor_aliases"] = _parse_alias_editor(descriptor_text)
+                    policy["credit_aliases"] = _parse_alias_editor(credit_text)
+
+                descriptor_text.bind("<FocusOut>", _stage_aliases)
+                credit_text.bind("<FocusOut>", _stage_aliases)
+
+                pref_frame = ttk.LabelFrame(editors, text="Preferred performance signatures", padding=5)
+                editors.add(pref_frame, weight=2)
+                scope_var = tk.StringVar(value="Global")
+                scope_cb = ttk.Combobox(pref_frame, textvariable=scope_var, values=("Global", "Artist", "Character"), state="readonly", width=12)
+                scope_cb.grid(row=0, column=0, padx=2, sticky="w")
+                key_var = tk.StringVar()
+                key_cb = ttk.Combobox(pref_frame, textvariable=key_var, state="normal", width=34)
+                key_cb.grid(row=0, column=1, padx=2, sticky="we")
+                signature_list = tk.Listbox(pref_frame, height=14, exportselection=False)
+                signature_list.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=4)
+                signature_var = tk.StringVar()
+                ttk.Entry(pref_frame, textvariable=signature_var).grid(row=2, column=0, columnspan=2, sticky="we")
+                pref_frame.columnconfigure(1, weight=1)
+                pref_frame.rowconfigure(1, weight=1)
+
+                def _scope_bucket(create=True):
+                    prefs = policy.setdefault("preferred_performances", {"global": [], "artists": {}, "characters": {}})
+                    scope = scope_var.get().lower()
+                    if scope == "global":
+                        return prefs.setdefault("global", [])
+                    mapping = prefs.setdefault("artists" if scope == "artist" else "characters", {})
+                    key = key_var.get().strip()
+                    if not key:
+                        return []
+                    return mapping.setdefault(key, []) if create else mapping.get(key, [])
+
+                def _refresh_signatures(_evt=None):
+                    scope = scope_var.get()
+                    if scope == "Artist":
+                        key_cb.configure(values=(self.correction_known or {}).get("artists", []))
+                    elif scope == "Character":
+                        key_cb.configure(values=(self.correction_known or {}).get("characters", []))
+                    else:
+                        key_var.set("")
+                        key_cb.configure(values=())
+                    signature_list.delete(0, "end")
+                    for value in _scope_bucket(create=False):
+                        signature_list.insert("end", value)
+
+                def _add_signature():
+                    value = signature_var.get().strip()
+                    bucket = _scope_bucket()
+                    if value and value not in bucket:
+                        bucket.append(value)
+                        signature_var.set("")
+                        _refresh_signatures()
+
+                def _remove_signature():
+                    sel = signature_list.curselection()
+                    if sel:
+                        bucket = _scope_bucket()
+                        if sel[0] < len(bucket):
+                            bucket.pop(sel[0])
+                        _refresh_signatures()
+
+                def _move_signature(delta):
+                    sel = signature_list.curselection()
+                    bucket = _scope_bucket()
+                    if not sel:
+                        return
+                    old = sel[0]
+                    new = max(0, min(len(bucket) - 1, old + delta))
+                    if old != new:
+                        bucket.insert(new, bucket.pop(old))
+                        _refresh_signatures()
+                        signature_list.selection_set(new)
+
+                buttons = ttk.Frame(pref_frame)
+                buttons.grid(row=3, column=0, columnspan=2, pady=4)
+                ttk.Button(buttons, text="Add", command=_add_signature).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Remove", command=_remove_signature).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Up", command=lambda: _move_signature(-1)).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Down", command=lambda: _move_signature(1)).pack(side="left", padx=2)
+                scope_cb.bind("<<ComboboxSelected>>", _refresh_signatures)
+                key_cb.bind("<<ComboboxSelected>>", _refresh_signatures)
+                key_cb.bind("<FocusOut>", _refresh_signatures)
+                _refresh_signatures()
+
+                self._stage_variant_policy_aliases = _stage_aliases
+
+            elif cat in ("artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases", "learned"):
                 # Re-use the 4a/prior editable UI code, adapted to pack into 'parent' instead of tab frame 'f'.
                 # All live refresh, 4 buttons, select populate, counts, terminology, help, save-unaffected logic preserved.
                 # Use stable internal keys (not display labels) for routing.
@@ -4531,6 +4899,13 @@ class OrganizerGUI:
                     messagebox.showerror("Save Error", "Config backup failed or invalid path; no write performed.")
                     return
 
+                if hasattr(self, "_stage_variant_policy_aliases"):
+                    self._stage_variant_policy_aliases()
+                variant_backup = apply_variant_policy_edits_to_config(cpath, getattr(self, "_edit_variant_policy", {}) or {})
+                if not variant_backup:
+                    messagebox.showerror("Save Error", "Variant policy backup failed; variant policy was not written.")
+                    return
+
                 # Phase 3c learned (separate file, resolved rel to this cpath)
                 lm = getattr(self, "_edit_learned_mappings", {}) or {}
                 learned_p = resolve_learned_mappings_path(cpath, cfg)
@@ -4551,7 +4926,7 @@ class OrganizerGUI:
                 messagebox.showinfo(
                     "Phase 3c Saved",
                     f"Config updated (artist_aliases, folder_aliases, character_mappings, canonical_character_aliases only).\n"
-                    f"Backup created: {backup.name}\n"
+                    f"Backups created: {backup.name}, {variant_backup.name}\n"
                     f"{learned_msg}"
                     "All other config structure/keys + learned file safety preserved (r34_config.json untouched outside the 4; no bleed to char_mappings/canon_*; dest/res never edited).\n"
                     "Dropdowns refreshed (learned appears in Characters/Franchises where applicable). Current Correction Tool session remains usable."
@@ -4585,6 +4960,8 @@ class OrganizerGUI:
             self._correction_target_directory(row),
             row.get("target_filename", ""),
             self._correction_resolution_tag(row),
+            row.get("variant_descriptors", "") or row.get("variant_version", ""),
+            row.get("variant_decision", ""),
             row.get("status", ""),
             row.get("approved", ""),
         )
@@ -4636,6 +5013,8 @@ class OrganizerGUI:
             "current_target": lambda r: self._natural_sort_key(self._correction_target_directory(r)),
             "output_filename": lambda r: self._natural_sort_key(r.get("target_filename", "")),
             "resolution": self._resolution_sort_value,
+            "variant": lambda r: self._natural_sort_key(" ".join((r.get("variant_version", ""), r.get("variant_descriptors", ""), r.get("variant_credits", "")))),
+            "decision": lambda r: self._natural_sort_key(r.get("variant_decision", "")),
             "status": lambda r: self._natural_sort_key(r.get("status", "")),
             "approved": self._approved_sort_value,
         }
