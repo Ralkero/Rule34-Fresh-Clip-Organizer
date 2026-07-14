@@ -3,15 +3,18 @@
 
 # Rule34 Fresh Clip Organizer
 
-Local Python CLI for previewing and applying safe renames/moves for freshly downloaded Rule34 clips.
+Local Python CLI and Windows GUI for previewing and applying safe renames/moves for freshly downloaded Rule34 clips.
 
 The tool is intentionally two-step:
 
 1. `preview` recursively scans one source folder and writes an editable CSV plan plus a Markdown summary.
 
-2. `apply` reads the reviewed CSV and moves only approved rows.
+2. `apply` reads the reviewed CSV and moves only approved rows, except `content_review` safety holds.
 
-It does not talk to Stash. After files are moved, rescan/import in Stash separately.
+The core Preview -> Apply workflow is local and file-based. The GUI also includes an optional Stash Import Preview surface for Known Values Manager cleanup: Stash queries are read-only, no Stash data is mutated, and imported values are only staged in the local manager until you explicitly save local config changes.
+
+The complete product, naming, variant-policy, and safety baseline is documented in
+[`docs/ORGANIZER_DESIGN_BASELINE.md`](docs/ORGANIZER_DESIGN_BASELINE.md).
 
 ## Requirements
 
@@ -25,10 +28,10 @@ Never put keys (xAI/Grok) in `r34_config.json`. Instead use:
 - `r34_xai_key.txt` placed next to your config file.
 The file is listed in `.gitignore` and is never included in source or built releases.
 
-Default destination root:
+For a new install, copy `r34_config.example.json` to `r34_config.json`, then edit `destination_root` to point at your curated library folder. For example:
 
 ```text
-E:\James' Stuff\Rule34
+D:\Media\Rule34
 ```
 
 ## Usage
@@ -72,7 +75,7 @@ Preview a fresh download folder:
 python r34_organizer.py preview --source "C:\path\to\fresh batch"
 ```
 
-During preview, the script samples the existing destination library at `E:\James' Stuff\Rule34` and mimics its established filename structure. When a strong character match is found, the target pattern is:
+During preview, the script samples the configured `destination_root` library and mimics its established filename structure. When a strong character match is found, the target pattern is:
 
 ```text
 Artist - Canonical Character - Clean Descriptive Title [Resolution].mp4
@@ -92,9 +95,9 @@ Date-prefixed artist batches such as `Nodu 2023` are handled as source-artist fo
 
 Collection source folders are also handled as artist context. For example, `Lazy Procrastinator Collection\2B - Cowgirl.mp4` previews as `Lazy Procrastinator - 2B - Cowgirl [1080P].mp4`, and nested generic folders such as `SageOfOsiris collection\Animations\...` use the parent collection name as the artist. Known artist prefixes still win, so `Pantsushi - ...` remains `Pantsushi`.
 
-Content-review terms in `r34_config.json` hold configured non-vanilla/fetish keywords out of the main library. Preview marks matching rows as `content_review`, and apply moves them to `_r34_content_review\<run-id>` under the source root for manual review.
+Content-review terms in `r34_config.json` hold configured non-vanilla/fetish keywords out of the main library. Preview marks matching rows as `content_review`, and apply moves them to `_r34_content_review\<run-id>` under the source root for manual review even when `approved=no`.
 
-Silent animations (files with no audio stream) are automatically detected via ffprobe during preview and can be routed to a separate folder (configurable via `silent_animations_folder_name`, default `_r34_silent`) on apply. This is useful for separating silent loops from voiced content in large collections.
+Silent animations (files with no audio stream) are automatically detected via ffprobe during preview and can be routed to a separate folder (configurable via `silent_animations_folder_name`, default `_r34_silent`) on apply after you approve the row. This is useful for separating silent loops from voiced content in large collections.
 
 Known compact title tokens can be expanded through `title_token_replacements` in `r34_config.json`, such as `bonusmotion` -> `Bonus Motion` and `kitchenmissionary` -> `Kitchen Missionary`.
 
@@ -105,7 +108,7 @@ r34_preview_YYYYMMDD-HHMMSS.csv
 r34_preview_YYYYMMDD-HHMMSS.md
 ```
 
-Review/edit the CSV. Rows with `approved` set to `yes`/`true`/`1` and a non-blocked `status` move to the library. Rows with `status=content_review` move to the source-root content review folder.
+Review/edit the CSV. Rows with `approved` set to `yes`/`true`/`1` and a non-blocked `status` move to the library. Approved rows with `status=silent` or `status=review` move to their source-root holding folders instead. Rows with `status=content_review` move to the source-root content review folder as an automatic safety hold.
 
 Apply the reviewed CSV:
 
@@ -141,7 +144,10 @@ python r34_organizer.py apply --plan "C:\path\to\r34_preview_YYYYMMDD-HHMMSS.csv
 - Normalizes all generated bracketed resolution tags to uppercase house style; 1440-tier files are labeled `[4K]`.
 - Can create missing destination folders when `allow_create_destination_folders` is `true`; only folders named by explicit config mappings are eligible.
 - Unapproved rows stay in place by default.
+- `content_review` rows are the exception: they are always moved to the source-root content review hold folder so flagged content does not enter the library by accident.
+- `silent` and `review` rows require approval before they are moved to their source-root hold folders.
 - Approved rows with destination conflicts are moved to `_r34_review/<run-id>` inside the source folder.
+- Apply rejects any approved `target_path` that resolves outside the configured destination root.
 - Apply writes `r34_apply_<run-id>.csv` with one result per row.
 
 ## Apply-Driven Learning (Reversible)
@@ -159,13 +165,17 @@ This gives you the requested behavior: Apply teaches the system; Undo can roll i
 Run tests:
 
 ```powershell
-python -m unittest discover -s tests
+python -m unittest tests.test_r34_organizer
 ```
 
-Run syntax check:
+Run the same local checks used by CI:
 
 ```powershell
-python -m py_compile r34_organizer.py
+python -m json.tool r34_config.json
+python -m json.tool r34_config.example.json
+python -m py_compile r34_organizer.py r34_gui.py
+python -m unittest tests.test_r34_organizer
+git diff --check
 ```
 
 ## GUI (Windows)
@@ -184,8 +194,19 @@ The GUI lets you:
 - Automatically offers to open the generated CSV + MD after preview
 - Select a reviewed CSV
 - Run Apply (live output + opens the apply log)
+- Open the Known Values Manager, including optional read-only Stash import preview tools
 
 All operations invoke the exact same `r34_organizer.py` CLI commands used by the existing PowerShell/.cmd launchers.
+
+### Optional Stash Import Preview
+
+The GUI can query a Stash GraphQL endpoint to preview performers, groups, and tags that may be useful for the local Known Values Manager. This integration is intentionally conservative:
+
+- Stash access is read-only.
+- No Stash scenes, tags, performers, groups, or metadata are created or modified.
+- Imported values are staged only in the local Known Values Manager.
+- Local config changes are written only when you click **Save Changes**, using the manager's normal backup-first save path.
+- The offline sample loader can be used to inspect the workflow without connecting to Stash.
 
 ### Building a Portable GUI (PyInstaller)
 
@@ -214,4 +235,10 @@ Every button has a detailed hover tooltip (pause the mouse cursor over any butto
 ### Requirements for the GUI
 
 - Same as the CLI (Python 3.10+, ffprobe on PATH)
-- The GUI itself has no extra runtime dependencies beyond the standard library (Tkinter is included with Python on Windows).
+- Core CLI/GUI (without AI features): no extra Python runtime packages (stdlib + ffprobe).
+- Grok/xAI assistance (`use_ai_for_unknown_characters` or during inference fallbacks): requires the `requests` package.
+- Building the portable GUI (optional): `pyinstaller`.
+
+Install with `pip install -r requirements.txt` (or just `pip install requests` if you only need AI assistance and are not rebuilding the exe).
+
+**Note:** The previous statement "GUI has no extra runtime dependencies" applies only to core operation without Grok. When AI assistance is enabled, `requests` is required.

@@ -13,6 +13,7 @@ to the existing .ps1 / .cmd launchers.
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,58 @@ try:
     import r34_organizer as org
 except ImportError:
     org = None  # Will handle gracefully in the correction tool
+
+
+SOURCE_COLLECTION_DATE_FALLBACK_RE = r"(?:19|20)\d{2}(?:[-_. ]\d{1,2}(?:[-_. ]\d{1,2})?)?"
+SOURCE_COLLECTION_RANGE_FALLBACK_RE = (
+    rf"(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE})"
+    rf"(?:[-_. ]*(?:to|through|thru|until|up[-_. ]*to)[-_. ]*(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE}))?"
+)
+SOURCE_ARTIST_SUFFIX_FALLBACK_RE = re.compile(
+    rf"(?i)[\s_.-]+(?:artist[\s_.-]+)?"
+    rf"(?:collection|clips?|videos?|animations?|animation|packs?|batches|archives?|uploads?|downloads?)"
+    rf"(?:[\s_.-]+(?:(?:from[\s_.-]+)?(?:{SOURCE_COLLECTION_RANGE_FALLBACK_RE})|"
+    rf"(?:to|through|thru|until|up[-_. ]*to)[\s_.-]+(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE})))?\s*$"
+)
+COLLECTION_EXPORT_PREFIX_RE = re.compile(
+    rf"(?i)^(?P<artist>.+?[\s_.-]+(?:artist[\s_.-]+)?"
+    rf"(?:collection|clips?|videos?|animations?|animation|packs?|batches|archives?|uploads?|downloads?)"
+    rf"(?:[\s_.-]+(?:(?:from[\s_.-]+)?(?:{SOURCE_COLLECTION_RANGE_FALLBACK_RE})|"
+    rf"(?:to|through|thru|until|up[-_. ]*to)[\s_.-]+(?:{SOURCE_COLLECTION_DATE_FALLBACK_RE}))))"
+    rf"\s*-\s*(?P<rest>.+)$"
+)
+
+
+def normalize_output_artist(artist: str) -> str:
+    value = str(artist or "").strip(" -_.")
+    if not value:
+        return ""
+    if org is not None and hasattr(org, "strip_source_artist_suffix"):
+        stripped = org.strip_source_artist_suffix(value)
+        if stripped:
+            return stripped
+    return SOURCE_ARTIST_SUFFIX_FALLBACK_RE.sub("", value).strip(" -_.") or value
+
+
+def normalize_collection_export_filename_prefix(filename: str) -> str:
+    value = str(filename or "").strip()
+    match = COLLECTION_EXPORT_PREFIX_RE.match(value)
+    if not match:
+        return value
+    artist = normalize_output_artist(match.group("artist"))
+    rest = match.group("rest").strip()
+    return f"{artist} - {rest}" if artist and rest else value
+
+
+def build_correction_target_path(dest_root: str, target_folder: str, target_filename: str) -> Path:
+    if org is not None and hasattr(org, "build_target_path"):
+        return org.build_target_path(Path(dest_root), target_folder, target_filename)
+    target = Path(dest_root)
+    for part in re.split(r"[\\/]+", str(target_folder or "")):
+        clean = part.strip(" .\t\r\n")
+        if clean:
+            target = target / clean
+    return target / target_filename
 
 
 def get_known_values(config_path: Optional[Path] = None, dest_root_override: Optional[Path] = None) -> dict:
@@ -83,21 +136,34 @@ def parse_target_filename_parts(fname: str) -> Dict[str, Optional[str]]:
     if not fname:
         return {"artist": None, "character": None, "title": None, "res": None, "ext": None, "sex_descriptor": None}
     # normalize common
-    fname = fname.strip()
+    fname = normalize_collection_export_filename_prefix(fname)
     m = re.match(r"^(?P<artist>.*?)\s*-\s*(?P<char>.*?)\s*-\s*(?P<title>.*?)\s*(?P<res>\[[^\]]+\])?(?P<ext>\.[^.]+)?$", fname)
+    sex_words = r"(?i)\b(Nude|BJ|Blowjob|Doggy|Cowgirl|Missionary|Anal|Creampie|Facial|69|Spoon|Prone|Standing|Doggystyle|Reverse.?Cowgirl)\b"
     if not m:
-        parts = [p.strip() for p in re.split(r"\s*-\s*", fname)]
-        artist = parts[0] if parts else None
-        char = parts[1] if len(parts)>1 else None
-        rest = " - ".join(parts[2:]) if len(parts)>2 else (parts[-1] if parts else "")
+        parts = [p.strip() for p in re.split(r"\s*-\s*", fname) if p.strip()]
+        if len(parts) >= 3:
+            artist = parts[0]
+            char = parts[1]
+            rest = " - ".join(parts[2:])
+        elif len(parts) == 2:
+            # Artist - Title [RES].ext is common when artist and character would
+            # duplicate. Do not treat the title/resolution chunk as a character.
+            artist = parts[0]
+            char = None
+            rest = parts[1]
+        else:
+            artist = None
+            char = None
+            rest = parts[0] if parts else ""
         rm = re.search(r"(\[[^\]]+\])(\.[^.]+)?$", rest)
         title = rest[:rm.start()].strip() if rm else rest
         res = rm.group(1) if rm else None
         ext = rm.group(2) if rm and rm.group(2) else ".mp4"
-        return {"artist": artist, "character": char, "title": title, "res": res, "ext": ext, "sex_descriptor": None}
+        sm = re.search(sex_words, title)
+        sex = sm.group(0) if sm else None
+        return {"artist": artist, "character": char, "title": title, "res": res, "ext": ext, "sex_descriptor": sex}
     d = m.groupdict()
     title = (d.get("title") or "").strip()
-    sex_words = r"(?i)\b(Nude|BJ|Blowjob|Doggy|Cowgirl|Missionary|Anal|Creampie|Facial|69|Spoon|Prone|Standing|Doggystyle|Reverse.?Cowgirl)\b"
     sm = re.search(sex_words, title)
     sex = sm.group(0) if sm else None
     return {
@@ -120,6 +186,141 @@ def choose_number_insertion_point(parts: Dict[str, Optional[str]], proposed_base
         return "before_res"
     return "ambiguous"
 
+def _format_target_filename_parts(artist: str, character: str, title: str, res: str, ext: str) -> str:
+    artist = normalize_output_artist(artist)
+    stem = " - ".join(p.strip() for p in (artist, character, title) if p and p.strip())
+    return f"{stem} {res}{ext}".strip()
+
+def apply_known_value_to_filename(category: str, value: str, current: str) -> str:
+    """Return a conservative edit-field preview after choosing a known value.
+
+    This replaces the parsed filename slot instead of blindly prefixing/appending,
+    which prevents names like "Aerith - Aerith - Cowgirl" or repeated full
+    filename fragments during correction-tool quick picks.
+    """
+    value = (value or "").strip()
+    current = (current or "").strip()
+    if not value:
+        return current
+    if not current:
+        if category == "artist":
+            return f"{value} - "
+        if category == "character":
+            return f"{value} - "
+        if category == "resolution":
+            return f"Title [{value}]"
+        return current
+
+    parts = parse_target_filename_parts(current)
+    artist = parts.get("artist") or ""
+    character = parts.get("character") or ""
+    title = parts.get("title") or ""
+    res = parts.get("res") or ""
+    ext = parts.get("ext") or ".mp4"
+
+    def _norm(text: str) -> str:
+        if org is not None and hasattr(org, "normalize"):
+            return org.normalize(text)
+        return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+    if category == "artist":
+        artist = value
+    elif category == "character":
+        # If the chosen character is already the artist and there is no separate
+        # character slot, keep the compact Artist - Title form.
+        if not character and _norm(value) == _norm(artist):
+            return _format_target_filename_parts(artist, "", title, res, ext)
+        character = value
+    elif category == "resolution":
+        res = f"[{value.strip('[]')}]"
+
+    return _format_target_filename_parts(artist, character, title, res, ext)
+
+
+def apply_filename_component_to_filename(category: str, value: str, current: str) -> str:
+    """Replace one parsed filename component while preserving every other component."""
+    category = (category or "").strip().lower()
+    value = (value or "").strip()
+    current = (current or "").strip()
+    if category in {"artist", "character", "resolution"} and value:
+        return apply_known_value_to_filename(category, value, current)
+    if not current:
+        return current
+
+    parts = parse_target_filename_parts(current)
+    artist = parts.get("artist") or ""
+    character = parts.get("character") or ""
+    title = parts.get("title") or ""
+    res = parts.get("res") or ""
+    ext = parts.get("ext") or ".mp4"
+    if category == "artist":
+        artist = value
+    elif category == "character":
+        character = value
+    elif category == "title":
+        title = value
+    elif category == "resolution":
+        res = f"[{value.strip('[]')}]" if value else ""
+    else:
+        return current
+    return _format_target_filename_parts(artist, character, title, res, ext)
+
+
+def infer_filename_component_edit(original: str, edited: str):
+    """Return (component, value) when exactly one structured filename part changed."""
+    if not original or not edited:
+        return None
+    before = parse_target_filename_parts(original)
+    after = parse_target_filename_parts(edited)
+    if (before.get("ext") or ".mp4").lower() != (after.get("ext") or ".mp4").lower():
+        return None
+
+    fields = (
+        ("artist", "artist"),
+        ("character", "character"),
+        ("title", "title"),
+        ("res", "resolution"),
+    )
+    changed = []
+    for part_key, category in fields:
+        old_value = (before.get(part_key) or "").strip()
+        new_value = (after.get(part_key) or "").strip()
+        if old_value != new_value:
+            changed.append((category, new_value.strip("[]") if category == "resolution" else new_value))
+    return changed[0] if len(changed) == 1 else None
+
+def append_character_to_filename(value: str, current: str) -> str:
+    """Append a character to the parsed character slot using comma separation.
+
+    Used by the correction tool quick-pick flow for multi-character files.
+    It preserves the existing artist/title/resolution structure and avoids
+    adding the same character twice.
+    """
+    value = (value or "").strip()
+    current = (current or "").strip()
+    if not value:
+        return current
+    if not current:
+        return f"{value} - "
+
+    parts = parse_target_filename_parts(current)
+    artist = parts.get("artist") or ""
+    character = parts.get("character") or ""
+    title = parts.get("title") or ""
+    res = parts.get("res") or ""
+    ext = parts.get("ext") or ".mp4"
+
+    def _norm(text: str) -> str:
+        if org is not None and hasattr(org, "normalize"):
+            return org.normalize(text)
+        return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+    existing = [c.strip() for c in re.split(r"\s*,\s*", character) if c.strip()]
+    if _norm(value) not in {_norm(c) for c in existing}:
+        existing.append(value)
+    character = ", ".join(existing)
+    return _format_target_filename_parts(artist, character, title, res, ext)
+
 def build_numbered_filename_variants(base_fname: str, num_variants: int, insertion_point: str, existing_to_avoid: Set[str]) -> List[str]:
     parts = parse_target_filename_parts(base_fname)
     res = parts.get("res") or ""
@@ -133,10 +334,10 @@ def build_numbered_filename_variants(base_fname: str, num_variants: int, inserti
         if insertion_point == "after_sex" and sex:
             titled = parts.get("title") or ""
             new_title = re.sub(r"(?i)\b" + re.escape(sex) + r"\b", f"{sex} {n}", titled, count=1)
-            newf = f"{parts.get('artist','')} - {char or ''} - {new_title} {res}{ext}".strip()
+            newf = _format_target_filename_parts(parts.get("artist") or "", char or "", new_title, res, ext)
         elif insertion_point == "after_character" and char:
             t = (parts.get('title','') or '').strip()
-            newf = f"{parts.get('artist','')} - {char} {n} - {t} {res}{ext}".strip()
+            newf = _format_target_filename_parts(parts.get("artist") or "", f"{char} {n}", t, res, ext)
         else:
             # fallback before res
             pre = base_fname[:base_fname.rfind(res)] if res in base_fname else base_fname[: -len(ext) if ext else None]
@@ -152,9 +353,9 @@ def build_numbered_filename_variants(base_fname: str, num_variants: int, inserti
             if insertion_point == "after_sex" and sex:
                 titled = parts.get("title") or ""
                 new_title = re.sub(r"(?i)\b" + re.escape(sex) + r"\b", f"{sex} {n+k}", titled, count=1)
-                cand = f"{parts.get('artist','')} - {char or ''} - {new_title} {res}{ext}".strip()
+                cand = _format_target_filename_parts(parts.get("artist") or "", char or "", new_title, res, ext)
             elif insertion_point == "after_character" and char:
-                cand = f"{parts.get('artist','')} - {char} {n+k} - {parts.get('title','')} {res}{ext}".strip()
+                cand = _format_target_filename_parts(parts.get("artist") or "", f"{char} {n+k}", parts.get("title") or "", res, ext)
             else:
                 p = Path(base_fname)
                 cand = f"{p.stem} {n+k}{p.suffix}"
@@ -177,6 +378,62 @@ def detect_selected_duplicate_targets(selected_rows: List[Dict[str, str]], propo
         "collisions_with_non_selected": collisions_with_others,
         "selected_count": len(selected_rows),
     }
+
+def filter_known_values(values: List[str], query: str, limit: int = 200) -> List[str]:
+    """Case-insensitive contains filter for correction-tool quick-pick comboboxes."""
+    q = (query or "").strip().lower()
+    source = [str(v) for v in (values or []) if str(v).strip()]
+    if not q:
+        return source[:limit]
+    starts = [v for v in source if v.lower().startswith(q)]
+    contains = [v for v in source if q in v.lower() and v not in starts]
+    return (starts + contains)[:limit]
+
+def add_quick_pick_known_value(known: dict, category: str, value: str) -> bool:
+    """Add a value to an in-memory correction quick-pick category."""
+    key = {
+        "artist": "artists",
+        "franchise": "franchises",
+        "character": "characters",
+        "resolution": "resolutions",
+    }.get(category)
+    value = (value or "").strip()
+    if not key or not value:
+        return False
+    items = list((known or {}).get(key, []))
+    if any(str(v).strip().lower() == value.lower() for v in items):
+        return False
+    items.append(value)
+    known[key] = sorted(items, key=lambda x: str(x).lower())
+    return True
+
+def remove_quick_pick_known_value(known: dict, category: str, value: str) -> bool:
+    """Remove a value from an in-memory correction quick-pick category."""
+    key = {
+        "artist": "artists",
+        "franchise": "franchises",
+        "character": "characters",
+        "resolution": "resolutions",
+    }.get(category)
+    value = (value or "").strip()
+    if not key or not value:
+        return False
+    items = list((known or {}).get(key, []))
+    kept = [v for v in items if str(v).strip().lower() != value.lower()]
+    if len(kept) == len(items):
+        return False
+    known[key] = kept
+    return True
+
+
+def unique_backup_path(path: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    candidate = path.with_name(f"{path.stem}.backup.{ts}{path.suffix}")
+    counter = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.backup.{ts}-{counter}{path.suffix}")
+        counter += 1
+    return candidate
 
 
 def apply_known_values_edits_to_config(
@@ -211,8 +468,7 @@ def apply_known_values_edits_to_config(
     if not cpath.exists():
         return None
     try:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        backup = cpath.with_name(f"{cpath.stem}.backup.{ts}.json")
+        backup = unique_backup_path(cpath)
         shutil.copy2(str(cpath), str(backup))  # timestamped backup BEFORE any write (hard requirement)
 
         with open(cpath, "r", encoding="utf-8") as fh:
@@ -253,6 +509,19 @@ def apply_known_values_edits_to_config(
     except Exception:
         # Surface to caller (manager shows error dialog); any backup created before failure is left on disk.
         raise
+
+
+def apply_variant_policy_edits_to_config(config_path: Path, variant_policy: dict) -> Optional[Path]:
+    """Backup-first, explicit save for the independently managed variant policy."""
+    if config_path is None or not Path(config_path).exists():
+        return None
+    cpath = Path(config_path)
+    backup = unique_backup_path(cpath)
+    shutil.copy2(str(cpath), str(backup))
+    raw = json.loads(cpath.read_text(encoding="utf-8-sig"))
+    raw["variant_policy"] = json.loads(json.dumps(variant_policy or {}))
+    cpath.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    return backup
 
 
 def resolve_learned_mappings_path(config_path: Path, cfg: Optional["org.Config"] = None) -> Path:
@@ -299,8 +568,7 @@ def apply_learned_mappings_edits(learned_path: Path, edits: Optional[dict] = Non
     try:
         backup = None
         if p.exists():
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            backup = p.with_name(f"{p.stem}.backup.{ts}.json")
+            backup = unique_backup_path(p)
             shutil.copy2(str(p), str(backup))  # collision-proof backup BEFORE any write
 
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -687,6 +955,21 @@ def normalize_stash_name(name: str) -> str:
     return s.lower().replace(" ", "")
 
 
+def compact_normalize(name: str) -> str:
+    """Compact normalized key for duplicate detection (preflight audit).
+
+    Removes spaces, punctuation, apostrophes, parentheses, underscores, hyphens, lowercases.
+    E.g. 'Aries Possession', 'AriesPossession', 'Aries_Possession', "Aries' Possession"
+    all become 'ariespossession' so we can flag as possible_duplicate (never auto-merge).
+    """
+    if not name:
+        return ""
+    s = str(name).lower()
+    # remove whitespace + common punct/separators (incl ' _ - ( ) . ! etc)
+    s = re.sub(r"[\s\.\-\_\(\)\[\]\{\}'\"!@#$%^&*+=:;/?\\|<>,`~]+", "", s)
+    return s
+
+
 def query_stash_readonly(graphql_url: str, api_key: Optional[str] = None, timeout: int = 10) -> dict:
     """Perform read-only GraphQL queries against a Stash instance.
 
@@ -971,11 +1254,18 @@ def get_sample_stash_data() -> dict:
             "New Performer Two",
             "bulging senpai",
             "Some Artist",
+            "Hentai",  # preflight: generic performer name should be review-only, not artist
         ],
         "groups": [
             "New Franchise Group",
             "Baldur's Gate 3",
             "Another Group",
+            "Compilation",  # preflight: should be review-only
+            "Hentai",       # preflight
+            "Yuffie x Cloud",
+            "Aries Possession",
+            "AriesPossession",  # compact dup of above
+            "Jewelz Blu, Nicole Doshi",
         ],
         "tags": [
             "2b",
@@ -986,6 +1276,7 @@ def get_sample_stash_data() -> dict:
             "ArtistTagUnderArtists",
             "FranchiseTag",
             "AmbiguousMixed",
+            "Characters",  # preflight: category tag -> review, not canonical
         ],
         "errors": [],
         "meta": {
@@ -999,9 +1290,9 @@ def get_sample_stash_data() -> dict:
             "tags": "success (sample)",
         },
         "response_counts": {
-            "performers": 5,
-            "groups": 3,
-            "tags": 8,
+            "performers": 6,
+            "groups": 9,
+            "tags": 9,
         },
         # Phase 4b.6 rich data for classification (used by build and tests)
         "performer_data": [
@@ -1010,11 +1301,18 @@ def get_sample_stash_data() -> dict:
             {"id": "p3", "name": "New Performer Two", "alias_list": []},
             {"id": "p4", "name": "bulging senpai", "alias_list": []},
             {"id": "p5", "name": "Some Artist", "alias_list": []},
+            {"id": "p6", "name": "Hentai", "alias_list": []},  # preflight: generic performer name -> review-only
         ],
         "group_data": [
             {"id": "g1", "name": "New Franchise Group", "aliases": []},
             {"id": "g2", "name": "Baldur's Gate 3", "aliases": []},
             {"id": "g3", "name": "Another Group", "aliases": []},
+            {"id": "g4", "name": "Compilation", "aliases": []},
+            {"id": "g5", "name": "Hentai", "aliases": []},
+            {"id": "g6", "name": "Yuffie x Cloud", "aliases": []},
+            {"id": "g7", "name": "Aries Possession", "aliases": []},
+            {"id": "g8", "name": "AriesPossession", "aliases": []},
+            {"id": "g9", "name": "Jewelz Blu, Nicole Doshi", "aliases": []},
         ],
         "tag_data": [
             {"id": "t1", "name": "2b", "aliases": ["2B"], "parents": [{"id": "pc", "name": "Characters"}], "children": []},
@@ -1024,8 +1322,46 @@ def get_sample_stash_data() -> dict:
             {"id": "t5", "name": "ArtistTagUnderArtists", "aliases": [], "parents": [{"name": "Artists"}], "children": []},  # artist_candidate
             {"id": "t6", "name": "FranchiseTag", "aliases": [], "parents": [{"name": "Franchises"}], "children": []},  # franchise
             {"id": "t7", "name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []},  # ambiguous
+            {"id": "t8", "name": "Characters", "aliases": [], "parents": [{"name": "Characters"}], "children": []},  # preflight: category -> review
         ],
     }
+
+
+# Phase 4c-preflight classification audit patch (no bulk import, no writes, no Stash mutations):
+# Configurable (module-level for now) review-only denylist/patterns to prevent false-positive
+# artist/character/franchise suggestions for obvious non-artists, multis, titles, category tags.
+REVIEW_ONLY_DENYLIST = {"compilation", "compilations", "cleavage", "discipline", "lubed", "saveass", "slayed", "hentai"}
+REVIEW_ONLY_TITLE_PATTERNS = ["itadaki", "kakushi dere", "kano", "sweet home", "seieki"]
+REVIEW_ONLY_MAIDEN_PATTERNS = ["bonus maiden", "maiden "]
+REVIEW_ONLY_MODEL_PATTERNS = ["tetra (", "skx'_", "skx_"]
+
+
+def _get_review_only_reason(name: str, aliases: list = None) -> str:
+    """Return non-empty reason if name/alias matches review-only denylist/patterns.
+    Catches: bad group names (Compilation etc), comma multis, x-pairings, maiden/model titles,
+    'Characters' category tag. Used to force ignored_or_review pre-override in build.
+    """
+    if not name:
+        return ""
+    n = str(name).lower().strip()
+    al = [str(a).lower().strip() for a in (aliases or [])]
+    candidates = [n] + al
+    for c in candidates:
+        if c in REVIEW_ONLY_DENYLIST:
+            return f"review-only denylist match: {c}"
+        if "," in c and len(c.split(",")) >= 2:
+            return "comma-separated multi-person entry (review or split candidate)"
+        if re.search(r"\b x \b", c) or re.search(r"\bx\b", c):
+            return "x-pairing / collab entry like 'Yuffie x Cloud' (review-only)"
+        if any(p in c for p in REVIEW_ONLY_MAIDEN_PATTERNS):
+            return "generated/maiden-like entry (review-only)"
+        if any(p in c for p in REVIEW_ONLY_TITLE_PATTERNS) or ("!" in c and any(kw in c for kw in ["itadaki", "kano", "sweet"])):
+            return "title/franchise-like entry (review-only)"
+        if c in ("characters", "character"):
+            return "parent/category tag (Characters), not a character name"
+        if any(p in c for p in REVIEW_ONLY_MODEL_PATTERNS):
+            return "model/generated/title-like with parens/underscore (review-only)"
+    return ""
 
 
 def classify_stash_tag(tag_info: dict) -> tuple:
@@ -1036,6 +1372,11 @@ def classify_stash_tag(tag_info: dict) -> tuple:
     """
     if not isinstance(tag_info, dict):
         return "general_tag", "ignored_or_review", "invalid tag data"
+
+    # Preflight audit: force review-only for category tags like "Characters", bad titles etc.
+    rev = _get_review_only_reason(tag_info.get("name"), tag_info.get("aliases") or tag_info.get("alias_list"))
+    if rev:
+        return "general_tag", "ignored_or_review", rev
 
     # Collect clues from parents (and their aliases), and self name/aliases for robustness
     clues = set()
@@ -1103,6 +1444,11 @@ def classify_stash_group(group_info: dict) -> tuple:
     if not isinstance(group_info, dict):
         return "ambiguous", "ignored_or_review", "invalid group data"
 
+    # Preflight audit: check review denylist/patterns first (e.g. Compilation, Hentai, x-pair, comma, titles)
+    rev = _get_review_only_reason(group_info.get("name"), group_info.get("aliases"))
+    if rev:
+        return "ignored_or_review", "ignored_or_review", rev
+
     clues = set()
     def add_clue(n):
         if n:
@@ -1168,11 +1514,13 @@ def build_stash_import_preview(
             return norm_key in lcca_keys
         return False
 
-    # Track dups within this stash preview (per suggested section) - Phase 4b.6 add ignored
+    # Track dups within this stash preview (per suggested section) - Phase 4b.6 + preflight compact
     seen = {"artist_aliases": set(), "folder_aliases": set(), "canonical_character_aliases": set(), "ignored_or_review": set()}
+    seen_compact = {k: set() for k in seen}  # for compact dup detection (AriesPossession vs Aries Possession)
 
     def _make_item(source: str, original: str, suggested: str, note: str = "", detected_role: str = None, classification_reason: str = "", forced_status: str = None):
         nk = normalize_stash_name(original)
+        ck = compact_normalize(original)
         if not nk:
             return
         if forced_status is not None:
@@ -1181,9 +1529,10 @@ def build_stash_import_preview(
             status = "missing_local"
             if _already_exists(nk, suggested):
                 status = "already_exists_local"
-            if nk in seen.get(suggested, set()):
+            if nk in seen.get(suggested, set()) or ck in seen_compact.get(suggested, set()):
                 status = "possible_duplicate"
         seen.setdefault(suggested, set()).add(nk)
+        seen_compact.setdefault(suggested, set()).add(ck)
 
         if detected_role is None:
             if source == "stash_performer":
@@ -1197,6 +1546,7 @@ def build_stash_import_preview(
             "source": source,
             "original": original,
             "norm_key": nk,
+            "compact_key": ck,
             "suggested_section": suggested,
             "status": status,
             "note": note,
@@ -1213,6 +1563,11 @@ def build_stash_import_preview(
     for p in performer_infos:
         orig = p.get("name") or ""
         if not orig: continue
+        # Small 4c classification fix: apply review-only check to performers too (Hentai etc. as generic performer names should not become artist_aliases)
+        rev = _get_review_only_reason(orig, p.get("aliases") or p.get("alias_list"))
+        if rev:
+            _make_item("stash_performer", orig, "ignored_or_review", "", "ignored_or_review", rev, forced_status="ignored_or_review")
+            continue
         _make_item("stash_performer", orig, "artist_aliases", "", "artist_candidate", "Stash performer")
 
     # Groups: respect group_role_override (Phase 4b.6 source vs role separation)
@@ -1223,6 +1578,12 @@ def build_stash_import_preview(
     for g in group_infos:
         orig = g.get("name") or ""
         if not orig: continue
+        # Preflight audit: force review-only for denylist/pattern matches (Compilation etc) BEFORE any override
+        # so bad names never get artist_aliases even if user sets "rule34_artists".
+        rev = _get_review_only_reason(orig, g.get("aliases"))
+        if rev:
+            _make_item("stash_group", orig, "ignored_or_review", "", "ignored_or_review", rev, forced_status="ignored_or_review")
+            continue
         if group_role_override == "rule34_artists":
             role = "artist_candidate"
             sugg = "artist_aliases"
@@ -1296,8 +1657,8 @@ def export_stash_preview_report(
 ) -> str:
     """Write a timestamped Markdown report for the preview.
 
-    The report explicitly states that this is read-only, no imports applied, no writes to config/learned,
-    no Stash mutations. Never modifies r34_config.json or learned_character_franchises.json.
+    The report explicitly states that export is read-only: no imports applied, no writes to config/learned,
+    no Stash mutations. Export never modifies r34_config.json or learned_character_franchises.json.
     Returns the full path written.
     """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1308,10 +1669,11 @@ def export_stash_preview_report(
     lines = []
     lines.append(f"# Stash Import Preview Report {ts}")
     lines.append("")
-    lines.append("**THIS IS A READ-ONLY PREVIEW (Phase 4b.5)**")
+    lines.append("**THIS IS A READ-ONLY PREVIEW REPORT EXPORT**")
     lines.append("No Stash values were written to r34_config.json or learned_character_franchises.json.")
     lines.append("No GraphQL mutations were sent.")
-    lines.append("No import/apply occurred. Import behavior will be added in Phase 4c.")
+    lines.append("No import/apply occurred while exporting this report.")
+    lines.append("Report format: Phase 4b.5+ Stash preview/export.")
     lines.append("")
     lines.append(f"Generated: {datetime.now().isoformat()}")
     ep = stash_endpoint or "(no endpoint)"
@@ -1332,12 +1694,25 @@ def export_stash_preview_report(
     missing_a = [i for i in items if i.get("suggested_section") == "artist_aliases" and i.get("status") == "missing_local"]
     missing_f = [i for i in items if i.get("suggested_section") == "folder_aliases" and i.get("status") == "missing_local"]
     missing_c = [i for i in items if i.get("suggested_section") == "canonical_character_aliases" and i.get("status") == "missing_local"]
-    dups = [i for i in items if i.get("status") in ("possible_duplicate", "ambiguous")]
+    dups = [i for i in items if i.get("status") == "possible_duplicate"]  # ambig separate now
+    ambig = [i for i in items if i.get("status") == "ambiguous" or i.get("detected_tag_role") == "ambiguous"]
+    ignored = [i for i in items if i.get("suggested_section") == "ignored_or_review"]
     exists = [i for i in items if i.get("status") == "already_exists_local"]
 
     def fmt(it):
+        # Include all required: detected_role, suggested_section, source, status, classification_reason in every row
+        role = it.get("detected_tag_role", "")
+        sec = it.get("suggested_section", "")
+        src = it.get("source", "")
+        st = it.get("status", "")
+        reason = it.get("classification_reason") or it.get("note", "")
+        ck = it.get("compact_key", "")
         n = it.get("note", "")
-        return f"- {it.get('original','?')} (norm_key: {it.get('norm_key','?')}) [{it.get('source','?')}] {n}".strip()
+        base = f"- {it.get('original','?')} (norm_key: {it.get('norm_key','?')}"
+        if ck:
+            base += f", compact: {ck}"
+        base += f") [source:{src}] role:{role} -> {sec} | status:{st} | reason:{reason[:60]}"
+        return base.strip()
 
     if missing_a:
         lines.append("## Missing artist/performer candidates (would target artist_aliases)")
@@ -1356,8 +1731,18 @@ def export_stash_preview_report(
         lines.append("")
 
     if dups:
-        lines.append("## Possible duplicates or ambiguous within this preview")
+        lines.append("## Possible duplicates (compact or norm key collision within this preview; flagged not auto-merged)")
         for it in dups:
+            lines.append(fmt(it))
+        lines.append("")
+    if ambig:
+        lines.append("## Ambiguous (review-only; conflicting or unclear classification)")
+        for it in ambig:
+            lines.append(fmt(it))
+        lines.append("")
+    if ignored:
+        lines.append("## Ignored or review-only (suggested_section=ignored_or_review; denylist, multis, titles, category tags etc.)")
+        for it in ignored:
             lines.append(fmt(it))
         lines.append("")
     if exists:
@@ -1376,16 +1761,98 @@ def export_stash_preview_report(
         lines.append("")
 
     lines.append("## Important Notes")
-    lines.append("- Stash data was read-only.")
-    lines.append("- This preview did not modify any local files.")
-    lines.append("- Tags from Stash are treated as canonical_character_aliases candidates only.")
-    lines.append("  A separate franchise/folder mapping (via character_mappings) is still required for full use.")
+    lines.append("- Stash data was queried read-only.")
+    lines.append("- Exporting this report did not modify any local files.")
+    lines.append("- Tags from Stash are classified by parent/ancestor tags (artist/character/franchise/general/ambiguous). Unclassified or review-only (e.g. 'Characters' category, bad titles) go to ignored_or_review (not auto canonical_character_aliases).")
+    lines.append("  A separate franchise/folder mapping (via character_mappings) is still required for full use of character candidates.")
     lines.append("- Exporting this report does not perform any import.")
-    lines.append("- Phase 4c (when implemented) will provide controlled import/apply with previews and confirmations.")
+    lines.append("- Use reviewed 'Import Selected to Manager' in the GUI to stage selected values in memory; Save Changes is still required to persist to config.")
     lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
+
+
+def stage_stash_import_items(
+    selected_items: list,
+    artist_aliases: dict,
+    folder_aliases: dict,
+    canonical_character_aliases: dict,
+    overwrite_conflicts: bool = False,
+) -> dict:
+    """Pure (for testability + UI): given selected preview item dicts + copies of current _edit_* dicts,
+    compute staging plan and return updated dicts + detailed report.
+
+    Rules:
+    - Only artist_aliases / folder_aliases / canonical_character_aliases supported in Phase 4c.
+    - Skip ignored_or_review, ambiguous (default), already_exists_local (default).
+    - On conflict (norm_key exists in target): do not overwrite unless overwrite_conflicts=True.
+    - Returns counts, lists of added/skipped/conflicts for review dialog + result summary.
+    - Never mutates the input dicts (works on .copy()).
+    - No file I/O, no Stash calls.
+    """
+    aa = dict(artist_aliases or {})
+    fa = dict(folder_aliases or {})
+    ca = dict(canonical_character_aliases or {})
+
+    added = {"artist_aliases": [], "folder_aliases": [], "canonical_character_aliases": []}
+    skipped = {"ignored_or_review": [], "ambiguous": [], "already_exists_local": [], "unsupported_section": []}
+    conflicts = []
+
+    for it in (selected_items or []):
+        if not isinstance(it, dict):
+            continue
+        sec = it.get("suggested_section")
+        status = it.get("status", "")
+        nk = (it.get("norm_key") or "").strip()
+        orig = it.get("original") or nk
+        if not nk:
+            continue
+
+        if sec == "ignored_or_review":
+            skipped["ignored_or_review"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+        if status == "ambiguous":
+            skipped["ambiguous"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+        if status == "already_exists_local":
+            skipped["already_exists_local"].append({"norm_key": nk, "original": orig, "source": it.get("source")})
+            continue
+
+        if sec == "artist_aliases":
+            target = aa
+            key = "artist_aliases"
+        elif sec == "folder_aliases":
+            target = fa
+            key = "folder_aliases"
+        elif sec == "canonical_character_aliases":
+            target = ca
+            key = "canonical_character_aliases"
+        else:
+            skipped["unsupported_section"].append({"norm_key": nk, "original": orig, "source": it.get("source"), "section": sec})
+            continue
+
+        if nk in target:
+            conflicts.append((key, nk, orig, target[nk]))
+            if overwrite_conflicts:
+                target[nk] = orig
+                added[key].append((nk, orig))
+        else:
+            target[nk] = orig
+            added[key].append((nk, orig))
+
+    return {
+        "added": added,
+        "skipped": skipped,
+        "conflicts": conflicts,
+        "updated_artist_aliases": aa,
+        "updated_folder_aliases": fa,
+        "updated_canonical_character_aliases": ca,
+        "num_selected": len(selected_items or []),
+        "num_added": sum(len(v) for v in added.values()),
+        "num_conflicts": len(conflicts),
+        "num_skipped": sum(len(v) for v in skipped.values()),
+    }
 
 
 # ------------------------------------------------------------------
@@ -1643,6 +2110,11 @@ class OrganizerGUI:
         chk.grid(row=4, column=1, sticky="w", padx=5, pady=(2, 0))
         Tooltip(chk, "When enabled, the GUI will automatically attempt to load the xAI API key from the configured env var or r34_xai_key.txt on startup and show its status. Disable this if you prefer to never have the GUI read the key file automatically.")
 
+        self.variant_analysis_var = tk.BooleanVar(value=True)
+        variant_chk = ttk.Checkbutton(path_frame, text="Analyze collection variants", variable=self.variant_analysis_var)
+        variant_chk.grid(row=5, column=1, sticky="w", padx=5, pady=(2, 0))
+        Tooltip(variant_chk, "Compare related clips during Preview, retain clear winners, route optional variants to review, and mark equivalent lower-resolution files for reversible holding during Apply.")
+
         path_frame.columnconfigure(1, weight=1)
 
         # Action buttons
@@ -1894,6 +2366,8 @@ class OrganizerGUI:
         cmd = base_cmd + ["--config", config, "preview", "--source", source]
         if dest:
             cmd += ["--dest-root", dest]
+        if not self.variant_analysis_var.get():
+            cmd += ["--no-variant-analysis"]
 
         self._start_command(cmd, "Running preview...")
 
@@ -2123,29 +2597,50 @@ class OrganizerGUI:
         tree_frame = ttk.Frame(win)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        columns = ("check", "original", "artist", "character", "current_target", "status", "approved")
+        columns = (
+            "check",
+            "original",
+            "artist",
+            "character",
+            "franchise",
+            "current_target",
+            "output_filename",
+            "resolution",
+            "variant",
+            "decision",
+            "status",
+            "approved",
+        )
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         tree.heading("check", text="✓", anchor="center")
         tree.heading("original", text="Original Filename")
         tree.heading("artist", text="Artist")
         tree.heading("character", text="Character")
-        tree.heading("current_target", text="Current Target")
+        tree.heading("franchise", text="Franchise")
+        tree.heading("current_target", text="Target Path")
+        tree.heading("output_filename", text="Output Filename")
+        tree.heading("resolution", text="Resolution")
+        tree.heading("variant", text="Variant")
+        tree.heading("decision", text="Decision")
         tree.heading("status", text="Status")
         tree.heading("approved", text="Approved")
 
         tree.column("check", width=30, minwidth=30, stretch=False, anchor="center")
-        tree.column("original", width=300)
+        tree.column("original", width=260)
         tree.column("artist", width=120)
         tree.column("character", width=140)
-        tree.column("current_target", width=260)
+        tree.column("franchise", width=150)
+        tree.column("current_target", width=420)
+        tree.column("output_filename", width=320)
+        tree.column("resolution", width=90, anchor="center")
+        tree.column("variant", width=190)
+        tree.column("decision", width=150)
         tree.column("status", width=90)
         tree.column("approved", width=80)
 
         # Sorting (click headers)
-        tree.heading("status", command=lambda: self._sort_tree("status"))
-        tree.heading("current_target", command=lambda: self._sort_tree("current_target"))
-        tree.heading("character", command=lambda: self._sort_tree("character"))
-        tree.heading("original", command=lambda: self._sort_tree("original"))
+        for col in columns:
+            tree.heading(col, command=lambda c=col: self._sort_tree(c))
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
@@ -2156,16 +2651,7 @@ class OrganizerGUI:
         for i, row in enumerate(rows):
             if "_bulk_checked" not in row:
                 row["_bulk_checked"] = False
-            checked = "☑" if row.get("_bulk_checked") else "☐"
-            orig = row.get("original_name", "")
-            artist = row.get("artist", "")
-            char = row.get("character", "")
-            folder = row.get("target_folder", "")
-            fname = row.get("target_filename", "")
-            current_target = f"{folder}/{fname}" if folder and fname else (fname or "")
-            status = row.get("status", "")
-            approved = row.get("approved", "")
-            tree.insert("", "end", iid=str(i), values=(checked, orig, artist, char, current_target, status, approved))
+            tree.insert("", "end", iid=str(i), values=self._correction_tree_values(row))
 
         self.correction_tree = tree
         self.correction_rows = rows
@@ -2177,6 +2663,8 @@ class OrganizerGUI:
             self.correction_known = get_known_values(cpath)
         except Exception:
             self.correction_known = {"artists": [], "franchises": [], "characters": [], "resolutions": []}
+        self._quick_pick_hidden_values = getattr(self, "_quick_pick_hidden_values", {})
+        self._apply_quick_pick_hidden_values()
 
         # Edit panel
         edit_frame = ttk.LabelFrame(win, text="Correct Selected Row(s)", padding=10)
@@ -2195,9 +2683,12 @@ class OrganizerGUI:
         self.corr_notes_var = tk.StringVar()
         ttk.Entry(edit_frame, textvariable=self.corr_notes_var, width=50).grid(row=2, column=1, sticky="w")
 
+        self.corr_variant_evidence_var = tk.StringVar(value="Variant evidence: none")
+        ttk.Label(edit_frame, textvariable=self.corr_variant_evidence_var, foreground="#555555", wraplength=900).grid(row=3, column=0, columnspan=2, sticky="w", padx=5)
+
         # Buttons
         btn_frame = ttk.Frame(edit_frame)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
 
         btn_apply_corr = ttk.Button(btn_frame, text="Apply Correction to Selected Row(s)", command=self._apply_correction)
         btn_apply_corr.pack(side="left", padx=5)
@@ -2206,6 +2697,10 @@ class OrganizerGUI:
         btn_mark = ttk.Button(btn_frame, text="Mark as Approved", command=self._mark_selected_approved)
         btn_mark.pack(side="left", padx=5)
         Tooltip(btn_mark, "Sets approved='yes' on the currently selected row (identical to editing the CSV by hand). After marking, the row will be included when you run Apply Approved Plan from the main window. Use this after you have reviewed or manually corrected a difficult filename so it is no longer skipped.")
+
+        btn_unmark = ttk.Button(btn_frame, text="Mark as Unapproved", command=self._mark_selected_unapproved)
+        btn_unmark.pack(side="left", padx=5)
+        Tooltip(btn_unmark, "Sets approved='no' on the currently selected row(s). Use this when a row was approved by mistake but should stay in the review CSV instead of being applied.")
 
         btn_reset = ttk.Button(btn_frame, text="Reset Selected Row", command=self._reset_selected_row)
         btn_reset.pack(side="left", padx=5)
@@ -2222,6 +2717,14 @@ class OrganizerGUI:
         btn_approve_chk.pack(side="left", padx=5)
         Tooltip(btn_approve_chk, "Marks all rows that have a checkmark in the ✓ column as approved='yes'. Click the checkbox column (first column) to toggle individual rows. Shift/Ctrl+Click to highlight multiple rows, then right-click and choose 'Select multiple (toggle checkboxes)' to batch-toggle their checkmarks — now the highlighted rows behave like individually checked ones.")
 
+        btn_unapprove_sel = ttk.Button(bulk_frame, text="Unapprove Selected", command=self._unapprove_selected)
+        btn_unapprove_sel.pack(side="left", padx=5)
+        Tooltip(btn_unapprove_sel, "Marks all currently selected rows as approved='no' without changing their target filename, folder, or status.")
+
+        btn_unapprove_chk = ttk.Button(bulk_frame, text="Unapprove Checked", command=self._unapprove_checked)
+        btn_unapprove_chk.pack(side="left", padx=5)
+        Tooltip(btn_unapprove_chk, "Marks every checked row as approved='no'. This is useful for backing out a batch approval before saving the corrected CSV.")
+
         # Bind selection and checkbox toggle
         tree.bind("<<TreeviewSelect>>", self._on_correction_row_selected)
         tree.bind("<ButtonRelease-1>", self._on_correction_tree_click, add="+")
@@ -2231,6 +2734,11 @@ class OrganizerGUI:
         # User highlights a batch (or many), right-clicks anywhere, chooses the item
         # to batch-toggle those rows' _bulk_checked state + the visible symbol.
         context_menu = tk.Menu(tree, tearoff=0)
+        context_menu.add_command(
+            label="Show Source File in Explorer",
+            command=self._show_correction_file_in_explorer
+        )
+        context_menu.add_separator()
         context_menu.add_command(
             label="Select multiple (toggle checkboxes)",
             command=self._toggle_checkboxes_for_selected
@@ -2248,34 +2756,54 @@ class OrganizerGUI:
 
         # Artists
         ttk.Label(picks_frame, text="Artists:").grid(row=0, column=0, sticky="e", padx=3)
-        self.corr_artist_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("artists", []), width=18, state="readonly")
+        self.corr_artist_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("artists", []), width=18, state="normal")
         self.corr_artist_cb.grid(row=0, column=1, sticky="w")
+        self._bind_searchable_known_combo(self.corr_artist_cb, "artist")
         self.corr_artist_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("artist", self.corr_artist_cb.get()))
         ttk.Button(picks_frame, text="Apply Artist", command=lambda: self._apply_picked_value("artist")).grid(row=0, column=2, padx=3)
+        ttk.Button(picks_frame, text="+", width=3, command=lambda: self._add_quick_pick_value("artist")).grid(row=0, column=3, padx=(0, 1))
+        ttk.Button(picks_frame, text="-", width=3, command=lambda: self._remove_quick_pick_value("artist")).grid(row=0, column=4, padx=(0, 5))
 
         # Franchises (required Apply to rows)
-        ttk.Label(picks_frame, text="Franchises/Folders:").grid(row=0, column=3, sticky="e", padx=3)
+        ttk.Label(picks_frame, text="Franchises/Folders:").grid(row=0, column=5, sticky="e", padx=3)
         self.corr_franchise_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("franchises", []), width=18, state="readonly")
-        self.corr_franchise_cb.grid(row=0, column=4, sticky="w")
+        self.corr_franchise_cb.configure(state="normal")
+        self.corr_franchise_cb.grid(row=0, column=6, sticky="w")
+        self._bind_searchable_known_combo(self.corr_franchise_cb, "franchise")
         self.corr_franchise_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("franchise", self.corr_franchise_cb.get()))
-        ttk.Button(picks_frame, text="Apply Franchise to Rows", command=lambda: self._apply_picked_value("franchise")).grid(row=0, column=5, padx=3)
+        ttk.Button(picks_frame, text="Apply Franchise to Rows", command=lambda: self._apply_picked_value("franchise")).grid(row=0, column=7, padx=3)
+        ttk.Button(picks_frame, text="+", width=3, command=lambda: self._add_quick_pick_value("franchise")).grid(row=0, column=8, padx=(0, 1))
+        ttk.Button(picks_frame, text="-", width=3, command=lambda: self._remove_quick_pick_value("franchise")).grid(row=0, column=9, padx=(0, 5))
 
         # Characters
         ttk.Label(picks_frame, text="Characters:").grid(row=1, column=0, sticky="e", padx=3)
-        self.corr_character_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("characters", []), width=18, state="readonly")
+        self.corr_character_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("characters", []), width=18, state="normal")
         self.corr_character_cb.grid(row=1, column=1, sticky="w")
+        self._bind_searchable_known_combo(self.corr_character_cb, "character")
         self.corr_character_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("character", self.corr_character_cb.get()))
         ttk.Button(picks_frame, text="Apply Character", command=lambda: self._apply_picked_value("character")).grid(row=1, column=2, padx=3)
+        ttk.Button(picks_frame, text="Add Character", command=self._append_picked_character).grid(row=1, column=3, padx=3)
+        ttk.Button(picks_frame, text="+", width=3, command=lambda: self._add_quick_pick_value("character")).grid(row=1, column=4, padx=(0, 1))
+        ttk.Button(picks_frame, text="-", width=3, command=lambda: self._remove_quick_pick_value("character")).grid(row=1, column=5, padx=(0, 5))
 
         # Resolutions
-        ttk.Label(picks_frame, text="Resolutions:").grid(row=1, column=3, sticky="e", padx=3)
-        self.corr_resolution_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("resolutions", []), width=18, state="readonly")
-        self.corr_resolution_cb.grid(row=1, column=4, sticky="w")
+        ttk.Label(picks_frame, text="Resolutions:").grid(row=1, column=6, sticky="e", padx=3)
+        self.corr_resolution_cb = ttk.Combobox(picks_frame, values=self.correction_known.get("resolutions", []), width=18, state="normal")
+        self.corr_resolution_cb.grid(row=1, column=7, sticky="w")
+        self._bind_searchable_known_combo(self.corr_resolution_cb, "resolution")
         self.corr_resolution_cb.bind("<<ComboboxSelected>>", lambda e: self._on_known_pick("resolution", self.corr_resolution_cb.get()))
-        ttk.Button(picks_frame, text="Apply Resolution", command=lambda: self._apply_picked_value("resolution")).grid(row=1, column=5, padx=3)
+        ttk.Button(picks_frame, text="Apply Resolution", command=lambda: self._apply_picked_value("resolution")).grid(row=1, column=8, padx=3)
+        ttk.Button(picks_frame, text="+", width=3, command=lambda: self._add_quick_pick_value("resolution")).grid(row=1, column=9, padx=(0, 1))
+        ttk.Button(picks_frame, text="-", width=3, command=lambda: self._remove_quick_pick_value("resolution")).grid(row=1, column=10, padx=(0, 5))
 
-        ttk.Button(picks_frame, text="Refresh Lists", command=self._refresh_known_lists).grid(row=0, column=6, rowspan=2, padx=6)
-        ttk.Button(picks_frame, text="Manage Known Values...", command=self._open_known_values_manager).grid(row=0, column=7, rowspan=2, padx=3)  # stub for P3
+        ttk.Button(picks_frame, text="Refresh Lists", command=self._refresh_known_lists).grid(row=0, column=11, rowspan=2, padx=6)
+        ttk.Button(picks_frame, text="Manage Known Values...", command=self._open_known_values_manager).grid(row=0, column=12, rowspan=2, padx=3)  # stub for P3
+        ttk.Label(picks_frame, text="Type to search. Apply Character replaces; Add Character appends for multi-character files. Use + to add typed value; - hides/removes selected value.").grid(row=2, column=0, columnspan=13, sticky="w", pady=(4, 0))
+
+        log_frame = ttk.LabelFrame(win, text="Correction Change Log", padding=6)
+        log_frame.pack(fill="both", expand=False, padx=10, pady=(0, 8))
+        self.correction_change_log = scrolledtext.ScrolledText(log_frame, height=6, wrap="word", state="disabled")
+        self.correction_change_log.pack(fill="both", expand=True)
 
         # Bottom bar
         bottom = ttk.Frame(win, padding=8)
@@ -2287,24 +2815,65 @@ class OrganizerGUI:
 
         self.correction_window = win
 
+    def _correction_row_label(self, row: dict) -> str:
+        return row.get("original_name") or row.get("target_filename") or "(unnamed row)"
+
+    def _log_correction_change(self, message: str):
+        widget = getattr(self, "correction_change_log", None)
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        if widget:
+            try:
+                widget.configure(state="normal")
+                widget.insert("end", line + "\n")
+                widget.see("end")
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+
+    def _log_row_changes(self, row: dict, action: str, before: dict):
+        labels = {
+            "target_folder": "folder",
+            "target_filename": "filename",
+            "character": "character",
+            "status": "status",
+            "approved": "approved",
+        }
+        changes = []
+        for key, label in labels.items():
+            old = before.get(key, "") or ""
+            new = row.get(key, "") or ""
+            if old != new:
+                changes.append(f"{label}: {old or '(blank)'} -> {new or '(blank)'}")
+        if changes:
+            self._log_correction_change(f"{action} | {self._correction_row_label(row)} | " + "; ".join(changes))
+
+    def _set_row_approved(self, row: dict, approved: str, iid: str = None, tree=None, promote_ready: bool = False):
+        """Internal: update a row's approved flag and refresh the visible table."""
+        before = {key: row.get(key, "") for key in ("target_folder", "target_filename", "character", "status", "approved")}
+        approved_value = "yes" if str(approved or "").strip().lower() in ("yes", "y", "true", "1") else "no"
+        row["approved"] = approved_value
+        if iid and tree:
+            try:
+                tree.set(iid, "approved", approved_value)
+            except Exception:
+                pass
+        if promote_ready and approved_value == "yes":
+            cur = (row.get("status") or "").strip().lower()
+            if cur in ("unmatched", "duplicate", "blocked", "invalid", "") or cur == "needs review":
+                row["status"] = "ready"
+                if iid and tree:
+                    try:
+                        tree.set(iid, "status", "ready")
+                    except Exception:
+                        pass
+        if hasattr(self, "_log_row_changes"):
+            self._log_row_changes(row, "Approval", before)
+
     def _approve_row(self, row: dict, iid: str = None, tree=None):
         """Internal: mark a row approved and, for fixable statuses (e.g. unmatched after correction),
         also flip status to 'ready' so it will be applied (instead of treated as blocked).
         """
-        row["approved"] = "yes"
-        if iid and tree:
-            try:
-                tree.set(iid, "approved", "yes")
-            except Exception:
-                pass
-        cur = (row.get("status") or "").strip().lower()
-        if cur in ("unmatched", "duplicate", "blocked", "invalid", "") or cur == "needs review":
-            row["status"] = "ready"
-            if iid and tree:
-                try:
-                    tree.set(iid, "status", "ready")
-                except Exception:
-                    pass
+        self._set_row_approved(row, "yes", iid, tree, promote_ready=True)
 
     def _on_correction_row_selected(self, event=None):
         """Load the first selected row into the edit fields as a template.
@@ -2329,6 +2898,9 @@ class OrganizerGUI:
         self.corr_folder_var.set(row.get("target_folder", ""))
         self.corr_filename_var.set(row.get("target_filename", ""))
         self.corr_notes_var.set(row.get("notes", ""))
+        evidence = row.get("variant_reason", "") or "none"
+        family = row.get("variant_family", "") or "standalone"
+        self.corr_variant_evidence_var.set(f"Variant family: {family} | {evidence}")
 
     def _on_correction_tree_click(self, event):
         """Handle click on checkbox column to toggle bulk selection."""
@@ -2365,6 +2937,7 @@ class OrganizerGUI:
         if not tree or not hasattr(self, "correction_context_menu"):
             return
         item = tree.identify_row(event.y)
+        self._correction_context_iid = item or None
         if item:
             # Preserve an existing multi-selection if the user right-clicks inside it.
             # Only change selection if the clicked row is outside the current set.
@@ -2378,6 +2951,66 @@ class OrganizerGUI:
             self.correction_context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.correction_context_menu.grab_release()
+
+    def _correction_context_row(self):
+        tree = getattr(self, "correction_tree", None)
+        rows = getattr(self, "correction_rows", [])
+        iid = getattr(self, "_correction_context_iid", None)
+        if not iid and tree:
+            selection = tree.selection()
+            iid = selection[0] if selection else None
+        if iid is None:
+            return None
+        try:
+            return rows[int(iid)]
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def _correction_explorer_target_for_row(self, row: dict):
+        """Return (path, select_file) for the best Explorer target for a correction row."""
+        for key in ("source_path", "target_path"):
+            raw = (row or {}).get(key, "")
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.is_file():
+                return path, True
+            if path.is_dir():
+                return path, False
+            parent = path.parent
+            if parent and parent.exists():
+                return parent, False
+        return None, False
+
+    def _explorer_select_command(self, path: Path) -> str:
+        # Explorer's /select parser is picky; this exact command-line shape
+        # opens the source folder and highlights the file.
+        return f'explorer.exe /select,"{str(path)}"'
+
+    def _open_in_explorer(self, path: Path, select_file: bool = False):
+        if select_file:
+            subprocess.Popen(self._explorer_select_command(path))
+        else:
+            subprocess.Popen(["explorer.exe", str(path)])
+
+    def _show_correction_file_in_explorer(self):
+        row = self._correction_context_row()
+        if not row:
+            self.status_var.set("No correction row selected to show in Explorer.")
+            return
+        path, select_file = self._correction_explorer_target_for_row(row)
+        if not path:
+            messagebox.showwarning(
+                "File Not Found",
+                "Could not find this row's source file, target file, or containing folder."
+            )
+            return
+        try:
+            self._open_in_explorer(path, select_file=select_file)
+            label = Path(row.get("source_path") or row.get("target_path") or path).name
+            self.status_var.set(f"Opened in Explorer: {label}")
+        except Exception as e:
+            messagebox.showerror("Explorer Error", f"Failed to open Windows Explorer: {e}")
 
     def _toggle_checkboxes_for_selected(self):
         """Toggle _bulk_checked (and the ✓/☐ symbol) for every row in the current
@@ -2411,10 +3044,11 @@ class OrganizerGUI:
             self.append_output(msg)
             self.status_var.set(msg)
 
-    def _apply_correction(self):
+    def _apply_correction(self, filename_component: str = None, component_value: str = None, folder_only: bool = False):
         """Apply the edit fields to ALL selected rows (supports multi-select via Ctrl/Shift).
 
         - Only non-empty fields are applied (enables folder-only or filename-only bulk edits).
+        - Single-component filename edits preserve each selected row's other generated parts.
         - A correction note is appended to every affected row.
         - target_path is recomputed per row using the (updated) folder + filename for that row.
         - Changes are reflected LIVE in the tree immediately (no popups, no confirmation dialogs).
@@ -2428,10 +3062,20 @@ class OrganizerGUI:
             return
 
         new_folder = self.corr_folder_var.get().strip()
-        new_filename = self.corr_filename_var.get().strip()
+        new_filename = "" if folder_only else self.corr_filename_var.get().strip()
         notes = self.corr_notes_var.get().strip()
 
-        if not new_folder and not new_filename:
+        component_edit = None
+        if filename_component:
+            component_edit = (filename_component, (component_value or "").strip())
+        elif new_filename and len(selection) > 1:
+            try:
+                anchor_row = self.correction_rows[int(selection[0])]
+                component_edit = infer_filename_component_edit(anchor_row.get("target_filename", ""), new_filename)
+            except (ValueError, IndexError, KeyError):
+                component_edit = None
+
+        if not new_folder and not new_filename and not component_edit:
             self.status_var.set("Enter a folder and/or filename to apply.")
             return
 
@@ -2450,10 +3094,11 @@ class OrganizerGUI:
 
         updated_count = 0
         affected_iids = []
+        numbered_filenames = {}
 
         # P2: smart dup numbering for multi filename edit (wired after pure helpers + tests).
         # Check only "rest of the selected files"; auto number per scheme (after sex or char); dialog if ambiguous.
-        if new_filename and len(selection) > 1:
+        if new_filename and len(selection) > 1 and not component_edit:
             sel_rows = []
             for iid in selection:
                 try:
@@ -2471,12 +3116,8 @@ class OrganizerGUI:
                     point = "after_character" if choice == "yes" else "before_res"
                 variants = build_numbered_filename_variants(base_for_num, len(sel_rows), point, set(r.get("target_filename","") for r in self.correction_rows))
                 for i, iid in enumerate(selection):
-                    try:
-                        idx = int(iid)
-                        if i < len(variants):
-                            self.correction_rows[idx]["target_filename"] = variants[i]
-                    except Exception:
-                        pass
+                    if i < len(variants):
+                        numbered_filenames[str(iid)] = variants[i]
                 # note in status
                 self.status_var.set(f"Auto-numbered {len(sel_rows)} files for dups (point: {point}).")
 
@@ -2484,14 +3125,27 @@ class OrganizerGUI:
             try:
                 idx = int(iid)
                 row = self.correction_rows[idx]
+                before = {key: row.get(key, "") for key in ("target_folder", "target_filename", "character", "status", "approved")}
 
                 changed = False
                 if new_folder:
                     row["target_folder"] = new_folder
                     changed = True
-                if new_filename:
-                    # if we numbered above, it may already be set; still mark changed
-                    row["target_filename"] = row.get("target_filename") or new_filename
+                if component_edit:
+                    category, value = component_edit
+                    current_filename = row.get("target_filename", "")
+                    updated_filename = apply_filename_component_to_filename(category, value, current_filename)
+                    if updated_filename != current_filename:
+                        row["target_filename"] = updated_filename
+                        parsed = parse_target_filename_parts(updated_filename)
+                        if parsed.get("character") is not None:
+                            row["character"] = parsed.get("character") or ""
+                        changed = True
+                elif new_filename:
+                    row["target_filename"] = numbered_filenames.get(str(iid), new_filename)
+                    parsed = parse_target_filename_parts(row["target_filename"])
+                    if parsed.get("character") is not None:
+                        row["character"] = parsed.get("character") or ""
                     changed = True
 
                 if not changed:
@@ -2501,7 +3155,7 @@ class OrganizerGUI:
                 row_folder = row.get("target_folder", "")
                 row_fname = row.get("target_filename", "")
                 if dest_root and row_folder and row_fname:
-                    target_path = str(Path(dest_root) / row_folder / row_fname)
+                    target_path = str(build_correction_target_path(dest_root, row_folder, row_fname))
                     row["target_path"] = target_path
 
                 # Append audit note to this row
@@ -2514,23 +3168,14 @@ class OrganizerGUI:
                 # If correcting an unmatched (or similar) row by providing target, auto-promote to ready+approved
                 # so bulk "apply correction" makes it apply-able instead of still blocked on status=unmatched.
                 cur_stat = (row.get("status") or "").strip().lower()
-                if (new_folder or new_filename) and cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
+                if (new_folder or new_filename or component_edit) and cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
                     row["status"] = "ready"
                     row["approved"] = "yes"
 
-                # Live update this row in the tree immediately (7-tuple with check column)
-                checked = "☑" if row.get("_bulk_checked") else "☐"
-                approved_val = row.get("approved", "")
-                current_target = f"{row_folder}/{row_fname}" if row_folder else row_fname
-                tree.item(iid, values=(
-                    checked,
-                    row.get("original_name", ""),
-                    row.get("artist", ""),
-                    row.get("character", ""),
-                    current_target,
-                    row.get("status", ""),
-                    approved_val
-                ))
+                # Live update this row in the tree immediately.
+                tree.item(iid, values=self._correction_tree_values(row))
+                if hasattr(self, "_log_row_changes"):
+                    self._log_row_changes(row, "Apply Correction", before)
 
                 updated_count += 1
                 affected_iids.append(iid)
@@ -2567,6 +3212,29 @@ class OrganizerGUI:
                 pass
         if count:
             msg = f"Marked {count} row(s) as approved (live)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+
+    def _mark_selected_unapproved(self):
+        """Mark currently selected row(s) unapproved (live, supports multi-select)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected to unapprove.")
+            return
+        count = 0
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
+                self._set_row_approved(row, "no", iid, tree)
+                count += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+        if count:
+            msg = f"Marked {count} row(s) as unapproved (live)."
             self.append_output(msg)
             self.status_var.set(msg)
 
@@ -2610,7 +3278,331 @@ class OrganizerGUI:
         else:
             self.status_var.set("No checked rows to approve.")
 
-    # P1 Phase 1 support (read-only dropdowns + explicit Apply; per constraints: no auto-mod on select)
+    def _unapprove_selected(self):
+        """Unapprove all currently selected rows (live update, no popup)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected to unapprove.")
+            return
+        count = 0
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
+                self._set_row_approved(row, "no", iid, tree)
+                count += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+        if count:
+            msg = f"Marked {count} selected row(s) as unapproved (live in tree)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+
+    def _unapprove_checked(self):
+        """Unapprove all checked rows (live update, no popup)."""
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        count = 0
+        for i, row in enumerate(self.correction_rows):
+            if row.get("_bulk_checked"):
+                self._set_row_approved(row, "no", str(i), tree)
+                count += 1
+        if count:
+            msg = f"Marked {count} checked row(s) as unapproved (live in tree)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+        else:
+            self.status_var.set("No checked rows to unapprove.")
+
+    def _quick_pick_norm(self, value: str) -> str:
+        if org is not None and hasattr(org, "normalize"):
+            return org.normalize(value)
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    def _quick_pick_key(self, category: str) -> Optional[str]:
+        return {
+            "artist": "artists",
+            "franchise": "franchises",
+            "character": "characters",
+            "resolution": "resolutions",
+        }.get(category)
+
+    def _quick_pick_combo(self, category: str):
+        return {
+            "artist": getattr(self, "corr_artist_cb", None),
+            "franchise": getattr(self, "corr_franchise_cb", None),
+            "character": getattr(self, "corr_character_cb", None),
+            "resolution": getattr(self, "corr_resolution_cb", None),
+        }.get(category)
+
+    def _apply_quick_pick_hidden_values(self):
+        hidden = getattr(self, "_quick_pick_hidden_values", {}) or {}
+        known = getattr(self, "correction_known", {}) or {}
+        for category, norms in hidden.items():
+            key = self._quick_pick_key(category)
+            if not key:
+                continue
+            norm_set = set(norms or set())
+            known[key] = [v for v in known.get(key, []) if self._quick_pick_norm(v) not in norm_set]
+        self.correction_known = known
+
+    def _set_known_combo_values(self, category: str):
+        combo = self._quick_pick_combo(category)
+        key = self._quick_pick_key(category)
+        if not combo or not key:
+            return []
+        query = combo.get() if hasattr(combo, "get") else ""
+        values = filter_known_values((self.correction_known or {}).get(key, []), query)
+        combo["values"] = values
+        return values
+
+    def _known_combo_state(self, category: str) -> dict:
+        states = getattr(self, "_quick_pick_combo_states", None)
+        if states is None:
+            states = {}
+            self._quick_pick_combo_states = states
+        return states.setdefault(category, {"query": "", "index": -1})
+
+    def _post_known_combo_dropdown(self, combo):
+        if not combo:
+            return
+        try:
+            combo.focus_set()
+        except Exception:
+            pass
+        try:
+            combo.tk.call("ttk::combobox::Post", combo)
+        except Exception:
+            try:
+                combo.event_generate("<Down>")
+            except Exception:
+                pass
+        try:
+            combo.focus_set()
+        except Exception:
+            pass
+
+    def _refresh_known_combo_search(self, category: str, query: str = None, post: bool = True):
+        combo = self._quick_pick_combo(category)
+        key = self._quick_pick_key(category)
+        if not combo or not key:
+            return []
+        cursor_index = None
+        try:
+            cursor_index = combo.index("insert")
+        except Exception:
+            cursor_index = None
+        if query is None:
+            query = combo.get() if hasattr(combo, "get") else ""
+        state = self._known_combo_state(category)
+        state["query"] = query or ""
+        state["index"] = -1
+        values = filter_known_values((self.correction_known or {}).get(key, []), state["query"])
+        combo["values"] = values
+        if post and values:
+            self._post_known_combo_dropdown(combo)
+        if cursor_index is not None:
+            try:
+                combo.icursor(min(int(cursor_index), len(query or "")))
+            except Exception:
+                pass
+        return values
+
+    def _navigate_known_combo_results(self, category: str, direction: int):
+        combo = self._quick_pick_combo(category)
+        key = self._quick_pick_key(category)
+        if not combo or not key:
+            return "break"
+        state = self._known_combo_state(category)
+        query = state.get("query")
+        if query is None:
+            query = combo.get() if hasattr(combo, "get") else ""
+            state["query"] = query
+        values = filter_known_values((self.correction_known or {}).get(key, []), query)
+        combo["values"] = values
+        if not values:
+            return "break"
+        raw_index = state.get("index", -1)
+        index = int(raw_index if raw_index is not None else -1)
+        index = (index + direction) % len(values)
+        state["index"] = index
+        combo.set(values[index])
+        try:
+            combo.selection_range(0, "end")
+        except Exception:
+            pass
+        self._post_known_combo_dropdown(combo)
+        return "break"
+
+    def _accept_known_combo_selection(self, category: str):
+        combo = self._quick_pick_combo(category)
+        key = self._quick_pick_key(category)
+        if not combo or not key:
+            return "break"
+        state = self._known_combo_state(category)
+        query = state.get("query")
+        if query is None:
+            query = combo.get() if hasattr(combo, "get") else ""
+        values = filter_known_values((self.correction_known or {}).get(key, []), query)
+        raw_index = state.get("index", -1)
+        index = int(raw_index if raw_index is not None else -1)
+        value = ""
+        if values and 0 <= index < len(values):
+            value = values[index]
+        elif values:
+            value = values[0]
+        elif combo and hasattr(combo, "get"):
+            value = combo.get().strip()
+        if value:
+            combo.set(value)
+            state["query"] = value
+            state["index"] = -1
+            setattr(self, f"_last_picked_{category}", value)
+            self._on_known_pick(category, value)
+            try:
+                combo.icursor("end")
+            except Exception:
+                pass
+            try:
+                combo.focus_set()
+            except Exception:
+                pass
+        return "break"
+
+    def _bind_searchable_known_combo(self, combo, category: str):
+        def _on_keypress(event=None):
+            keysym = getattr(event, "keysym", "")
+            if keysym == "Down":
+                return self._navigate_known_combo_results(category, 1)
+            if keysym == "Up":
+                return self._navigate_known_combo_results(category, -1)
+            if keysym == "Return":
+                return self._accept_known_combo_selection(category)
+            if keysym == "Escape":
+                self._known_combo_state(category)["index"] = -1
+                return None
+            return None
+
+        def _on_keyrelease(event=None):
+            keysym = getattr(event, "keysym", "")
+            if keysym in {
+                "Up", "Down", "Left", "Right", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R",
+                "Alt_L", "Alt_R", "Caps_Lock"
+            }:
+                return None
+            self._refresh_known_combo_search(category, post=False)
+            return None
+
+        def _on_open(event=None):
+            self._refresh_known_combo_search(category, post=False)
+
+        combo.bind("<KeyPress>", _on_keypress)
+        combo.bind("<KeyRelease>", _on_keyrelease)
+        combo.bind("<FocusIn>", _on_open, add="+")
+        combo.bind("<Button-1>", lambda _e: combo.after(1, lambda: self._refresh_known_combo_search(category, post=False)), add="+")
+
+    def _config_section_for_quick_pick(self, category: str) -> Optional[str]:
+        return {
+            "artist": "artist_aliases",
+            "franchise": "folder_aliases",
+            "character": "canonical_character_aliases",
+        }.get(category)
+
+    def _persist_quick_pick_value(self, category: str, value: str, remove: bool = False) -> Optional[Path]:
+        section = self._config_section_for_quick_pick(category)
+        if not section or org is None:
+            return None
+        cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
+        if not cpath.exists():
+            return None
+        cfg = org.load_config(cpath)
+        aa = dict(getattr(cfg, "artist_aliases", {}) or {})
+        fa = dict(getattr(cfg, "folder_aliases", {}) or {})
+        cm = dict(getattr(cfg, "character_mappings", {}) or {})
+        cca = dict(getattr(cfg, "canonical_character_aliases", {}) or {})
+        mapping = {
+            "artist_aliases": aa,
+            "folder_aliases": fa,
+            "canonical_character_aliases": cca,
+        }[section]
+        norm = self._quick_pick_norm(value)
+        if remove:
+            for key in list(mapping.keys()):
+                if self._quick_pick_norm(key) == norm or self._quick_pick_norm(mapping.get(key, "")) == norm:
+                    mapping.pop(key, None)
+        else:
+            mapping[norm] = value.strip()
+        return apply_known_values_edits_to_config(
+            cpath,
+            artist_aliases=aa,
+            folder_aliases=fa,
+            character_mappings=cm,
+            canonical_character_aliases=cca,
+        )
+
+    def _add_quick_pick_value(self, category: str):
+        combo = self._quick_pick_combo(category)
+        if not combo:
+            return
+        value = combo.get().strip()
+        if not value:
+            self.status_var.set("Type a value first, then click + to add it.")
+            return
+        hidden = getattr(self, "_quick_pick_hidden_values", {}) or {}
+        hidden.setdefault(category, set()).discard(self._quick_pick_norm(value))
+        self._quick_pick_hidden_values = hidden
+        added = add_quick_pick_known_value(self.correction_known, category, value)
+        backup = None
+        try:
+            backup = self._persist_quick_pick_value(category, value, remove=False)
+        except Exception as exc:
+            self.status_var.set(f"Added '{value}' to this session, but config write failed: {exc}")
+            self._set_known_combo_values(category)
+            return
+        self._set_known_combo_values(category)
+        setattr(self, f"_last_picked_{category}", value)
+        if backup:
+            self.status_var.set(f"Added '{value}' to {category} quick picks and config. Backup: {backup.name}")
+        elif added:
+            self.status_var.set(f"Added '{value}' to {category} quick picks for this session.")
+        else:
+            self.status_var.set(f"'{value}' is already in {category} quick picks.")
+
+    def _remove_quick_pick_value(self, category: str):
+        combo = self._quick_pick_combo(category)
+        if not combo:
+            return
+        value = combo.get().strip()
+        if not value:
+            self.status_var.set("Type or select a value first, then click - to remove/hide it.")
+            return
+        if not messagebox.askyesno("Remove quick-pick value?", f"Remove or hide '{value}' from {category} quick picks?"):
+            return
+        hidden = getattr(self, "_quick_pick_hidden_values", {}) or {}
+        hidden.setdefault(category, set()).add(self._quick_pick_norm(value))
+        self._quick_pick_hidden_values = hidden
+        removed = remove_quick_pick_known_value(self.correction_known, category, value)
+        backup = None
+        try:
+            backup = self._persist_quick_pick_value(category, value, remove=True)
+        except Exception as exc:
+            self.status_var.set(f"Hidden '{value}' for this session, but config write failed: {exc}")
+            self._set_known_combo_values(category)
+            return
+        combo.set("")
+        self._set_known_combo_values(category)
+        if backup:
+            self.status_var.set(f"Removed matching config entry for '{value}' and hid it from this session. Backup: {backup.name}")
+        elif removed:
+            self.status_var.set(f"Removed '{value}' from {category} quick picks for this session.")
+        else:
+            self.status_var.set(f"'{value}' hidden for this session. It may reappear after refresh if learned from library folders.")
+
+    # P1 Phase 1 support (searchable dropdowns + explicit Apply; select does not modify rows)
     def _on_known_pick(self, category: str, value: str):
         """Load value only (no row modification). Populate relevant edit field for user preview/confirm."""
         if not value:
@@ -2619,26 +3611,11 @@ class OrganizerGUI:
             self.corr_folder_var.set(value)
         elif category == "artist":
             # Conservative: populate filename field (user can refine); do not rewrite rows
-            current = self.corr_filename_var.get().strip()
-            if current:
-                self.corr_filename_var.set(value + " - " + current if " - " not in current else value + current)
-            else:
-                self.corr_filename_var.set(value + " - ")
+            self.corr_filename_var.set(apply_known_value_to_filename("artist", value, self.corr_filename_var.get()))
         elif category == "character":
-            current = self.corr_filename_var.get().strip()
-            if current:
-                self.corr_filename_var.set(current.replace(" - ", " - " + value + " - ", 1) if " - " in current else value + " - " + current)
-            else:
-                self.corr_filename_var.set(value + " - ")
+            self.corr_filename_var.set(apply_known_value_to_filename("character", value, self.corr_filename_var.get()))
         elif category == "resolution":
-            current = self.corr_filename_var.get().strip()
-            if current and "[" in current:
-                # replace res tag conservatively
-                import re
-                new = re.sub(r"\[[^\]]+\]", f"[{value}]", current)
-                self.corr_filename_var.set(new)
-            else:
-                self.corr_filename_var.set(current + f" [{value}]" if current else f"Title [{value}]")
+            self.corr_filename_var.set(apply_known_value_to_filename("resolution", value, self.corr_filename_var.get()))
         # Store last for explicit Apply buttons if needed
         setattr(self, f"_last_picked_{category}", value)
 
@@ -2651,12 +3628,24 @@ class OrganizerGUI:
         if not selection:
             self.status_var.set("No rows selected.")
             return
-        value = getattr(self, f"_last_picked_{category}", None) or (self.corr_franchise_cb.get() if category == "franchise" else None)
+        combo = self._quick_pick_combo(category)
+        typed_value = combo.get().strip() if combo and hasattr(combo, "get") else ""
+        value = typed_value or getattr(self, f"_last_picked_{category}", None)
         if not value:
-            self.status_var.set(f"No {category} value picked from dropdown.")
+            self.status_var.set(f"Type or pick a {category} value first.")
             return
+        setattr(self, f"_last_picked_{category}", value)
 
         if category == "franchise":
+            self.corr_folder_var.set(value)
+            self._apply_correction(folder_only=True)
+            if combo and hasattr(combo, "set"):
+                combo.set("")
+            if hasattr(self, "_set_known_combo_values"):
+                self._set_known_combo_values(category)
+            return
+
+        if False and category == "franchise":
             # Required: apply to target_folder on selected rows (like bulk correction)
             updated = 0
             for iid in selection:
@@ -2675,12 +3664,8 @@ class OrganizerGUI:
                             except Exception:
                                 dest_root = ""
                         if dest_root:
-                            row["target_path"] = str(Path(dest_root) / row_folder / row_fname)
-                    # live tree
-                    checked = "☑" if row.get("_bulk_checked") else "☐"
-                    approved_val = row.get("approved", "")
-                    cur_target = f"{row_folder}/{row_fname}" if row_folder and row_fname else row_fname
-                    tree.item(iid, values=(checked, row.get("original_name", ""), row.get("artist", ""), row.get("character", ""), cur_target, row.get("status", ""), approved_val))
+                            row["target_path"] = str(build_correction_target_path(dest_root, row_folder, row_fname))
+                    tree.item(iid, values=self._correction_tree_values(row))
                     updated += 1
                 except Exception:
                     pass
@@ -2690,27 +3675,103 @@ class OrganizerGUI:
             # Conservative for Artist/Char/Resolution per approval notes: if uncertain about safe filename-part replacement,
             # just populate the edit field instead of rewriting rows.
             # For P1, always populate the filename field (user confirms before Apply Correction or explicit future).
-            if category == "artist":
-                self.corr_filename_var.set(value + " - " + (self.corr_filename_var.get() or "Title"))
-            elif category == "character":
-                self.corr_filename_var.set((self.corr_filename_var.get() or "Artist - ") + value + " - Title")
-            elif category == "resolution":
-                current = self.corr_filename_var.get() or "Title"
-                import re
-                if re.search(r"\[[^\]]+\]", current):
-                    self.corr_filename_var.set(re.sub(r"\[[^\]]+\]", f"[{value}]", current))
-                else:
-                    self.corr_filename_var.set(current + f" [{value}]")
-            self.status_var.set(f"Loaded {category} '{value}' into edit field (use Apply Correction or edit manually).")
+            if category in ("artist", "character", "resolution"):
+                self.corr_filename_var.set(apply_known_value_to_filename(category, value, self.corr_filename_var.get()))
+            self._apply_correction(filename_component=category, component_value=value)
+            if combo and hasattr(combo, "set"):
+                combo.set("")
+            if hasattr(self, "_set_known_combo_values"):
+                self._set_known_combo_values(category)
+
+    def _append_picked_character(self):
+        tree = getattr(self, "correction_tree", None)
+        if not tree:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.status_var.set("No rows selected.")
+            return
+
+        combo = self._quick_pick_combo("character")
+        value = combo.get().strip() if combo and hasattr(combo, "get") else ""
+        value = value or getattr(self, "_last_picked_character", "")
+        if not value:
+            self.status_var.set("Type or pick a character value first.")
+            return
+        setattr(self, "_last_picked_character", value)
+
+        dest_root = self.dest_var.get().strip() or ""
+        if not dest_root:
+            try:
+                cfg = org.load_config(Path(self.config_var.get() or DEFAULT_CONFIG))
+                dest_root = str(cfg.destination_root)
+            except Exception:
+                dest_root = ""
+
+        correction_note = f"manual_correction: {datetime.now().strftime('%Y-%m-%d %H:%M')} - added character {value}"
+        updated = 0
+        first_filename = ""
+        for iid in selection:
+            try:
+                idx = int(iid)
+                row = self.correction_rows[idx]
+                before = {key: row.get(key, "") for key in ("target_folder", "target_filename", "character", "status", "approved")}
+                old_filename = row.get("target_filename", "") or self.corr_filename_var.get().strip()
+                new_filename = append_character_to_filename(value, old_filename)
+                if new_filename == old_filename:
+                    continue
+
+                row["target_filename"] = new_filename
+                parsed = parse_target_filename_parts(new_filename)
+                row["character"] = parsed.get("character") or row.get("character", "")
+
+                row_folder = row.get("target_folder", "")
+                if dest_root and row_folder and new_filename:
+                    row["target_path"] = str(build_correction_target_path(dest_root, row_folder, new_filename))
+
+                existing_notes = row.get("notes", "")
+                row["notes"] = f"{existing_notes}; {correction_note}".strip("; ")
+                existing_reason = row.get("reason", "")
+                row["reason"] = f"{existing_reason};manual_multi_character_correction".strip(";")
+
+                cur_stat = (row.get("status") or "").strip().lower()
+                if cur_stat in ("unmatched", "needs review", "blocked", "invalid", ""):
+                    row["status"] = "ready"
+                    row["approved"] = "yes"
+
+                tree.item(iid, values=self._correction_tree_values(row))
+                self._log_row_changes(row, "Add Character", before)
+                if not first_filename:
+                    first_filename = new_filename
+                updated += 1
+            except (ValueError, IndexError, KeyError):
+                pass
+
+        if combo and hasattr(combo, "set"):
+            combo.set("")
+        if hasattr(self, "_set_known_combo_values"):
+            self._set_known_combo_values("character")
+        if updated == 1 and first_filename:
+            self.corr_filename_var.set(first_filename)
+        elif updated:
+            self.corr_filename_var.set("")
+
+        if updated:
+            msg = f"Added character '{value}' to {updated} selected row(s)."
+            self.append_output(msg)
+            self.status_var.set(msg)
+        else:
+            self.status_var.set(f"No rows changed; '{value}' may already be present.")
 
     def _refresh_known_lists(self):
         try:
             cpath = Path(self.config_var.get().strip() or str(DEFAULT_CONFIG))
             self.correction_known = get_known_values(cpath)
-            self.corr_artist_cb["values"] = self.correction_known.get("artists", [])
-            self.corr_franchise_cb["values"] = self.correction_known.get("franchises", [])
-            self.corr_character_cb["values"] = self.correction_known.get("characters", [])
-            self.corr_resolution_cb["values"] = self.correction_known.get("resolutions", [])
+            self._apply_quick_pick_hidden_values()
+            self._set_known_combo_values("artist")
+            self._set_known_combo_values("franchise")
+            self._set_known_combo_values("character")
+            self._set_known_combo_values("resolution")
             self.status_var.set("Known values lists refreshed.")
         except Exception as e:
             self.status_var.set(f"Refresh failed: {e}")
@@ -2721,12 +3782,10 @@ class OrganizerGUI:
         # Selecting row populates fields. Live list + count refresh immediately after Add/Update/Remove/Clear (before Save).
         # Count labels + improved terminology + clarifying help text (exact for the two char sections).
         # dest_folders/resolutions remain view-only validation (3d/3e). Save/backup logic 100% unchanged.
-        # Phase 4b.5: added "Stash Import Preview" (read-only sidebar category). Connection + preview load + filters + export report.
-        # All Stash access is read-only queries (no mutations). No writes to config or learned. No import/apply (Phase 4c deferred).
+        # Stash Import Preview: read-only Stash queries plus reviewed in-memory staging via Import Selected.
+        # No Stash mutations. Local config writes still happen only through the bottom Save Changes button.
         # Prior 5 editables + dest/res/characters views 100% preserved.
-        # No Stash import (write), no new sections beyond preview, no name-gen/preview/apply changes, no org.py edits.
-        # Collision-proof %f backups only for the 5 editable. Preserve ALL other keys/structure exactly.
-        # Stop after 4b.5. Do not proceed to 4c.
+        # Collision-proof %f backups only for editable manager data. Preserve ALL other keys/structure exactly.
         win = tk.Toplevel(self.root)
         win.title("Known Values Manager")
         win.geometry("1100x700")  # larger for sidebar + content; Phase 4a.5 scalable layout
@@ -2743,6 +3802,7 @@ class OrganizerGUI:
         self._edit_folder_aliases = dict(getattr(cfg, 'folder_aliases', {})) if cfg else {}
         self._edit_character_mappings = dict(getattr(cfg, 'character_mappings', {})) if cfg else {}
         self._edit_canonical_character_aliases = dict(getattr(cfg, 'canonical_character_aliases', {})) if cfg else {}
+        self._edit_variant_policy = json.loads(json.dumps(getattr(cfg, 'variant_policy', {}) or {})) if cfg else {}
 
         # Phase 3c: load learned mappings from its own file (resolved rel to selected config via _loaded or sibling).
         # In-mem only until Save. No write on open. Uses pure resolve (duplicates org logic without editing org.py).
@@ -2787,6 +3847,7 @@ class OrganizerGUI:
             ("character_mappings", "Character Mappings"),
             ("canonical_character_aliases", "Canonical Character Aliases"),
             ("learned", "Learned Mappings"),
+            ("variant_policy", "Variant Policy"),
             ("dest_folders", "Destination Folders"),
             ("characters", "Characters"),
             ("resolutions", "Resolutions"),
@@ -2830,7 +3891,137 @@ class OrganizerGUI:
             # Optional header
             ttk.Label(parent, text=disp_name, font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0,4))
 
-            if cat in ("artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases", "learned"):
+            if cat == "variant_policy":
+                policy = self._edit_variant_policy
+                enabled_var = tk.BooleanVar(value=bool(policy.get("enabled", True)))
+                ttk.Checkbutton(parent, text="Enable variant analysis by default", variable=enabled_var,
+                                command=lambda: policy.__setitem__("enabled", enabled_var.get())).pack(anchor="w", pady=2)
+
+                limits = ttk.Frame(parent)
+                limits.pack(fill="x", pady=2)
+                ttk.Label(limits, text="Maximum retained performances:").pack(side="left")
+                max_var = tk.IntVar(value=int(policy.get("max_preferred_performances", 2)))
+                max_spin = ttk.Spinbox(limits, from_=0, to=10, textvariable=max_var, width=5)
+                max_spin.pack(side="left", padx=5)
+                def _stage_max_performances(*_):
+                    try:
+                        policy["max_preferred_performances"] = max(0, int(max_var.get()))
+                    except (TypeError, ValueError, tk.TclError):
+                        pass
+                max_var.trace_add("write", _stage_max_performances)
+
+                editors = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+                editors.pack(fill="both", expand=True, pady=4)
+
+                alias_frame = ttk.LabelFrame(editors, text="Aliases (one alias = output per line)", padding=5)
+                editors.add(alias_frame, weight=2)
+                ttk.Label(alias_frame, text="Descriptor abbreviations").pack(anchor="w")
+                descriptor_text = tk.Text(alias_frame, height=10, width=42)
+                descriptor_text.pack(fill="both", expand=True)
+                descriptor_text.insert("1.0", "\n".join(f"{k} = {v}" for k, v in sorted((policy.get("descriptor_aliases") or {}).items())))
+                ttk.Label(alias_frame, text="Credit aliases").pack(anchor="w", pady=(6, 0))
+                credit_text = tk.Text(alias_frame, height=10, width=42)
+                credit_text.pack(fill="both", expand=True)
+                credit_text.insert("1.0", "\n".join(f"{k} = {v}" for k, v in sorted((policy.get("credit_aliases") or {}).items())))
+
+                def _parse_alias_editor(widget):
+                    result = {}
+                    for line in widget.get("1.0", "end").splitlines():
+                        if "=" not in line:
+                            continue
+                        alias, output = (part.strip() for part in line.split("=", 1))
+                        if alias and output:
+                            result[alias] = output
+                    return result
+
+                def _stage_aliases(_evt=None):
+                    policy["descriptor_aliases"] = _parse_alias_editor(descriptor_text)
+                    policy["credit_aliases"] = _parse_alias_editor(credit_text)
+
+                descriptor_text.bind("<FocusOut>", _stage_aliases)
+                credit_text.bind("<FocusOut>", _stage_aliases)
+
+                pref_frame = ttk.LabelFrame(editors, text="Preferred performance signatures", padding=5)
+                editors.add(pref_frame, weight=2)
+                scope_var = tk.StringVar(value="Global")
+                scope_cb = ttk.Combobox(pref_frame, textvariable=scope_var, values=("Global", "Artist", "Character"), state="readonly", width=12)
+                scope_cb.grid(row=0, column=0, padx=2, sticky="w")
+                key_var = tk.StringVar()
+                key_cb = ttk.Combobox(pref_frame, textvariable=key_var, state="normal", width=34)
+                key_cb.grid(row=0, column=1, padx=2, sticky="we")
+                signature_list = tk.Listbox(pref_frame, height=14, exportselection=False)
+                signature_list.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=4)
+                signature_var = tk.StringVar()
+                ttk.Entry(pref_frame, textvariable=signature_var).grid(row=2, column=0, columnspan=2, sticky="we")
+                pref_frame.columnconfigure(1, weight=1)
+                pref_frame.rowconfigure(1, weight=1)
+
+                def _scope_bucket(create=True):
+                    prefs = policy.setdefault("preferred_performances", {"global": [], "artists": {}, "characters": {}})
+                    scope = scope_var.get().lower()
+                    if scope == "global":
+                        return prefs.setdefault("global", [])
+                    mapping = prefs.setdefault("artists" if scope == "artist" else "characters", {})
+                    key = key_var.get().strip()
+                    if not key:
+                        return []
+                    return mapping.setdefault(key, []) if create else mapping.get(key, [])
+
+                def _refresh_signatures(_evt=None):
+                    scope = scope_var.get()
+                    if scope == "Artist":
+                        key_cb.configure(values=(self.correction_known or {}).get("artists", []))
+                    elif scope == "Character":
+                        key_cb.configure(values=(self.correction_known or {}).get("characters", []))
+                    else:
+                        key_var.set("")
+                        key_cb.configure(values=())
+                    signature_list.delete(0, "end")
+                    for value in _scope_bucket(create=False):
+                        signature_list.insert("end", value)
+
+                def _add_signature():
+                    value = signature_var.get().strip()
+                    bucket = _scope_bucket()
+                    if value and value not in bucket:
+                        bucket.append(value)
+                        signature_var.set("")
+                        _refresh_signatures()
+
+                def _remove_signature():
+                    sel = signature_list.curselection()
+                    if sel:
+                        bucket = _scope_bucket()
+                        if sel[0] < len(bucket):
+                            bucket.pop(sel[0])
+                        _refresh_signatures()
+
+                def _move_signature(delta):
+                    sel = signature_list.curselection()
+                    bucket = _scope_bucket()
+                    if not sel:
+                        return
+                    old = sel[0]
+                    new = max(0, min(len(bucket) - 1, old + delta))
+                    if old != new:
+                        bucket.insert(new, bucket.pop(old))
+                        _refresh_signatures()
+                        signature_list.selection_set(new)
+
+                buttons = ttk.Frame(pref_frame)
+                buttons.grid(row=3, column=0, columnspan=2, pady=4)
+                ttk.Button(buttons, text="Add", command=_add_signature).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Remove", command=_remove_signature).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Up", command=lambda: _move_signature(-1)).pack(side="left", padx=2)
+                ttk.Button(buttons, text="Down", command=lambda: _move_signature(1)).pack(side="left", padx=2)
+                scope_cb.bind("<<ComboboxSelected>>", _refresh_signatures)
+                key_cb.bind("<<ComboboxSelected>>", _refresh_signatures)
+                key_cb.bind("<FocusOut>", _refresh_signatures)
+                _refresh_signatures()
+
+                self._stage_variant_policy_aliases = _stage_aliases
+
+            elif cat in ("artist_aliases", "folder_aliases", "character_mappings", "canonical_character_aliases", "learned"):
                 # Re-use the 4a/prior editable UI code, adapted to pack into 'parent' instead of tab frame 'f'.
                 # All live refresh, 4 buttons, select populate, counts, terminology, help, save-unaffected logic preserved.
                 # Use stable internal keys (not display labels) for routing.
@@ -2998,7 +4189,7 @@ class OrganizerGUI:
                 if help_text:
                     ttk.Label(parent, text=help_text, wraplength=600, justify="left").pack(anchor="w", pady=2)
 
-                note = "Phase 4a/4a.5/4b.5: in-memory until Save. Lists + counts refresh live after Add/Update/Remove/Clear. Search above filters this list only. Stash preview is separate read-only category."
+                note = "In-memory until Save. Lists + counts refresh live after Add/Update/Remove/Clear. Search above filters this list only. Stash preview can stage selected imports into the manager; Save Changes persists them."
                 ttk.Label(parent, text=note, wraplength=600).pack(anchor="w", pady=2)
 
             elif cat == "dest_folders":
@@ -3167,10 +4358,8 @@ class OrganizerGUI:
                 ttk.Label(parent, text="View-only. Shows resolution labels from library scan + naming style. No editing, no config/media writes. Resolution editing is deferred.").pack(pady=2)
 
             elif cat == "stash_preview":
-                # Phase 4b.5: read-only Stash import preview. Reachable from sidebar.
-                # Connection fields + Test/Load (sample supported) + filters + counts + list + Export report.
-                # NO import/apply (button disabled + label says Phase 4c). No writes to any json.
-                # Uses the pure query_ / build_ / export_ helpers (network isolated for mocking).
+                # Stash import preview. Stash access is read-only; Import Selected stages local manager edits in memory.
+                # Save Changes is the only action that writes config JSON. Export report remains report-only.
                 parent_frame = parent  # for clarity
 
                 # Connection controls
@@ -3469,6 +4658,162 @@ class OrganizerGUI:
                     except Exception as ex:
                         status_lbl.config(text=f"Export failed: {ex}", foreground="red")
 
+                def _select_all_filtered_importable():
+                    """Select only the rows currently visible (after all filters) that are importable:
+                    suggested_section in (artist_aliases, folder_aliases, canonical_character_aliases)
+                    AND status == "missing_local".
+                    Does not touch ignored/ambiguous/exists/unsupported.
+                    """
+                    preview_lst.selection_clear(0, "end")
+                    term = filter_var.get().lower().strip()
+                    sf = status_filter_var.get()
+                    secf = section_filter_var.get()
+                    srcf = source_filter_var.get()
+                    rolef = role_filter_var.get()
+                    visible_idx = 0
+                    importable_secs = {"artist_aliases", "folder_aliases", "canonical_character_aliases"}
+                    for it in getattr(self, "_stash_preview_items", []):
+                        # apply same filter logic as _repop
+                        if sf != "all" and it.get("status") != sf:
+                            continue
+                        if secf != "all" and it.get("suggested_section") != secf:
+                            continue
+                        if srcf != "all" and it.get("source") != srcf:
+                            continue
+                        if rolef != "all" and it.get("detected_tag_role") != rolef:
+                            continue
+                        if term and term not in (it.get("original", "") + " " + it.get("norm_key", "")).lower():
+                            continue
+                        # this row is visible
+                        if it.get("suggested_section") in importable_secs and it.get("status") == "missing_local":
+                            preview_lst.selection_set(visible_idx)
+                        visible_idx += 1
+
+                def _import_selected_stash_to_manager():
+                    """Phase 4c: reviewed import of selected preview rows into the in-memory _edit_* dicts.
+                    - Uses currently selected rows from the (multi-select) Listbox.
+                    - Pre-review dialog with counts, exact entries, conflicts, skips.
+                    - Default: skip conflicts, skip ignored/ambiguous/already_exists.
+                    - Only mutates self._edit_* (artist/folder/canonical); Save Changes is still the *only* way to write disk.
+                    - After staging: updates preview item statuses (where practical), repops list, shows summary.
+                    - No writes to r34_config or learned; no Stash side effects.
+                    """
+                    items = getattr(self, "_stash_preview_items", []) or []
+                    sel_indices = preview_lst.curselection() or ()
+                    selected = []
+                    for idx in sel_indices:
+                        if 0 <= idx < len(items):
+                            selected.append(items[idx])
+                    if not selected:
+                        status_lbl.config(text="No rows selected in the preview list. Use filters + click rows (ctrl/shift for multi) or 'Select all filtered importable'.", foreground="orange")
+                        return
+
+                    # Use pure for plan (pass copies of current edits)
+                    plan = stage_stash_import_items(
+                        selected,
+                        dict(getattr(self, "_edit_artist_aliases", {})),
+                        dict(getattr(self, "_edit_folder_aliases", {})),
+                        dict(getattr(self, "_edit_canonical_character_aliases", {})),
+                        overwrite_conflicts=False,  # decision below
+                    )
+
+                    # Build review text
+                    lines = []
+                    lines.append(f"Import Selected to Manager (Phase 4c) - REVIEW")
+                    lines.append(f"Selected in list: {plan['num_selected']}")
+                    lines.append(f"Importable (will stage if confirmed): {plan['num_added']}")
+                    lines.append(f"Conflicts found: {plan['num_conflicts']}")
+                    lines.append(f"Skipped by rule (ignored/ambig/exists/unsupported): {plan['num_skipped']}")
+                    lines.append("")
+                    if plan["added"]["artist_aliases"]:
+                        lines.append("Will add to Artist Aliases:")
+                        for nk, orig in plan["added"]["artist_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["artist_aliases"]) > 20: lines.append("  ...")
+                    if plan["added"]["folder_aliases"]:
+                        lines.append("Will add to Folder Aliases / Franchises:")
+                        for nk, orig in plan["added"]["folder_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["folder_aliases"]) > 20: lines.append("  ...")
+                    if plan["added"]["canonical_character_aliases"]:
+                        lines.append("Will add to Canonical Character Aliases:")
+                        for nk, orig in plan["added"]["canonical_character_aliases"][:20]:
+                            lines.append(f"  {nk} -> {orig}")
+                        if len(plan["added"]["canonical_character_aliases"]) > 20: lines.append("  ...")
+                    if plan["conflicts"]:
+                        lines.append("")
+                        lines.append("CONFLICTS (existing keys; default=skip):")
+                        for sec, nk, orig, oldv in plan["conflicts"][:15]:
+                            lines.append(f"  [{sec}] {nk} -> {orig}  (currently: {oldv})")
+                        if len(plan["conflicts"]) > 15: lines.append("  ...")
+                    if plan["skipped"]["ignored_or_review"]:
+                        lines.append(f"Ignored/review rows skipped: {len(plan['skipped']['ignored_or_review'])}")
+                    if plan["skipped"]["ambiguous"]:
+                        lines.append(f"Ambiguous rows skipped (default): {len(plan['skipped']['ambiguous'])}")
+                    if plan["skipped"]["already_exists_local"]:
+                        lines.append(f"Already-exists rows skipped (default): {len(plan['skipped']['already_exists_local'])}")
+                    lines.append("")
+                    lines.append("NOTE: This ONLY stages into the manager's in-memory edits.")
+                    lines.append("Click 'Save Changes' (bottom of window) to actually write r34_config.json (with backup).")
+                    lines.append("No Stash changes. No learned mappings touched. character_mappings import deferred.")
+
+                    review_text = "\n".join(lines)
+                    # Show review (use messagebox for simplicity + cross platform)
+                    messagebox.showinfo("Stash Import Review (before staging)", review_text[:3000] + ("\n... (truncated)" if len(review_text)>3000 else "") )
+
+                    if plan["conflicts"]:
+                        ow = messagebox.askyesno(
+                            "Conflicts - Overwrite?",
+                            f"{len(plan['conflicts'])} keys already exist in target section(s).\n\n"
+                            "Overwrite them with the Stash values? (RECOMMENDED: No = safer default, skips conflicts)\n\n"
+                            "Yes = overwrite those specific keys in the in-memory edit (still requires Save to persist)."
+                        )
+                    else:
+                        ow = False
+
+                    # Final confirm to stage
+                    proceed = messagebox.askyesno(
+                        "Confirm Stage to Manager?",
+                        f"Proceed to stage {plan['num_added']} values into in-memory Artist/Folder/Canonical aliases?\n"
+                        f"(Conflicts will be {'OVERWRITTEN' if ow else 'SKIPPED (default)'})\n\n"
+                        "This does NOT write to disk yet. Use Save Changes after."
+                    )
+                    if not proceed:
+                        status_lbl.config(text="Import cancelled by user.", foreground="gray")
+                        return
+
+                    # Re-run pure with the overwrite decision (on fresh copies)
+                    final_plan = stage_stash_import_items(
+                        selected,
+                        dict(getattr(self, "_edit_artist_aliases", {})),
+                        dict(getattr(self, "_edit_folder_aliases", {})),
+                        dict(getattr(self, "_edit_canonical_character_aliases", {})),
+                        overwrite_conflicts=ow,
+                    )
+
+                    # Apply to live in-mem (this is what Save will see)
+                    self._edit_artist_aliases = final_plan["updated_artist_aliases"]
+                    self._edit_folder_aliases = final_plan["updated_folder_aliases"]
+                    self._edit_canonical_character_aliases = final_plan["updated_canonical_character_aliases"]
+
+                    # Update statuses in the master items list for visible feedback (even if filter changes)
+                    staged_nks = set()
+                    for sec, lst in final_plan["added"].items():
+                        for nk, _ in lst:
+                            staged_nks.add(nk)
+                    for it in items:
+                        if it.get("norm_key") in staged_nks:
+                            it["status"] = "already_exists_local"
+                            it["note"] = (it.get("note") or "") + " (staged via Import Selected; pending Save)"
+
+                    _repop_stash_preview()
+                    # counts are from last build; user can re-load/reclass to refresh against new edits, or we leave as preview snapshot
+                    status_lbl.config(
+                        text=f"IMPORTED to manager (in-memory): artist+{len(final_plan['added']['artist_aliases'])} folder+{len(final_plan['added']['folder_aliases'])} canon+{len(final_plan['added']['canonical_character_aliases'])} ; conflicts handled: {ow} ; now click Save Changes to persist. Skipped: {final_plan['num_skipped']}",
+                        foreground="green",
+                    )
+                    # Optional: if user has other tabs open conceptually, switching cat will show live _edit updates.
+
                 # Buttons row
                 btn_frm = ttk.Frame(parent_frame)
                 btn_frm.pack(fill="x", pady=4)
@@ -3478,13 +4823,14 @@ class OrganizerGUI:
                 ttk.Button(btn_frm, text="Reclassify Current Preview (no Stash re-query)", command=_reclassify_current_preview).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Export Preview Report", command=_export_preview_report).pack(side="left", padx=2)
                 ttk.Button(btn_frm, text="Clear Preview", command=lambda: (setattr(self, "_stash_preview_items", []), preview_lst.delete(0, "end"), status_lbl.config(text="Cleared."))).pack(side="left", padx=2)
+                ttk.Button(btn_frm, text="Select all filtered importable", command=_select_all_filtered_importable).pack(side="left", padx=2)
 
-                # Disabled placeholder for future import (per spec: must be disabled + label Phase 4c)
-                import_btn = ttk.Button(btn_frm, text="Import Selected (Phase 4c - not implemented)", state="disabled")
+                # Phase 4c: enabled import (reviewed staging to in-mem _edit only)
+                import_btn = ttk.Button(btn_frm, text="Import Selected to Manager", command=_import_selected_stash_to_manager)
                 import_btn.pack(side="left", padx=2)
-                ttk.Label(parent_frame, text="Import/apply will be implemented in Phase 4c. This phase is read-only preview + export only.", foreground="gray").pack(anchor="w")
+                ttk.Label(parent_frame, text="Import Selected stages values in the manager only. Click Save Changes to write them to config.", foreground="blue").pack(anchor="w")
 
-                note = "Phase 4b.6 read-only classification preview: Tags classified by parent/ancestor tags (artist/character/franchise). Unclassified tags go to ignored_or_review (not auto characters). All prior editable + view-only tabs remain fully functional. Export is report only."
+                note = "Stash tags are classified by parent/ancestor tags (artist/character/franchise). Unclassified tags go to ignored_or_review, not auto characters. Import Selected stages reviewed values in the manager; Export is report only."
                 ttk.Label(parent_frame, text=note, wraplength=700).pack(anchor="w", pady=2)
 
                 # Required note per spec
@@ -3553,6 +4899,13 @@ class OrganizerGUI:
                     messagebox.showerror("Save Error", "Config backup failed or invalid path; no write performed.")
                     return
 
+                if hasattr(self, "_stage_variant_policy_aliases"):
+                    self._stage_variant_policy_aliases()
+                variant_backup = apply_variant_policy_edits_to_config(cpath, getattr(self, "_edit_variant_policy", {}) or {})
+                if not variant_backup:
+                    messagebox.showerror("Save Error", "Variant policy backup failed; variant policy was not written.")
+                    return
+
                 # Phase 3c learned (separate file, resolved rel to this cpath)
                 lm = getattr(self, "_edit_learned_mappings", {}) or {}
                 learned_p = resolve_learned_mappings_path(cpath, cfg)
@@ -3573,7 +4926,7 @@ class OrganizerGUI:
                 messagebox.showinfo(
                     "Phase 3c Saved",
                     f"Config updated (artist_aliases, folder_aliases, character_mappings, canonical_character_aliases only).\n"
-                    f"Backup created: {backup.name}\n"
+                    f"Backups created: {backup.name}, {variant_backup.name}\n"
                     f"{learned_msg}"
                     "All other config structure/keys + learned file safety preserved (r34_config.json untouched outside the 4; no bleed to char_mappings/canon_*; dest/res never edited).\n"
                     "Dropdowns refreshed (learned appears in Characters/Franchises where applicable). Current Correction Tool session remains usable."
@@ -3583,8 +4936,67 @@ class OrganizerGUI:
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; 5 editable + learned; Phase 4a/4b.5 UI only - live edits before Save; Stash preview read-only + export; dest/res untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save Changes (create collision-proof timestamped backups; editable manager data + learned; includes staged Stash imports; dest/res untouched)", command=_save_known_values_changes).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
+
+    def _correction_resolution_tag(self, row: dict) -> str:
+        value = (row.get("resolution", "") or "").strip()
+        if not value:
+            filename = row.get("target_filename", "") or ""
+            match = re.search(r"\[([^\]]+)\]", filename)
+            value = match.group(1).strip() if match else ""
+        if not value:
+            return ""
+        return value if value.startswith("[") and value.endswith("]") else f"[{value.strip('[]')}]"
+
+    def _correction_tree_values(self, row: dict):
+        checked = "â˜‘" if row.get("_bulk_checked") else "â˜"
+        return (
+            checked,
+            row.get("original_name", ""),
+            row.get("artist", ""),
+            row.get("character", ""),
+            row.get("target_folder", ""),
+            self._correction_target_directory(row),
+            row.get("target_filename", ""),
+            self._correction_resolution_tag(row),
+            row.get("variant_descriptors", "") or row.get("variant_version", ""),
+            row.get("variant_decision", ""),
+            row.get("status", ""),
+            row.get("approved", ""),
+        )
+
+    def _correction_target_directory(self, row: dict) -> str:
+        target_path = row.get("target_path", "") or ""
+        target_filename = row.get("target_filename", "") or ""
+        if not target_path:
+            return ""
+
+        path = Path(target_path)
+        if target_filename and path.name.lower() == target_filename.lower():
+            return str(path.parent)
+        return target_path.rstrip("\\/")
+
+    def _natural_sort_key(self, value: str):
+        parts = re.split(r"(\d+)", str(value or "").lower())
+        return tuple(int(part) if part.isdigit() else part for part in parts)
+
+    def _resolution_sort_value(self, row: dict) -> int:
+        value = self._correction_resolution_tag(row)
+        norm = value.strip("[]").upper()
+        if norm in {"4K", "UHD", "2160P"}:
+            return 2160
+        if norm in {"8K", "4320P"}:
+            return 4320
+        match = re.search(r"\d+", norm)
+        return int(match.group(0)) if match else 0
+
+    def _approved_sort_value(self, row: dict) -> int:
+        value = (row.get("approved", "") or "").strip().lower()
+        return 1 if value in {"yes", "y", "true", "1", "approved", "apply"} else 0
+
+    def _checked_sort_value(self, row: dict) -> int:
+        return 1 if row.get("_bulk_checked") else 0
 
     def _sort_tree(self, col):
         """Sort the underlying rows and refresh the tree view."""
@@ -3593,10 +5005,18 @@ class OrganizerGUI:
         reverse = self._sort_state.get(col, False)
 
         key_funcs = {
-            "status": lambda r: (r.get("status", "") or "").lower(),
-            "current_target": lambda r: ((r.get("target_folder", "") or "") + "/" + (r.get("target_filename", "") or "")).lower(),
-            "character": lambda r: (r.get("character", "") or "").lower(),
-            "original": lambda r: (r.get("original_name", "") or "").lower(),
+            "check": self._checked_sort_value,
+            "original": lambda r: self._natural_sort_key(r.get("original_name", "")),
+            "artist": lambda r: self._natural_sort_key(r.get("artist", "")),
+            "character": lambda r: self._natural_sort_key(r.get("character", "")),
+            "franchise": lambda r: self._natural_sort_key(r.get("target_folder", "")),
+            "current_target": lambda r: self._natural_sort_key(self._correction_target_directory(r)),
+            "output_filename": lambda r: self._natural_sort_key(r.get("target_filename", "")),
+            "resolution": self._resolution_sort_value,
+            "variant": lambda r: self._natural_sort_key(" ".join((r.get("variant_version", ""), r.get("variant_descriptors", ""), r.get("variant_credits", "")))),
+            "decision": lambda r: self._natural_sort_key(r.get("variant_decision", "")),
+            "status": lambda r: self._natural_sort_key(r.get("status", "")),
+            "approved": self._approved_sort_value,
         }
         if col not in key_funcs:
             return
@@ -3612,16 +5032,7 @@ class OrganizerGUI:
             return
         tree.delete(*tree.get_children())
         for i, row in enumerate(self.correction_rows):
-            checked = "☑" if row.get("_bulk_checked") else "☐"
-            orig = row.get("original_name", "")
-            artist = row.get("artist", "")
-            char = row.get("character", "")
-            folder = row.get("target_folder", "")
-            fname = row.get("target_filename", "")
-            current_target = f"{folder}/{fname}" if folder and fname else (fname or "")
-            status = row.get("status", "")
-            approved = row.get("approved", "")
-            tree.insert("", "end", iid=str(i), values=(checked, orig, artist, char, current_target, status, approved))
+            tree.insert("", "end", iid=str(i), values=self._correction_tree_values(row))
 
     def _reset_selected_row(self):
         # This is a simple version — for full reset we'd need the original CSV backup.

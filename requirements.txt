@@ -1,0 +1,5 @@
+# Runtime (for optional Grok/xAI assistance during preview)
+requests
+
+# Build only (for creating the portable GUI .exe/folder)
+pyinstaller

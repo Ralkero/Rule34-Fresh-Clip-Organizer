@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Windows Python 3.12
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate JSON config files
+        run: |
+          python -m json.tool r34_config.json > $null
+          python -m json.tool r34_config.example.json > $null
+
+      - name: Compile Python entry points
+        run: python -m py_compile r34_organizer.py r34_gui.py
+
+      - name: Run unit tests
+        run: python -m unittest tests.test_r34_organizer
+
+      - name: Check whitespace errors
+        run: git diff --check

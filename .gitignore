@@ -15,6 +15,12 @@ __pycache__/
 # Temporary / validation
 validation_tmp/
 analysis/akiryo-*
+.pytest_cache/
+r34_preview_*.csv
+r34_preview_*.md
+r34_apply_*.csv
+r34_undo_*.csv
+r34_config.backup.*.json
 
 # OS
 .DS_Store
@@ -23,3 +29,4 @@ Thumbs.db
 # PyInstaller / build artifacts (the portable GUI exe + folder are provided as assets on GitHub Releases, not in the repo)
 build/
 dist/
+Rule34Organizer-*-portable.zip

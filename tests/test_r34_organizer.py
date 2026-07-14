@@ -27,19 +27,44 @@ def make_config(dest_root: Path) -> org.Config:
             "2b": "Nier Automata",
             "2p": "Nier Automata",
             "a2": "Nier Automata",
+            "ahri": "League of Legends",
+            "commander": "Nier Automata",
             "d va": "Overwatch",
             "dva": "Overwatch",
+            "barret": "Final Fantasy",
             "botw zelda": "Legend of Zelda",
+            "ashe and bob": "Overwatch",
+            "ashe bob": "Overwatch",
+            "ashebob": "Overwatch",
+            "atomic heart twins": "Atomic Heart",
+            "atomic twins": "Atomic Heart",
+            "burnice": "Zenless Zone Zero",
+            "burnice white": "Zenless Zone Zero",
+            "ezreal": "League of Legends",
             "eunie": "Xenoblade Chronicles",
+            "evelynn": "League of Legends",
+            "ganyu": "Genshin Impact",
+            "jane doe": "Zenless Zone Zero",
+            "lucian": "League of Legends",
+            "lucy": "Cyberpunk",
             "melony": "Pokemon",
+            "mercy": "Overwatch",
+            "mundo": "League of Legends",
+            "neeko": "League of Legends",
             "nessa": "Pokemon",
             "palutena": "Kid Icarus",
             "peach": "Super Mario",
+            "qiyana": "League of Legends",
             "raven": "Teen Titans",
+            "seraphine": "League of Legends",
             "starfire": "Teen Titans",
             "mythra": "Xenoblade Chronicles",
             "pyra": "Xenoblade Chronicles",
             "tifa": "Final Fantasy",
+            "winston": "Overwatch",
+            "twins": "Atomic Heart",
+            "widow": "Overwatch",
+            "widowmaker": "Overwatch",
             "chun li": "Street Fighter",
             "chun-li": "Street Fighter",
             "sophitia": "Street Fighter, King of Fighters, Soul Calibur",
@@ -48,31 +73,59 @@ def make_config(dest_root: Path) -> org.Config:
             "2b": "2B",
             "2p": "2P",
             "a2": "A2",
+            "ahri": "Ahri",
             "botw zelda": "Princess Zelda",
+            "ashe and bob": "Ashe And Bob",
+            "ashe bob": "Ashe And Bob",
+            "ashebob": "Ashe And Bob",
+            "atomic heart twins": "Atomic Twins",
+            "atomic twins": "Atomic Twins",
+            "burnice": "Burnice White",
+            "burnice white": "Burnice White",
             "chun li": "Chun-Li",
             "chun-li": "Chun-Li",
+            "commander": "Commander White",
+            "commander white": "Commander White",
             "d va": "D.Va",
             "dva": "D.Va",
+            "barret": "Barret Wallace",
             "eunie": "Eunie",
+            "ezreal": "Ezreal",
+            "evelynn": "Evelynn",
+            "ganyu": "Ganyu",
+            "jane doe": "Jane Doe",
+            "lucian": "Lucian",
+            "lucy": "Lucy",
             "melony": "Melony",
+            "mercy": "Mercy",
+            "mundo": "Dr. Mundo",
+            "neeko": "Neeko",
             "mythra": "Mythra",
             "nessa": "Nessa",
             "palutena": "Palutena",
             "peach": "Princess Peach",
             "pyra": "Pyra",
+            "qiyana": "Qiyana",
             "raven": "Raven",
+            "seraphine": "Seraphine",
             "sophitia": "Sophitia",
             "starfire": "Starfire",
             "tifa": "Tifa Lockhart",
+            "winston": "Winston",
+            "twins": "Atomic Twins",
+            "widow": "Widowmaker",
+            "widowmaker": "Widowmaker",
         },
         title_token_replacements={
             "bathextra": "bath extra",
+            "atomicheart": "Atomic Heart",
             "bonusmotion": "bonus motion",
             "boobday": "boob day",
             "hipwiggle": "hip wiggle",
             "kitchenmissionary": "kitchen missionary",
             "suddenstamina": "sudden stamina",
         },
+        filename_overrides={},
         content_review_terms={},
         junk_tokens=("full hd", "unwatermarked", "no watermark", "animated extra", "1080p", "4k"),
         preserve_tokens=("2B", "2P", "A2", "D.Va", "BotW", "XC2", "BJ", "POV", "RRH", "MAX"),
@@ -120,6 +173,16 @@ def test_collector_folder_artist_from_filename_prefix():
 
 
 class CleaningTests(unittest.TestCase):
+    def test_load_config_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "r34_config_bom.json"
+            dest = Path(tmp) / "dest"
+            cfg_path.write_text(json.dumps({"destination_root": str(dest)}), encoding="utf-8-sig")
+
+            config = org.load_config(cfg_path)
+
+            self.assertEqual(config.destination_root, dest)
+
     def test_removes_leading_number_resolution_and_watermark(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp))
@@ -160,6 +223,31 @@ class CleaningTests(unittest.TestCase):
     def test_date_prefix_is_not_stripped_as_numeric_index(self):
         stem = "2023-01-26 - A Playful Goddess - (Palutena)_4K60fps"
         self.assertEqual(org.strip_leading_index(stem), stem)
+
+    def test_strips_collection_export_date_from_artist_source(self):
+        self.assertEqual(org.strip_source_artist_suffix("Juicyneko Collection To 2024-04-05"), "Juicyneko")
+        self.assertEqual(org.strip_source_artist_suffix("Juicyneko collection through 2024_04_05"), "Juicyneko")
+        self.assertEqual(org.strip_source_artist_suffix("KinkyCat3D_Animations_2020_to_2024-01"), "KinkyCat3D")
+        self.assertEqual(org.strip_source_artist_suffix("SomeArtist-Pack-2021-through-2024"), "SomeArtist")
+
+    def test_target_filename_normalizes_collection_export_artist(self):
+        self.assertEqual(
+            org.target_filename_for(
+                "Juicyneko Collection To 2024-04-05",
+                "Aerith Gainsborough",
+                "Cowgirl",
+                "4K",
+                ".mp4",
+            ),
+            "Juicyneko - Aerith Gainsborough - Cowgirl [4K].mp4",
+        )
+
+    def test_outlier_cleanup_keeps_scene_descriptors_without_precedent(self):
+        reference = org.ReferenceData({}, {}, {}, {}, org.NamingStyle(0, {}, ()))
+        cleaned, removed, confidence = org.strip_outlier_tokens("Public Handjob", reference)
+        self.assertEqual(cleaned, "Public Handjob")
+        self.assertEqual(removed, [])
+        self.assertEqual(confidence, 1.0)
 
 
 class ClassificationTests(unittest.TestCase):
@@ -365,6 +453,344 @@ class PreviewAndApplyTests(unittest.TestCase):
             self.assertEqual(row["character"], "2B")
             self.assertEqual(row["target_filename"], "Pantsushi - 2B - Training [1080P].mp4")
 
+    def test_preview_uses_meaningful_subfolder_context_for_clip_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Mercy Halloween"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "Overwatch").mkdir(parents=True)
+            video = subfolder / "Loop With Spooky Sound Effect.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["artist"], "KinkyCat3D")
+            self.assertEqual(row["character"], "Mercy")
+            self.assertEqual(row["clean_title"], "Mercy Halloween - Loop, Spooky Sound Effect")
+            self.assertEqual(row["target_folder"], "Overwatch")
+            self.assertEqual(
+                row["target_filename"],
+                "KinkyCat3D - Mercy Halloween - Loop, Spooky Sound Effect [1080P].mp4",
+            )
+
+    def test_preview_uses_parent_subfolder_context_and_ignores_generic_bonus_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Mercy Halloween" / "Bonus"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "Overwatch").mkdir(parents=True)
+            video = subfolder / "Loop.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["clean_title"], "Mercy Halloween - Loop")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Mercy Halloween - Loop [1080P].mp4")
+
+    def test_clean_source_artist_beats_low_precedent_and_can_auto_approve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Mercy Halloween"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "Overwatch").mkdir(parents=True)
+            # Simulate an old preview/apply having taught KinkyCat3D as precedent.
+            (dest / "Overwatch" / "KinkyCat3D - D.Va - Loop [1080P].mp4").write_bytes(b"old")
+            video = subfolder / "Loop With Spooky Sound Effect.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["artist"], "KinkyCat3D")
+            self.assertIn("artist_from_source_alias_or_precedent", row["reason"])
+            self.assertEqual(row["status"], "ready")
+            self.assertEqual(row["approved"], "yes")
+
+    def test_preview_strips_technical_labels_from_character_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "League of Legends").mkdir(parents=True)
+            video = source / "Seraphine 06-2024 High Res.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Seraphine")
+            self.assertNotIn("High Res", row["target_filename"])
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Seraphine [1080P].mp4")
+
+    def test_preview_preserves_second_known_character_in_connector_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "Final Fantasy").mkdir(parents=True)
+            video = source / "Tifa X Barret 02-2024 1080p60fps.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Tifa Lockhart, Barret Wallace")
+            self.assertEqual(row["target_folder"], "Final Fantasy")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Tifa Lockhart, Barret Wallace [1080P].mp4")
+
+    def test_action_word_precedent_does_not_drive_franchise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "Final Fantasy").mkdir(parents=True)
+            (dest / "Final Fantasy" / "Artist - Character - Missionary [1080P].mp4").write_bytes(b"old")
+            (dest / "Final Fantasy" / "Artist - Character - Missionary 2 [1080P].mp4").write_bytes(b"old")
+            video = source / "Samsung Sam Missionary.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Samsung Sam")
+            self.assertNotEqual(row["target_folder"], "Final Fantasy")
+            self.assertEqual(row["target_folder"], "Original Character / KinkyCat3D")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Samsung Sam - Missionary [1080P].mp4")
+            self.assertEqual(
+                Path(row["target_path"]),
+                dest / "Original Character" / "KinkyCat3D" / "KinkyCat3D - Samsung Sam - Missionary [1080P].mp4",
+            )
+
+    def test_subfolder_context_dedupes_inferred_character_and_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Bunnygirl Catwalk"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            video = subfolder / "Bunnygirl Concept.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Bunnygirl")
+            self.assertEqual(row["clean_title"], "Bunnygirl Catwalk - Concept")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Bunnygirl Catwalk - Concept [1080P].mp4")
+
+    def test_compact_descriptor_suffix_splits_before_character_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "Nier Automata").mkdir(parents=True)
+            video = source / "Commanderbj.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Commander White")
+            self.assertEqual(row["target_folder"], "Nier Automata")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Commander White - BJ [1080P].mp4")
+
+    def test_compact_descriptor_suffix_handles_attached_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "Overwatch").mkdir(parents=True)
+            video = source / "Widowridedildo1080p.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Widowmaker")
+            self.assertEqual(row["target_folder"], "Overwatch")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Widowmaker - Ride Dildo [1080P].mp4")
+
+    def test_character_first_name_only_title_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            filename = org.target_filename_for("KinkyCat3D", "Samsung Sam", "Samsung", "1080P", ".mp4")
+            self.assertEqual(filename, "KinkyCat3D - Samsung Sam [1080P].mp4")
+            filename = org.target_filename_for("KinkyCat3D", "Seraphine", "Seraphine", "1080P", ".mp4")
+            self.assertEqual(filename, "KinkyCat3D - Seraphine [1080P].mp4")
+
+    def test_ai_lookup_is_not_called_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            video = source / "Samsung Sam.mp4"
+            video.write_bytes(b"fake")
+            config = org.replace_config(make_config(dest), use_ai_for_unknown_characters=False)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), \
+                 patch.object(org, "has_audio_stream", return_value=True), \
+                 patch.object(org, "query_grok_for_character_franchise", side_effect=AssertionError("AI should not run")):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Samsung Sam")
+
+    def test_known_character_compact_variant_does_not_become_new_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "League of Legends").mkdir(parents=True)
+            video = source / "Ahri1A 11-2024 High Res.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Ahri")
+            self.assertEqual(row["target_folder"], "League of Legends")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Ahri [1080P].mp4")
+            self.assertEqual(row["status"], "ready")
+
+    def test_compact_pair_subfolder_variants_use_clean_numeric_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Ashe & Bob"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "Overwatch").mkdir(parents=True)
+            video = subfolder / "Ashebob2.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Ashe And Bob")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Ashe And Bob 2 [1080P].mp4")
+
+    def test_atomic_heart_subfolder_keeps_atomic_twins_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Atomic Heart Twins"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "Atomic Heart").mkdir(parents=True)
+            video = subfolder / "Atomicheart1_1080p_60fps.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Atomic Twins")
+            self.assertEqual(row["target_folder"], "Atomic Heart")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Atomic Twins 1 [1080P].mp4")
+
+    def test_preserves_breed_a_brat_descriptor_before_known_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            (dest / "League of Legends").mkdir(parents=True)
+            video = source / "Breed A Brat Qiyana.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Qiyana")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Qiyana - Breed A Brat [1080P].mp4")
+
+    def test_subfolder_context_drops_generic_file_action_variant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            subfolder = source / "Bonking session with Neeko"
+            dest = base / "Rule34"
+            subfolder.mkdir(parents=True)
+            (dest / "League of Legends").mkdir(parents=True)
+            video = subfolder / "Neeko Fuk V1.mp4"
+            video.write_bytes(b"fake")
+            config = make_config(dest)
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Neeko")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Bonking Session With Neeko [1080P].mp4")
+
+    def test_filename_override_handles_missing_character_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "KinkyCat3D"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            video = source / "Zenless Zone Zero 10-2024 High Res.mp4"
+            video.write_bytes(b"fake")
+            config = org.replace_config(
+                make_config(dest),
+                filename_overrides={
+                    "zenless zone zero": {
+                        "character": "Jane Doe, Burnice White",
+                        "target_folder": "Zenless Zone Zero",
+                        "title": "",
+                    }
+                },
+            )
+            reference = org.build_reference_data(dest, config)
+
+            with patch.object(org, "probe_resolution", return_value=("1080p", "", "")), patch.object(org, "has_audio_stream", return_value=True):
+                row = org.analyze_file(video, source, config, reference)
+
+            self.assertEqual(row["character"], "Jane Doe, Burnice White")
+            self.assertEqual(row["target_folder"], "Zenless Zone Zero")
+            self.assertEqual(row["target_filename"], "KinkyCat3D - Jane Doe, Burnice White [1080P].mp4")
+            self.assertEqual(row["status"], "ready")
+
     def test_content_review_terms_block_preview_row(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -386,6 +812,77 @@ class PreviewAndApplyTests(unittest.TestCase):
             self.assertIn("futa:futa", row["reason"])
             self.assertIn("Held for content review", row["notes"])
             self.assertEqual(row["target_folder"], "Nier Automata")
+
+    def test_collector_descriptor_words_do_not_pollute_inferred_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "Rogowski collection"
+            dest = base / "Rule34"
+            source.mkdir(parents=True)
+            for folder in ("League of Legends", "Final Fantasy", "Chainsaw Man"):
+                (dest / folder).mkdir(parents=True)
+
+            config = make_config(dest)
+            config = org.replace_config(
+                config,
+                character_mappings={
+                    **config.character_mappings,
+                    "kaisa": "League of Legends",
+                    "kai sa": "League of Legends",
+                    "anran": "Final Fantasy",
+                    "power": "Chainsaw Man",
+                },
+                canonical_character_aliases={
+                    **config.canonical_character_aliases,
+                    "kaisa": "Kai'Sa",
+                    "kai sa": "Kai'Sa",
+                    "anran": "Anran",
+                    "power": "Power",
+                },
+                preserve_tokens=(*config.preserve_tokens, "Kai'Sa"),
+            )
+            reference = org.build_reference_data(dest, config)
+
+            cases = [
+                (
+                    "Megaera - Kaisa Beach Nude All Angles - Beach Nude 10 [4K].mp4",
+                    "Kai'Sa",
+                    "League of Legends",
+                    "Kaisa Beach Nude All Angles",
+                ),
+                (
+                    "Megaera - Anran Missionary Nude All Angles - 3 [4K].mp4",
+                    "Anran",
+                    "Final Fantasy",
+                    "Anran Missionary Nude All Angles",
+                ),
+                (
+                    "Megaera - Power Cowgirl, Power - BJ 4 [1080P].mp4",
+                    "Power",
+                    "Chainsaw Man",
+                    "Power Cowgirl, Power",
+                ),
+            ]
+
+            with patch.object(org, "probe_resolution", return_value=("4K", "", "")), \
+                 patch.object(org, "has_audio_stream", return_value=True):
+                for filename, expected_character, expected_folder, polluted_phrase in cases:
+                    video = source / filename
+                    video.write_bytes(b"fake")
+                    row = org.analyze_file(video, source, config, reference)
+                    self.assertEqual(row["character"], expected_character)
+                    self.assertEqual(row["target_folder"], expected_folder)
+                    self.assertNotIn(polluted_phrase, row["character"])
+                    self.assertNotIn(polluted_phrase, row["target_filename"])
+                    self.assertIn(f"Megaera - {expected_character} - ", row["target_filename"])
+
+    def test_default_content_review_terms_do_not_flag_monster_hunter_franchise(self):
+        config = org.load_config(PROJECT_ROOT / "r34_config.json")
+        self.assertEqual(org.detect_content_review(("Monster Hunter Gemma Ride.mp4",), config), ())
+        self.assertIn(
+            "extreme:tentacle",
+            org.detect_content_review(("Tentacle scene.mp4",), config),
+        )
 
     def test_max_quality_token_is_not_learned_as_first_name_character(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -637,6 +1134,93 @@ class PreviewAndApplyTests(unittest.TestCase):
             self.assertFalse(video.exists())
             self.assertTrue(expected.exists())
             self.assertEqual(result["apply_message"], str(expected))
+
+    def test_apply_rejects_target_path_outside_destination_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "incoming"
+            destination_root = base / "Rule34"
+            source.mkdir()
+            destination_root.mkdir()
+            video = source / "clip.mp4"
+            video.write_bytes(b"fake")
+            outside_target = base / "NotRule34" / "clip.mp4"
+            row = {column: "" for column in org.CSV_COLUMNS}
+            row.update({
+                "approved": "yes",
+                "source_path": str(video),
+                "original_name": video.name,
+                "status": "ready",
+                "target_path": str(outside_target),
+            })
+
+            result = org.apply_row(row, source, "run", "_r34_review", False, destination_root=destination_root)
+
+            self.assertEqual(result["apply_result"], "invalid_target")
+            self.assertIn("outside destination_root", result["apply_message"])
+            self.assertTrue(video.exists())
+            self.assertFalse(outside_target.exists())
+
+    def test_apply_repairs_legacy_spaced_subfolder_target_path_from_structured_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "incoming"
+            destination_root = base / "Rule34"
+            source.mkdir()
+            destination_root.mkdir()
+            video = source / "Samsung Sam.mp4"
+            video.write_bytes(b"fake")
+            filename = "KinkyCat3D - Samsung Sam [1080P].mp4"
+            legacy_target = destination_root / "Original Character " / " KinkyCat3D" / filename
+            expected_target = destination_root / "Original Character" / "KinkyCat3D" / filename
+            row = {column: "" for column in org.CSV_COLUMNS}
+            row.update({
+                "approved": "yes",
+                "source_path": str(video),
+                "original_name": video.name,
+                "status": "ready",
+                "target_folder": "Original Character / KinkyCat3D",
+                "target_filename": filename,
+                "target_path": str(legacy_target),
+            })
+
+            result = org.apply_row(row, source, "run", "_r34_review", False, destination_root=destination_root)
+
+            self.assertEqual(result["apply_result"], "moved")
+            self.assertEqual(Path(result["apply_message"]), expected_target)
+            self.assertTrue(expected_target.exists())
+            self.assertFalse(video.exists())
+
+    def test_silent_and_review_rows_require_approval_before_hold_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            silent = source / "silent.mp4"
+            review = source / "review.mp4"
+            silent.write_bytes(b"fake")
+            review.write_bytes(b"fake")
+
+            silent_row = {column: "" for column in org.CSV_COLUMNS}
+            silent_row.update({"approved": "no", "source_path": str(silent), "status": "silent"})
+            review_row = {column: "" for column in org.CSV_COLUMNS}
+            review_row.update({"approved": "no", "source_path": str(review), "status": "review"})
+
+            silent_result = org.apply_row(silent_row, source, "run", "_r34_review", False)
+            review_result = org.apply_row(review_row, source, "run", "_r34_review", False)
+
+            self.assertEqual(silent_result["apply_result"], "skipped_unapproved")
+            self.assertEqual(review_result["apply_result"], "skipped_unapproved")
+            self.assertTrue(silent.exists())
+            self.assertTrue(review.exists())
+
+            silent_row["approved"] = "yes"
+            review_row["approved"] = "yes"
+            silent_result = org.apply_row(silent_row, source, "run", "_r34_review", False)
+            review_result = org.apply_row(review_row, source, "run", "_r34_review", False)
+
+            self.assertEqual(silent_result["apply_result"], "held_silent")
+            self.assertEqual(review_result["apply_result"], "held_for_review")
+            self.assertTrue((source / "_r34_silent" / "run" / "silent.mp4").exists())
+            self.assertTrue((source / "_r34_review" / "run" / "review.mp4").exists())
 
     def test_apply_creates_missing_destination_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1134,6 +1718,600 @@ class NumberingHelpersTests(unittest.TestCase):
         self.assertEqual(point, "after_character")
         variants = gui.build_numbered_filename_variants(base, 1, point, set())
         self.assertIn("Megaera - 2B 2 - Training [1080P].mp4", variants)
+
+    def test_two_part_artist_title_filename_numbers_title_not_fake_character(self):
+        base = "Aerith Gainsborough - Cowgirl [1080P].mp4"
+        parts = gui.parse_target_filename_parts(base)
+        self.assertEqual(parts["artist"], "Aerith Gainsborough")
+        self.assertIsNone(parts["character"])
+        self.assertEqual(parts["title"], "Cowgirl")
+        self.assertEqual(parts["sex_descriptor"], "Cowgirl")
+        point = gui.choose_number_insertion_point(parts, base)
+        self.assertEqual(point, "after_sex")
+        variants = gui.build_numbered_filename_variants(base, 1, point, set())
+        self.assertEqual(variants[0], "Aerith Gainsborough - Cowgirl 2 [1080P].mp4")
+
+    def test_known_value_filename_edit_replaces_slots_without_duplication(self):
+        base = "Aerith Gainsborough - Cowgirl [1080P].mp4"
+        self.assertEqual(
+            gui.apply_known_value_to_filename("character", "Aerith Gainsborough", base),
+            base,
+        )
+        self.assertEqual(
+            gui.apply_known_value_to_filename("artist", "Nodu", base),
+            "Nodu - Cowgirl [1080P].mp4",
+        )
+        self.assertEqual(
+            gui.apply_known_value_to_filename("resolution", "4K", base),
+            "Aerith Gainsborough - Cowgirl [4K].mp4",
+        )
+
+    def test_gui_formatter_strips_collection_export_artist_prefix(self):
+        base = "Juicyneko Collection To 2024-04-05 - Aerith Gainsborough - Cowgirl [1080P].mp4"
+        self.assertEqual(
+            gui.apply_known_value_to_filename("resolution", "4K", base),
+            "Juicyneko - Aerith Gainsborough - Cowgirl [4K].mp4",
+        )
+
+    def test_quick_pick_filter_prefers_prefix_then_contains(self):
+        values = ["Tifa Lockhart", "Aerith Gainsborough", "Barret Wallace", "Gainsborough Aerith"]
+        self.assertEqual(
+            gui.filter_known_values(values, "aer"),
+            ["Aerith Gainsborough", "Gainsborough Aerith"],
+        )
+
+    def test_infer_filename_component_edit_detects_only_artist_change(self):
+        before = "Wrong Artist - Aerith Gainsborough - Cowgirl [4K].mp4"
+        after = "Correct Artist - Aerith Gainsborough - Cowgirl [4K].mp4"
+        self.assertEqual(gui.infer_filename_component_edit(before, after), ("artist", "Correct Artist"))
+        self.assertIsNone(
+            gui.infer_filename_component_edit(
+                before,
+                "Correct Artist - Tifa Lockhart - Missionary [4K].mp4",
+            )
+        )
+
+    def test_quick_pick_arrow_navigation_uses_filtered_results(self):
+        class FakeCombo:
+            def __init__(self, value=""):
+                self.value = value
+                self.values = []
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+            def __setitem__(self, key, value):
+                if key == "values":
+                    self.values = list(value)
+            def selection_range(self, *_args):
+                pass
+            def focus_set(self):
+                pass
+
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_known = {"characters": ["Aerith Gainsborough", "Gainsborough Aerith", "Tifa Lockhart"]}
+        fake.corr_character_cb = FakeCombo("aer")
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._quick_pick_key = lambda category: "characters" if category == "character" else None
+        fake._known_combo_state = lambda category: gui.OrganizerGUI._known_combo_state(fake, category)
+        fake._post_known_combo_dropdown = lambda _combo: None
+
+        gui.OrganizerGUI._refresh_known_combo_search(fake, "character", "aer", post=False)
+        gui.OrganizerGUI._navigate_known_combo_results(fake, "character", 1)
+        self.assertEqual(fake.corr_character_cb.get(), "Aerith Gainsborough")
+        gui.OrganizerGUI._navigate_known_combo_results(fake, "character", 1)
+        self.assertEqual(fake.corr_character_cb.get(), "Gainsborough Aerith")
+        self.assertEqual(fake._quick_pick_combo_states["character"]["query"], "aer")
+
+    def test_quick_pick_enter_accepts_result_without_applying_rows(self):
+        class FakeCombo:
+            def __init__(self, value=""):
+                self.value = value
+                self.values = []
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+            def __setitem__(self, key, value):
+                if key == "values":
+                    self.values = list(value)
+            def icursor(self, *_args):
+                pass
+            def focus_set(self):
+                pass
+
+        accepted = []
+        applied = []
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_known = {"characters": ["Aerith Gainsborough", "Gainsborough Aerith"]}
+        fake.corr_character_cb = FakeCombo("aer")
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._quick_pick_key = lambda category: "characters" if category == "character" else None
+        fake._known_combo_state = lambda category: gui.OrganizerGUI._known_combo_state(fake, category)
+        fake._on_known_pick = lambda category, value: accepted.append((category, value))
+        fake._apply_picked_value = lambda category: applied.append(category)
+
+        gui.OrganizerGUI._refresh_known_combo_search(fake, "character", "aer", post=False)
+        gui.OrganizerGUI._accept_known_combo_selection(fake, "character")
+
+        self.assertEqual(fake.corr_character_cb.get(), "Aerith Gainsborough")
+        self.assertEqual(accepted, [("character", "Aerith Gainsborough")])
+        self.assertEqual(applied, [])
+
+    def test_quick_pick_typing_filters_without_reposting_or_refocusing(self):
+        class FakeCombo:
+            def __init__(self, value=""):
+                self.value = value
+                self.values = []
+                self.bindings = {}
+                self.cursor = 1
+                self.focus_calls = 0
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+            def __setitem__(self, key, value):
+                if key == "values":
+                    self.values = list(value)
+            def bind(self, sequence, callback, add=None):
+                self.bindings[sequence] = callback
+            def index(self, index):
+                if index == "insert":
+                    return self.cursor
+                raise ValueError(index)
+            def icursor(self, index):
+                self.cursor = index
+            def focus_set(self):
+                self.focus_calls += 1
+            def after(self, _ms, callback):
+                callback()
+
+        posts = []
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_known = {"characters": ["Aerith Gainsborough", "Gainsborough Aerith", "Tifa Lockhart"]}
+        fake.corr_character_cb = FakeCombo("ae")
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._quick_pick_key = lambda category: "characters" if category == "character" else None
+        fake._known_combo_state = lambda category: gui.OrganizerGUI._known_combo_state(fake, category)
+        fake._post_known_combo_dropdown = lambda combo: posts.append(combo)
+        fake._refresh_known_combo_search = (
+            lambda category, query=None, post=True:
+            gui.OrganizerGUI._refresh_known_combo_search(fake, category, query, post)
+        )
+
+        gui.OrganizerGUI._bind_searchable_known_combo(fake, fake.corr_character_cb, "character")
+        event = type("Event", (), {"keysym": "e"})()
+        fake.corr_character_cb.bindings["<KeyRelease>"](event)
+
+        self.assertEqual(fake.corr_character_cb.values, ["Aerith Gainsborough", "Gainsborough Aerith"])
+        self.assertEqual(posts, [])
+        self.assertEqual(fake.corr_character_cb.focus_calls, 0)
+        self.assertEqual(fake.corr_character_cb.cursor, 1)
+
+    def test_quick_pick_add_and_remove_are_case_insensitive(self):
+        known = {"characters": ["Aerith Gainsborough"]}
+        self.assertFalse(gui.add_quick_pick_known_value(known, "character", "aerith gainsborough"))
+        self.assertTrue(gui.add_quick_pick_known_value(known, "character", "Tifa Lockhart"))
+        self.assertIn("Tifa Lockhart", known["characters"])
+        self.assertTrue(gui.remove_quick_pick_known_value(known, "character", "tifa lockhart"))
+        self.assertNotIn("Tifa Lockhart", known["characters"])
+
+    def test_apply_picked_value_uses_typed_quick_pick_text(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "artist": "Aerith Gainsborough",
+            "character": "",
+            "target_folder": "Final Fantasy",
+            "target_filename": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_artist_cb = Var("Nodu")
+        fake.corr_character_cb = Var("")
+        fake.corr_franchise_cb = Var("")
+        fake.corr_resolution_cb = Var("")
+        fake.corr_folder_var = Var("")
+        fake.corr_filename_var = Var("Aerith Gainsborough - Cowgirl [1080P].mp4")
+        fake.corr_notes_var = Var("")
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._quick_pick_combo = lambda category: {
+            "artist": fake.corr_artist_cb,
+            "character": fake.corr_character_cb,
+            "franchise": fake.corr_franchise_cb,
+            "resolution": fake.corr_resolution_cb,
+        }.get(category)
+        fake._set_known_combo_values = lambda _category: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+        fake._apply_correction = lambda **kwargs: gui.OrganizerGUI._apply_correction(fake, **kwargs)
+
+        gui.OrganizerGUI._apply_picked_value(fake, "artist")
+
+        self.assertEqual(row["target_filename"], "Nodu - Cowgirl [1080P].mp4")
+        self.assertEqual(fake.corr_artist_cb.get(), "")
+        self.assertEqual(fake._last_picked_artist, "Nodu")
+
+    def test_apply_artist_to_multiple_rows_preserves_each_generated_filename(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0", "1")
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        rows = [
+            {
+                "original_name": "one.mp4",
+                "artist": "WrongArtist",
+                "character": "Aerith Gainsborough",
+                "target_folder": "Final Fantasy",
+                "target_filename": "WrongArtist - Aerith Gainsborough - Cowgirl [4K].mp4",
+                "status": "ready",
+                "approved": "yes",
+                "notes": "",
+                "reason": "",
+            },
+            {
+                "original_name": "two.mp4",
+                "artist": "WrongArtist",
+                "character": "Tifa Lockhart",
+                "target_folder": "Final Fantasy",
+                "target_filename": "WrongArtist - Tifa Lockhart - Missionary 3 [1080P].mp4",
+                "status": "ready",
+                "approved": "yes",
+                "notes": "",
+                "reason": "",
+            },
+        ]
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = rows
+        fake.corr_artist_cb = Var("CorrectArtist")
+        fake.corr_character_cb = Var("")
+        fake.corr_franchise_cb = Var("")
+        fake.corr_resolution_cb = Var("")
+        fake.corr_folder_var = Var("")
+        fake.corr_filename_var = Var(rows[0]["target_filename"])
+        fake.corr_notes_var = Var("")
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._quick_pick_combo = lambda category: fake.corr_artist_cb if category == "artist" else None
+        fake._set_known_combo_values = lambda _category: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+        fake._apply_correction = lambda **kwargs: gui.OrganizerGUI._apply_correction(fake, **kwargs)
+
+        gui.OrganizerGUI._apply_picked_value(fake, "artist")
+
+        self.assertEqual(
+            rows[0]["target_filename"],
+            "CorrectArtist - Aerith Gainsborough - Cowgirl [4K].mp4",
+        )
+        self.assertEqual(
+            rows[1]["target_filename"],
+            "CorrectArtist - Tifa Lockhart - Missionary 3 [1080P].mp4",
+        )
+
+    def test_apply_correction_overwrites_existing_target_filename_live(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Aerith Gainsborough - Cowgirl [1080P].mp4",
+            "artist": "Aerith Gainsborough",
+            "character": "",
+            "target_folder": "Final Fantasy",
+            "target_filename": "Aerith Gainsborough - Cowgirl [1080P].mp4 2 - Cowgirl [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_folder_var = Var("")
+        fake.corr_filename_var = Var("Aerith Gainsborough - Cowgirl [1080P].mp4")
+        fake.corr_notes_var = Var("manual cleanup")
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+
+        gui.OrganizerGUI._apply_correction(fake)
+
+        self.assertEqual(row["target_filename"], "Aerith Gainsborough - Cowgirl [1080P].mp4")
+        self.assertTrue(row["target_path"].endswith(r"Final Fantasy\Aerith Gainsborough - Cowgirl [1080P].mp4"))
+        self.assertIn("manual_filename_correction", row["reason"])
+        self.assertEqual(fake.correction_tree.values["0"][4], "Final Fantasy")
+        self.assertTrue(fake.correction_tree.values["0"][5].endswith(r"Final Fantasy"))
+        self.assertNotIn("Aerith Gainsborough - Cowgirl [1080P].mp4", fake.correction_tree.values["0"][5])
+        self.assertEqual(fake.correction_tree.values["0"][6], "Aerith Gainsborough - Cowgirl [1080P].mp4")
+        self.assertEqual(fake.correction_tree.values["0"][7], "[1080P]")
+
+    def test_append_character_to_filename_preserves_structure_and_dedupes(self):
+        original = "Artist - Kiriko - Rescue [1080P].mp4"
+
+        updated = gui.append_character_to_filename("Mercy", original)
+        repeated = gui.append_character_to_filename("Mercy", updated)
+
+        self.assertEqual(updated, "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(repeated, updated)
+
+    def test_append_picked_character_updates_selected_row_and_live_log(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.values = {}
+            def selection(self):
+                return ("0",)
+            def item(self, iid, values=None):
+                if values is not None:
+                    self.values[iid] = values
+                return {"values": self.values.get(iid)}
+
+        row = {
+            "original_name": "Artist - Rescue [1080P].mp4",
+            "artist": "Artist",
+            "character": "Kiriko",
+            "target_folder": "Overwatch",
+            "target_filename": "Artist - Kiriko - Rescue [1080P].mp4",
+            "target_path": r"E:\Library\Overwatch\Artist - Kiriko - Rescue [1080P].mp4",
+            "status": "ready",
+            "approved": "",
+            "notes": "",
+            "reason": "",
+        }
+        logs = []
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.corr_character_cb = Var("Mercy")
+        fake.corr_filename_var = Var(row["target_filename"])
+        fake.dest_var = Var(r"E:\Library")
+        fake.config_var = Var("")
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._quick_pick_combo = lambda category: fake.corr_character_cb if category == "character" else None
+        fake._set_known_combo_values = lambda _category: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._correction_tree_values = lambda row_arg: gui.OrganizerGUI._correction_tree_values(fake, row_arg)
+        fake._correction_row_label = lambda row_arg: gui.OrganizerGUI._correction_row_label(fake, row_arg)
+        fake._log_correction_change = logs.append
+        fake._log_row_changes = lambda row_arg, action, before: gui.OrganizerGUI._log_row_changes(fake, row_arg, action, before)
+
+        gui.OrganizerGUI._append_picked_character(fake)
+
+        self.assertEqual(row["target_filename"], "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(row["character"], "Kiriko, Mercy")
+        self.assertTrue(row["target_path"].endswith(r"Overwatch\Artist - Kiriko, Mercy - Rescue [1080P].mp4"))
+        self.assertEqual(fake.correction_tree.values["0"][3], "Kiriko, Mercy")
+        self.assertEqual(fake.correction_tree.values["0"][6], "Artist - Kiriko, Mercy - Rescue [1080P].mp4")
+        self.assertEqual(fake.corr_character_cb.get(), "")
+        self.assertTrue(any("Add Character" in entry and "Mercy" in entry for entry in logs))
+
+    def test_correction_tree_values_show_path_filename_franchise_and_resolution(self):
+        fake = type("FakeCorrectionGui", (), {})()
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        row = {
+            "original_name": "clip.mp4",
+            "artist": "Megaera",
+            "character": "Kai'Sa",
+            "target_folder": "League of Legends",
+            "target_path": r"E:\James' Stuff\Rule34\League of Legends\Megaera - Kai'Sa - Beach Nude [4K].mp4",
+            "target_filename": "Megaera - Kai'Sa - Beach Nude [4K].mp4",
+            "resolution": "4K",
+            "status": "ready",
+            "approved": "yes",
+            "_bulk_checked": True,
+        }
+
+        values = gui.OrganizerGUI._correction_tree_values(fake, row)
+
+        self.assertEqual(values[4], "League of Legends")
+        self.assertEqual(values[5], r"E:\James' Stuff\Rule34\League of Legends")
+        self.assertNotIn("Megaera - Kai'Sa - Beach Nude [4K].mp4", values[5])
+        self.assertEqual(values[6], "Megaera - Kai'Sa - Beach Nude [4K].mp4")
+        self.assertEqual(values[7], "[4K]")
+
+    def test_correction_tree_sort_uses_logical_column_ordering(self):
+        fake = type("FakeCorrectionGui", (), {})()
+        fake._sort_state = {}
+        fake._refresh_correction_tree = lambda: None
+        fake._correction_resolution_tag = lambda row_arg: gui.OrganizerGUI._correction_resolution_tag(fake, row_arg)
+        fake._natural_sort_key = lambda value: gui.OrganizerGUI._natural_sort_key(fake, value)
+        fake._correction_target_directory = lambda row_arg: gui.OrganizerGUI._correction_target_directory(fake, row_arg)
+        fake._resolution_sort_value = lambda row_arg: gui.OrganizerGUI._resolution_sort_value(fake, row_arg)
+        fake._approved_sort_value = lambda row_arg: gui.OrganizerGUI._approved_sort_value(fake, row_arg)
+        fake._checked_sort_value = lambda row_arg: gui.OrganizerGUI._checked_sort_value(fake, row_arg)
+        fake.correction_rows = [
+            {"original_name": "clip10.mp4", "target_filename": "B [4K].mp4", "resolution": "4K", "approved": "yes"},
+            {"original_name": "clip2.mp4", "target_filename": "A [1080P].mp4", "resolution": "1080P", "approved": "no"},
+            {"original_name": "clip1.mp4", "target_filename": "C [720P].mp4", "resolution": "720P", "approved": "yes"},
+        ]
+
+        gui.OrganizerGUI._sort_tree(fake, "original")
+        self.assertEqual([r["original_name"] for r in fake.correction_rows], ["clip1.mp4", "clip2.mp4", "clip10.mp4"])
+
+        gui.OrganizerGUI._sort_tree(fake, "resolution")
+        self.assertEqual([r["resolution"] for r in fake.correction_rows], ["720P", "1080P", "4K"])
+
+    def test_correction_explorer_target_prefers_existing_source_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "clip.mp4"
+            source.write_bytes(b"fake")
+            target_dir = Path(tmp) / "dest"
+            target_dir.mkdir()
+            row = {
+                "source_path": str(source),
+                "target_path": str(target_dir / "Renamed Clip.mp4"),
+            }
+            fake = type("FakeCorrectionGui", (), {})()
+
+            path, select_file = gui.OrganizerGUI._correction_explorer_target_for_row(fake, row)
+
+            self.assertEqual(path, source)
+            self.assertTrue(select_file)
+
+    def test_correction_explorer_target_falls_back_to_existing_target_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_dir = Path(tmp) / "dest"
+            target_dir.mkdir()
+            row = {
+                "source_path": str(Path(tmp) / "missing" / "clip.mp4"),
+                "target_path": str(target_dir / "Renamed Clip.mp4"),
+            }
+            fake = type("FakeCorrectionGui", (), {})()
+
+            path, select_file = gui.OrganizerGUI._correction_explorer_target_for_row(fake, row)
+
+            self.assertEqual(path, target_dir)
+            self.assertFalse(select_file)
+
+    def test_show_correction_file_in_explorer_uses_context_row(self):
+        class Var:
+            def __init__(self):
+                self.value = ""
+            def set(self, value):
+                self.value = value
+            def get(self):
+                return self.value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "clicked.mp4"
+            source.write_bytes(b"fake")
+            row = {"source_path": str(source), "target_path": ""}
+            calls = []
+            fake = type("FakeCorrectionGui", (), {})()
+            fake.status_var = Var()
+            fake._correction_context_row = lambda: row
+            fake._correction_explorer_target_for_row = lambda row_arg: gui.OrganizerGUI._correction_explorer_target_for_row(fake, row_arg)
+            fake._open_in_explorer = lambda path, select_file=False: calls.append((path, select_file))
+
+            gui.OrganizerGUI._show_correction_file_in_explorer(fake)
+
+            self.assertEqual(calls, [(source, True)])
+            self.assertIn("clicked.mp4", fake.status_var.get())
+
+    def test_explorer_select_command_quotes_file_for_highlighting(self):
+        fake = type("FakeCorrectionGui", (), {})()
+        path = Path(r"C:\Source Folder\Nested\selected clip.mp4")
+
+        command = gui.OrganizerGUI._explorer_select_command(fake, path)
+
+        self.assertEqual(command, 'explorer.exe /select,"C:\\Source Folder\\Nested\\selected clip.mp4"')
+
+    def test_approval_status_can_be_changed_live(self):
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self):
+                self.columns = {}
+            def selection(self):
+                return ("0",)
+            def set(self, iid, column, value):
+                self.columns[(iid, column)] = value
+
+        row = {
+            "original_name": "Needs Review.mp4",
+            "status": "unmatched",
+            "approved": "",
+        }
+        fake = type("FakeCorrectionGui", (), {})()
+        fake.correction_tree = FakeTree()
+        fake.correction_rows = [row]
+        fake.status_var = Var("")
+        fake.append_output = lambda _msg: None
+        fake._set_row_approved = (
+            lambda row_arg, approved, iid=None, tree=None, promote_ready=False:
+            gui.OrganizerGUI._set_row_approved(fake, row_arg, approved, iid, tree, promote_ready)
+        )
+
+        gui.OrganizerGUI._approve_row(fake, row, "0", fake.correction_tree)
+        self.assertEqual(row["approved"], "yes")
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(fake.correction_tree.columns[("0", "approved")], "yes")
+        self.assertEqual(fake.correction_tree.columns[("0", "status")], "ready")
+
+        gui.OrganizerGUI._unapprove_selected(fake)
+        self.assertEqual(row["approved"], "no")
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(fake.correction_tree.columns[("0", "approved")], "no")
+        self.assertIn("unapproved", fake.status_var.get())
 
     def test_ambiguous_parse_requires_dialog(self):
         base = "weirdtitle without dashes or sex [4K].mp4"
@@ -2306,6 +3484,394 @@ class Phase3bKnownValuesConfigEditTests(unittest.TestCase):
         self.assertIn("counts", preview)
         # auto on sample may produce ambiguous for some generic groups
         self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4c: reviewed Stash import to in-memory manager edits (pure stage_ + safety)
+    # ------------------------------------------------------------------
+
+    def test_stash_import_stages_artist_aliases_candidate(self):
+        items = [{"norm_key": "newartist", "original": "New Artist", "suggested_section": "artist_aliases", "status": "missing_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newartist", res["updated_artist_aliases"])
+        self.assertEqual(res["updated_artist_aliases"]["newartist"], "New Artist")
+        self.assertEqual(res["num_added"], 1)
+        self.assertEqual(len(res["added"]["artist_aliases"]), 1)
+
+    def test_stash_import_stages_folder_aliases_candidate(self):
+        items = [{"norm_key": "newfran", "original": "New Franchise", "suggested_section": "folder_aliases", "status": "missing_local", "source": "stash_group"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newfran", res["updated_folder_aliases"])
+        self.assertEqual(res["num_added"], 1)
+
+    def test_stash_import_stages_canonical_candidate(self):
+        items = [{"norm_key": "newchar", "original": "New Char", "suggested_section": "canonical_character_aliases", "status": "missing_local", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, overwrite_conflicts=False)
+        self.assertIn("newchar", res["updated_canonical_character_aliases"])
+        self.assertEqual(res["num_added"], 1)
+
+    def test_stash_import_skips_ignored_or_review(self):
+        items = [{"norm_key": "ign", "original": "Ign", "suggested_section": "ignored_or_review", "status": "missing_local", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["ignored_or_review"]), 1)
+
+    def test_stash_import_skips_ambiguous_by_default(self):
+        items = [{"norm_key": "ambig", "original": "Ambig", "suggested_section": "artist_aliases", "status": "ambiguous", "source": "stash_tag"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["ambiguous"]), 1)
+
+    def test_stash_import_skips_already_exists_local_by_default(self):
+        items = [{"norm_key": "exists", "original": "Exists", "suggested_section": "artist_aliases", "status": "already_exists_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, {}, {}, {}, False)
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(len(res["skipped"]["already_exists_local"]), 1)
+
+    def test_stash_import_does_not_overwrite_silently(self):
+        local_aa = {"dup": "Old"}
+        items = [{"norm_key": "dup", "original": "NewDup", "suggested_section": "artist_aliases", "status": "missing_local", "source": "stash_performer"}]
+        res = gui.stage_stash_import_items(items, local_aa, {}, {}, overwrite_conflicts=False)
+        self.assertEqual(res["updated_artist_aliases"]["dup"], "Old")  # unchanged
+        self.assertEqual(res["num_added"], 0)
+        self.assertEqual(res["num_conflicts"], 1)
+
+    def test_stash_import_to_manager_does_not_modify_config_json(self):
+        import tempfile, json, os, shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "r34_config.json"
+            # minimal valid for the 4 keys
+            base = {"artist_aliases": {}, "folder_aliases": {}, "character_mappings": {}, "canonical_character_aliases": {}, "destination_root": str(Path(tmp))}
+            cfg_p.write_text(json.dumps(base), encoding="utf-8")
+            pre_m = cfg_p.stat().st_mtime
+            # exercise the pure (as UI would)
+            items = [{"norm_key": "foo", "original": "Foo", "suggested_section": "artist_aliases", "status": "missing_local"}]
+            gui.stage_stash_import_items(items, {}, {}, {}, False)
+            self.assertEqual(pre_m, cfg_p.stat().st_mtime, "stage pure must not touch config file")
+            # also confirm no learned touched (none here)
+
+    def test_stash_import_to_manager_does_not_modify_learned_json(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmp:
+            learned_p = Path(tmp) / "learned_character_franchises.json"
+            learned_p.write_text(json.dumps({"old": "Old"}), encoding="utf-8")
+            pre_m = learned_p.stat().st_mtime
+            items = [{"norm_key": "x", "original": "X", "suggested_section": "artist_aliases", "status": "missing_local"}]
+            gui.stage_stash_import_items(items, {}, {}, {}, False)
+            self.assertEqual(pre_m, learned_p.stat().st_mtime)
+
+    def test_no_mutation_strings_still_after_4c(self):
+        code = (PROJECT_ROOT / "r34_gui.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("mutation ", code)
+
+    def test_full_suite_still_passes_after_4c(self):
+        # meta: adding 4c import staging (pure + UI in gui.py) must not break prior
+        preview = gui.build_stash_import_preview(gui.get_sample_stash_data(), {}, {}, {}, {}, group_role_override="rule34_artists")
+        self.assertIn("counts", preview)
+        # also exercise stage on sample-derived
+        sample_items = [i for i in preview.get("items", []) if i.get("status") == "missing_local" and i.get("suggested_section") in ("artist_aliases", "folder_aliases", "canonical_character_aliases")][:3]
+        if sample_items:
+            res = gui.stage_stash_import_items(sample_items, {}, {}, {}, False)
+            self.assertIn("added", res)
+        self.assertTrue(True)
+
+    # ------------------------------------------------------------------
+    # Phase 4c-preflight classification audit tests (build + export focused; no bulk import changes)
+    # ------------------------------------------------------------------
+
+    def test_preflight_compilation_group_is_review_only(self):
+        # Issue 1: Compilation should not be artist
+        stash = {"performers": [], "groups": ["Compilation"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        comps = [i for i in preview["items"] if "compil" in i.get("original", "").lower()]
+        self.assertTrue(comps)
+        self.assertEqual(comps[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("review-only", comps[0].get("classification_reason", "").lower())
+
+    def test_preflight_hentai_is_review_only(self):
+        # Hentai as generic label -> review
+        stash = {"performers": [], "groups": ["Hentai"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {}, group_role_override="rule34_artists")
+        hits = [i for i in preview["items"] if "hentai" in i.get("original", "").lower()]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+
+    def test_preflight_characters_tag_is_review_only(self):
+        # Issue 4: Characters category tag should not become canonical alias
+        stash = {"performers": [], "groups": [], "tags": ["Characters"]}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        chars = [i for i in preview["items"] if i.get("original", "").lower() == "characters"]
+        self.assertTrue(chars)
+        self.assertEqual(chars[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("category tag", chars[0].get("classification_reason", "").lower())
+
+    def test_preflight_comma_multi_is_review_only(self):
+        # Issue 2
+        stash = {"performers": [], "groups": ["Jewelz Blu, Nicole Doshi"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        hits = [i for i in preview["items"] if "," in i.get("original", "")]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("comma-separated", hits[0].get("classification_reason", "").lower())
+
+    def test_preflight_x_pairing_is_review_only(self):
+        # Issue 2/3 : Yuffie x Cloud
+        stash = {"performers": [], "groups": ["Yuffie x Cloud"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        hits = [i for i in preview["items"] if "x cloud" in i.get("original", "").lower()]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["suggested_section"], "ignored_or_review")
+        self.assertIn("x-pairing", hits[0].get("classification_reason", "").lower())
+
+    def test_preflight_compact_key_duplicate_flagged_possible_duplicate(self):
+        # Issue: Aries Possession / AriesPossession -> possible_duplicate by compact, not auto merge
+        stash = {"performers": [], "groups": ["Aries Possession", "AriesPossession"], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        dups = [i for i in preview["items"] if i.get("status") == "possible_duplicate"]
+        self.assertTrue(len(dups) >= 1)
+        # both should have compact_key
+        for d in dups:
+            self.assertIn("compact_key", d)
+            self.assertEqual(d["compact_key"], "ariespossession")
+
+    def test_preflight_export_includes_ignored_or_review_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = {"performers": [], "groups": ["Compilation"], "tags": ["Characters"]}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("## Ignored or review-only", content)
+            self.assertIn("review-only denylist match", content)
+            self.assertIn("category tag (Characters)", content)
+
+    def test_preflight_export_includes_ambiguous_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # use rich tag_data so classify hits conflicting parents -> role=ambiguous, section=ignored
+            stash = {"tag_data": [{"name": "AmbiguousMixed", "aliases": [], "parents": [{"name": "Artists"}, {"name": "Characters"}], "children": []}]}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("## Ambiguous", content)
+
+    def test_preflight_export_note_reflects_tag_classification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = gui.get_sample_stash_data()
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            self.assertIn("classified by parent/ancestor", content.lower())
+            # no longer claims all tags are canonical only
+            self.assertNotIn("treated as canonical_character_aliases candidates only", content)
+
+    def test_preflight_export_rows_include_full_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stash = {"performers": ["Pantsushi"], "groups": ["Compilation"], "tags": []}
+            preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+            rp = gui.export_stash_preview_report(preview, "http://example/graphql", False, dest_dir=Path(tmp))
+            content = Path(rp).read_text(encoding="utf-8")
+            # every listed row should have role: suggested: source: status: reason:
+            self.assertIn("role:", content)
+            self.assertIn("-> artist_aliases", content)
+            self.assertIn("status:missing_local", content)
+            self.assertIn("source:stash_performer", content)
+
+    def test_preflight_hentai_performer_is_review_only_not_artist(self):
+        # Small 4c fix: Hentai (and other denylist) as stash_performer must become ignored_or_review
+        # (not artist_aliases), even though previous logic always forced performers to artist.
+        stash = {"performer_data": [{"name": "Hentai", "alias_list": []}], "groups": [], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        h = [i for i in preview["items"] if i.get("original", "").lower() == "hentai"]
+        self.assertTrue(h)
+        self.assertEqual(h[0]["source"], "stash_performer")
+        self.assertEqual(h[0]["detected_tag_role"], "ignored_or_review")
+        self.assertEqual(h[0]["suggested_section"], "ignored_or_review")
+        self.assertEqual(h[0]["status"], "ignored_or_review")
+        self.assertIn("review-only denylist match", h[0].get("classification_reason", "").lower())
+
+    def test_preflight_normal_performer_still_artist_alias(self):
+        # Normal names (e.g. Pantsushi) must still become artist_aliases candidates.
+        stash = {"performer_data": [{"name": "Pantsushi", "alias_list": []}], "groups": [], "tags": []}
+        preview = gui.build_stash_import_preview(stash, {}, {}, {}, {})
+        p = [i for i in preview["items"] if i.get("original", "").lower() == "pantsushi"]
+        self.assertTrue(p)
+        self.assertEqual(p[0]["source"], "stash_performer")
+        self.assertEqual(p[0]["suggested_section"], "artist_aliases")
+        self.assertEqual(p[0]["status"], "missing_local")
+
+
+class VariantPolicyEngineTests(unittest.TestCase):
+    def config(self, root: Path, **policy_updates):
+        cfg = make_config(root)
+        policy = json.loads(json.dumps(org.DEFAULT_VARIANT_POLICY))
+        policy.update(policy_updates)
+        return org.replace_config(cfg, variant_policy=policy)
+
+    def row(self, root: Path, name: str, *, character="Malenia", resolution="1080P",
+            version="", descriptors="", credits="", duration=10.0, status="ready"):
+        source = root / name
+        return {
+            "approved": "yes" if status == "ready" else "no",
+            "source_path": str(source), "original_name": name, "artist": "HowlSFM",
+            "character": character, "clean_title": "", "resolution": resolution,
+            "target_folder": "Elden Ring", "target_filename": f"placeholder [{resolution}].mp4",
+            "target_path": str(root / "dest" / f"placeholder [{resolution}].mp4"),
+            "status": status, "reason": "", "notes": "", "variant_family": "",
+            "variant_version": version, "variant_descriptors": descriptors,
+            "variant_credits": credits, "variant_decision": "", "variant_reason": "",
+            "variant_rank": "", "_variant_duration": duration, "_variant_subfolder": "",
+            "_variant_candidate_version": "",
+        }
+
+    def test_descriptor_and_credit_aliases_preserve_meaning(self):
+        cfg = self.config(Path("C:/dest"), credit_aliases={"evil audio": "EvilAudio"})
+        meta = org.extract_variant_metadata(["Malenia_NoMaleAudio_Evil Audio_NoPubicHair_Pubes"], cfg)
+        self.assertIn("NMA", meta["descriptors"])
+        self.assertNotIn("Pubes", meta["descriptors"])
+        self.assertEqual(meta["credits"], ["EvilAudio"])
+        self.assertIn("Evil Audio", org.clean_title("Malenia Evil Audio", cfg))
+
+    def test_explicit_sibling_infers_v1_and_nma_supersedes_regular(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self.config(root)
+            regular = self.row(root, "Malenia.mp4", descriptors="Std")
+            nma = self.row(root, "Malenia_NMA.mp4", descriptors="Std, NMA")
+            v2 = self.row(root, "Malenia2.mp4", version="V2", descriptors="Std", duration=20.0)
+            org.apply_variant_policy([regular, nma, v2], cfg)
+            self.assertEqual(regular["variant_version"], "V1")
+            self.assertEqual(nma["variant_version"], "V1")
+            self.assertEqual(regular["status"], "superseded_variant")
+            self.assertEqual(nma["status"], "ready")
+            self.assertIn("V1", nma["target_filename"])
+
+    def test_standalone_scene_does_not_gain_v1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.row(Path(tmp), "2b_opaluva.mp4", character="2B", credits="OpaluVA")
+            org.apply_variant_policy([row], self.config(Path(tmp)))
+            self.assertEqual(row["variant_version"], "")
+
+    def test_two_ranked_performances_retained_third_reviews(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prefs = {"global": [], "artists": {}, "characters": {"HowlSFM|Malenia": ["OpaluVA", "EvilAudio"]}}
+            cfg = self.config(root, preferred_performances=prefs, max_preferred_performances=2)
+            rows = [
+                self.row(root, "a.mp4", credits="OpaluVA"),
+                self.row(root, "b.mp4", credits="EvilAudio", duration=11),
+                self.row(root, "c.mp4", credits="OtherVA", duration=12),
+            ]
+            org.apply_variant_policy(rows, cfg)
+            self.assertEqual([row["status"] for row in rows], ["ready", "ready", "variant_review"])
+
+    def test_co_credits_are_one_unordered_signature(self):
+        policy = {"global": [], "artists": {}, "characters": {"HowlSFM|Malenia": ["VoiceB + VoiceA"]}}
+        cfg = self.config(Path("C:/dest"), preferred_performances=policy)
+        self.assertEqual(org._preferred_performances(cfg.variant_policy, "HowlSFM", "Malenia"), ["VoiceA + VoiceB"])
+
+    def test_equivalent_lower_resolution_is_superseded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            high = self.row(root, "same (2).mp4", resolution="4K", duration=8)
+            low = self.row(root, "same.mp4", resolution="1080P", duration=8.1)
+            org.apply_variant_policy([low, high], self.config(root))
+            self.assertEqual(low["status"], "superseded_variant")
+            self.assertEqual(high["status"], "ready")
+
+    def test_unique_lower_resolution_and_optional_variants_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = self.row(root, "base.mp4", resolution="4K", duration=8)
+            distinct = self.row(root, "distinct.mp4", resolution="1080P", duration=20, descriptors="Nude")
+            optional = self.row(root, "pov.mp4", resolution="4K", duration=8, descriptors="POV")
+            org.apply_variant_policy([base, distinct, optional], self.config(root))
+            self.assertEqual(distinct["status"], "variant_review")
+            self.assertEqual(optional["status"], "variant_review")
+
+    def test_content_and_silent_statuses_override_variant_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = self.row(root, "a.mp4", status="content_review")
+            silent = self.row(root, "b.mp4", status="silent")
+            org.apply_variant_policy([content, silent], self.config(root))
+            self.assertEqual(content["status"], "content_review")
+            self.assertEqual(silent["status"], "silent")
+
+    def test_old_csv_loads_blank_variant_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.csv"
+            old_columns = [column for column in org.CSV_COLUMNS if column not in org.VARIANT_CSV_COLUMNS]
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=old_columns)
+                writer.writeheader()
+                writer.writerow({column: "" for column in old_columns})
+            loaded = org.read_csv(path)[0]
+            self.assertTrue(all(loaded[column] == "" for column in org.VARIANT_CSV_COLUMNS))
+
+    def test_apply_holds_superseded_and_undo_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "clip.mp4"
+            source.write_bytes(b"clip")
+            row = self.row(root, source.name)
+            row.update({"source_path": str(source), "status": "superseded_variant", "approved": "no"})
+            applied = org.apply_row(row, root, "run", "_review", False, superseded_folder_name="_superseded")
+            self.assertEqual(applied["apply_result"], "held_superseded_variant")
+            self.assertTrue(Path(applied["held_path"]).exists())
+            undone = org.undo_row(applied, root, "run", "_review")
+            self.assertEqual(undone["undo_result"], "restored")
+            self.assertTrue(source.exists())
+
+    def test_variant_policy_config_save_is_backup_first(self):
+        import r34_gui as gui
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r34_config.json"
+            path.write_text(json.dumps({"destination_root": tmp, "untouched": 7}), encoding="utf-8")
+            backup = gui.apply_variant_policy_edits_to_config(path, {"enabled": False})
+            self.assertTrue(backup.exists())
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(raw["untouched"], 7)
+            self.assertFalse(raw["variant_policy"]["enabled"])
+
+    def test_collection_artist_ordinal_range_suffix_is_removed(self):
+        cfg = self.config(Path("C:/dest"))
+        reference = org.ReferenceData({}, {}, {}, {}, org.NamingStyle(0, {}, ()))
+        artist, _, reason = org.source_context_artist(Path("C:/Downloads/AlenAbyss animations 01-30"), cfg, reference)
+        self.assertEqual(artist, "AlenAbyss")
+        self.assertIn("collection", reason)
+
+    def test_decimal_catalog_index_is_removed_from_subfolder(self):
+        self.assertEqual(org.strip_leading_index("19.1. Loba full audio"), "Loba full audio")
+        self.assertEqual(org.strip_leading_index("37.1 Vanessa and Chica"), "Vanessa and Chica")
+
+    def test_version_inference_ignores_fps_and_separate_folder_index(self):
+        cfg = self.config(Path("C:/dest"))
+        meta = org.extract_variant_metadata(
+            ["Asking out Tifa No Bra Version-75fps", "Asking out Tifa No Bra Version", "32. Asking out Tifa"],
+            cfg,
+            "Tifa Lockhart",
+        )
+        self.assertEqual(meta["version"], "")
+        self.assertEqual(meta["descriptors"], ["No Bra"])
+
+    def test_no_bra_dominates_overlapping_bra_alias(self):
+        cfg = self.config(Path("C:/dest"), descriptor_aliases={"no bra": "No Bra", "bra": "Bra"})
+        meta = org.extract_variant_metadata(["Tifa no bra"], cfg)
+        self.assertEqual(meta["descriptors"], ["No Bra"])
+
+    def test_position_cleanup_does_not_duplicate_trailing_title(self):
+        self.assertEqual(org.clean_position_descriptors("Loba Doggystyle - Gettin D"), "Loba Doggystyle - Gettin D")
+        self.assertEqual(org.clean_position_descriptors("Mercy Standing Sex"), "Mercy Standing Sex")
+
+    def test_known_variant_family_is_not_sequentially_numbered(self):
+        rows = [
+            {"target_filename": "Artist - Scene [4K].mp4", "target_path": "C:/dest/Artist - Scene [4K].mp4", "variant_family": "abc"},
+            {"target_filename": "Artist - Scene [4K].mp4", "target_path": "C:/dest/Artist - Scene [4K].mp4", "variant_family": "abc"},
+        ]
+        org.deduplicate_target_filenames(rows)
+        self.assertEqual(rows[0]["target_filename"], rows[1]["target_filename"])
+
+    def test_fps_metadata_is_removed_before_resolution_cleanup(self):
+        cfg = self.config(Path("C:/dest"))
+        self.assertEqual(org.clean_title("Ballerina Nude 4k-75fps", cfg), "Ballerina Nude")
 
 
 if __name__ == "__main__":

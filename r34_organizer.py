@@ -25,12 +25,12 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "0.3.0"
+VERSION = "0.5.0"
 
 CSV_COLUMNS = [
     "approved",
@@ -52,12 +52,23 @@ CSV_COLUMNS = [
     "title_confidence",
     "resolution_confidence",
     "weighted_confidence",
+    "variant_family",
+    "variant_version",
+    "variant_descriptors",
+    "variant_credits",
+    "variant_decision",
+    "variant_reason",
+    "variant_rank",
     "status",
     "reason",
     "notes",
 ]
 
-OPTIONAL_CSV_COLUMNS = {"character", "character_confidence", "character_reason", "artist_confidence", "character_confidence_component", "franchise_confidence", "title_confidence", "resolution_confidence", "weighted_confidence"}
+VARIANT_CSV_COLUMNS = {
+    "variant_family", "variant_version", "variant_descriptors", "variant_credits",
+    "variant_decision", "variant_reason", "variant_rank",
+}
+OPTIONAL_CSV_COLUMNS = {"character", "character_confidence", "character_reason", "artist_confidence", "character_confidence_component", "franchise_confidence", "title_confidence", "resolution_confidence", "weighted_confidence"} | VARIANT_CSV_COLUMNS
 REQUIRED_CSV_COLUMNS = [col for col in CSV_COLUMNS if col not in OPTIONAL_CSV_COLUMNS]
 
 BLOCKED_STATUSES = {"blocked", "duplicate", "missing_source", "unmatched", "invalid"}
@@ -81,19 +92,161 @@ PRECEDENT_STOP_TOKENS = {
     "clip",
     "concept",
     "day",
+    "down",
     "extra",
+    "feet",
+    "high",
     "full",
+    "from",
     "girl",
     "hot",
     "loop",
+    "long",
     "melon",
     "new",
     "night",
     "part",
+    "res",
+    "remake",
     "scene",
+    "short",
     "the",
     "valentine",
+    "vid",
+    "vids",
+    "ver",
+    "version",
     "wife",
+    "with",
+    "without",
+    "x",
+}
+
+CHARACTER_DESCRIPTOR_STOP_TOKENS = {
+    "all",
+    "angle",
+    "angles",
+    "anal",
+    "backdoor",
+    "beach",
+    "bj",
+    "blowjob",
+    "cam",
+    "camera",
+    "cockrider",
+    "compilation",
+    "cowgirl",
+    "deepthroat",
+    "dildo",
+    "dong",
+    "doggy",
+    "doggystyle",
+    "facial",
+    "feet",
+    "footjob",
+    "face",
+    "handjob",
+    "hj",
+    "licking",
+    "missionary",
+    "multiaudio",
+    "nude",
+    "oral",
+    "patron",
+    "piledrived",
+    "piledriver",
+    "piledrivered",
+    "pole",
+    "prone",
+    "quickie",
+    "reverse",
+    "ride",
+    "riding",
+    "sitting",
+    "solo",
+    "standing",
+    "strapon",
+    "spitroast",
+    "thighjob",
+    "titjob",
+    "tribbing",
+}
+
+TECHNICAL_CHARACTER_STOP_TOKENS = {
+    "animation",
+    "animated",
+    "cam",
+    "camera",
+    "classic",
+    "concept",
+    "commission",
+    "cut",
+    "exclusive",
+    "feb",
+    "january",
+    "jan",
+    "february",
+    "march",
+    "mar",
+    "april",
+    "apr",
+    "june",
+    "jun",
+    "july",
+    "jul",
+    "august",
+    "aug",
+    "september",
+    "sep",
+    "october",
+    "oct",
+    "november",
+    "nov",
+    "december",
+    "dec",
+    "high",
+    "long",
+    "model",
+    "official",
+    "patron",
+    "poll",
+    "raffle",
+    "raf",
+    "realistic",
+    "remake",
+    "res",
+    "sg",
+    "showcase",
+    "short",
+    "sound",
+    "seconds",
+    "ver",
+    "version",
+    "without",
+}
+
+PRECEDENT_SUPPRESS_TOKENS = PRECEDENT_STOP_TOKENS | CHARACTER_DESCRIPTOR_STOP_TOKENS | TECHNICAL_CHARACTER_STOP_TOKENS | {
+    "cake",
+    "doll",
+    "fuck",
+    "fuk",
+    "pog",
+    "speshal",
+    "subway",
+    "turntable",
+}
+CHARACTER_ALIAS_DENYLIST = {
+    "b",
+    "dildo",
+    "feet",
+    "patron",
+    "pov",
+    "quickie",
+    "seconds",
+    "spitroast",
+    "w",
+    "whispers",
+    "zero",
 }
 
 GENERIC_SOURCE_FOLDER_NAMES = {
@@ -107,14 +260,126 @@ GENERIC_SOURCE_FOLDER_NAMES = {
     "incoming",
     "new",
     "new clips",
+    "5 seconds or less",
+    "6 9 seconds",
+    "10 20 seconds",
+    "longer animations",
+    "duration unknown",
     "to sort",
     "unsorted",
     "video",
     "videos",
 }
 
+DURATION_BUCKET_FOLDER_NAMES = {
+    "5 seconds or less",
+    "6 9 seconds",
+    "10 20 seconds",
+    "longer animations",
+    "duration unknown",
+}
+
+INTERNAL_ORGANIZER_FOLDER_NAMES = {
+    "_r34_angle_variants",
+    "_r34_content_review",
+    "_r34_operation_logs",
+    "_r34_review",
+    "_r34_silent",
+    "_r34_superseded_variants",
+    "_r34_trimmed_for_review",
+}
+
+GENERIC_SUBFOLDER_CONTEXT_NAMES = {
+    "bonus",
+    "bonuses",
+    "extra",
+    "extras",
+    "loop",
+    "loops",
+    "sound",
+    "sounds",
+    "sfx",
+    "variants",
+    "version",
+    "versions",
+}
+
+SOURCE_COLLECTION_DATE_RE = r"(?:19|20)\d{2}(?:[-_. ]\d{1,2}(?:[-_. ]\d{1,2})?)?"
+SOURCE_COLLECTION_RANGE_RE = (
+    rf"(?:{SOURCE_COLLECTION_DATE_RE})"
+    rf"(?:[-_. ]*(?:to|through|thru|until|up[-_. ]*to)[-_. ]*(?:{SOURCE_COLLECTION_DATE_RE}))?"
+)
+SOURCE_ORDINAL_RANGE_RE = r"\d{1,4}\s*(?:-|to|through|thru)\s*\d{1,4}"
 SOURCE_ARTIST_SUFFIX_RE = re.compile(
-    r"(?i)\s+(?:artist\s+)?(?:collection|clips?|videos?|animations?)\s*$"
+    rf"(?i)[\s_.-]+(?:artist[\s_.-]+)?"
+    rf"(?:collection|clips?|videos?|animations?|animation|packs?|batches|archives?|uploads?|downloads?)"
+    rf"(?:[\s_.-]+(?:(?:from[\s_.-]+)?(?:{SOURCE_COLLECTION_RANGE_RE}|{SOURCE_ORDINAL_RANGE_RE})|"
+    rf"(?:to|through|thru|until|up[-_. ]*to)[\s_.-]+(?:{SOURCE_COLLECTION_DATE_RE})))?\s*$"
+)
+
+SCENE_DESCRIPTOR_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern, re.I), canonical)
+    for pattern, canonical in (
+        (r"\bpublic\s+hand\s*job\b", "Public Handjob"),
+        (r"\bbreed\s+a\s+brat\b", "Breed A Brat"),
+        (r"\brough\s+ride\b", "Rough Ride"),
+        (r"\bpole\s+danc(?:e|ing)\b", "Pole Dancing"),
+        (r"\breverse\s+cowgirl\b", "Reverse Cowgirl"),
+        (r"\bjack[-\s]*o[-\s]*pose\b", "Jack-O-Pose"),
+        (r"\bdeep\s*throat\b", "Deepthroat"),
+        (r"\bhand\s*job\b", "Handjob"),
+        (r"\bblow\s*job\b", "Blowjob"),
+        (r"\boral\s+job\b", "Oral Job"),
+        (r"\bcock\s*rider\b", "Cockrider"),
+        (r"\bpile\s*driver(?:ed)?\b", "Piledriver"),
+        (r"\bdoggy\s*style\b", "Doggystyle"),
+        (r"\bon\s+top\b", "On Top"),
+        (r"\bback\s*door\b", "Backdoor"),
+        (r"\bmissionary\b", "Missionary"),
+        (r"\bcowgirl\b", "Cowgirl"),
+        (r"\bdoggy\b", "Doggy"),
+        (r"\briding\b", "Riding"),
+        (r"\bcreampie\b", "Creampie"),
+        (r"\bdeepthroat\b", "Deepthroat"),
+        (r"\bhandjob\b", "Handjob"),
+        (r"\bblowjob\b", "Blowjob"),
+        (r"\bbackdoor\b", "Backdoor"),
+        (r"\bcockrider\b", "Cockrider"),
+        (r"\bfacial\b", "Facial"),
+        (r"\banal\b", "Anal"),
+        (r"\boral\b", "Oral"),
+        (r"\bnude\b", "Nude"),
+        (r"\bBJ\b", "BJ"),
+        (r"\bHJ\b", "HJ"),
+        (r"\b69\b", "69"),
+    )
+)
+SCENE_DESCRIPTOR_TOKEN_NORMS = frozenset(
+    re.sub(r"[^a-z0-9]+", " ", token.lower()).strip()
+    for _, canonical in SCENE_DESCRIPTOR_PATTERNS
+    for token in re.findall(r"[A-Za-z0-9]+", canonical)
+)
+
+COMPACT_SCENE_DESCRIPTOR_SUFFIXES: Tuple[Tuple[str, str], ...] = (
+    ("deepthroat", "Deepthroat"),
+    ("blowjob", "Blowjob"),
+    ("handjob", "Handjob"),
+    ("thighjob", "Thighjob"),
+    ("ridedildo", "Ride Dildo"),
+    ("cockrider", "Cockrider"),
+    ("missionary", "Missionary"),
+    ("backdoor", "Backdoor"),
+    ("creampie", "Creampie"),
+    ("cowgirl", "Cowgirl"),
+    ("doggy", "Doggy"),
+    ("facial", "Facial"),
+    ("riding", "Riding"),
+    ("dildo", "Dildo"),
+    ("ride", "Ride"),
+    ("anal", "Anal"),
+    ("oral", "Oral"),
+    ("bj", "BJ"),
+    ("hj", "HJ"),
 )
 
 DEFAULT_RESOLUTION_LABELS = {
@@ -127,6 +392,36 @@ DEFAULT_RESOLUTION_LABELS = {
 }
 
 RESOLUTION_BUCKET_ORDER = ("8k", "4k", "1440", "1080", "720", "480")
+
+DEFAULT_VARIANT_POLICY: Dict[str, Any] = {
+    "enabled": True,
+    "max_preferred_performances": 2,
+    "duration_tolerance_seconds": 0.5,
+    "duration_tolerance_percent": 2.0,
+    "superseded_folder_name": "_r34_superseded_variants",
+    "descriptor_aliases": {
+        "no male audio": "NMA", "nomaleaudio": "NMA", "nma": "NMA",
+        "standard": "Std", "default": "Std", "clothed": "Std", "std": "Std",
+        "alternate": "Alt", "alt": "Alt", "point of view": "POV", "pov": "POV",
+        "alternate angles": "Alt Angles", "alt angles": "Alt Angles", "altangles": "Alt Angles",
+        "nude": "Nude", "bonus": "Bonus", "loop": "Loop", "barelegs": "Barelegs",
+        "bare legs": "Barelegs", "no hat": "No Hat", "nohat": "No Hat",
+        "no x ray": "No X-Ray", "noxray": "No X-Ray", "facesit": "Facesit",
+        "facesitting": "Facesit", "pubes": "Pubes", "pubic hair": "Pubes",
+        "full nude": "Nude", "nude version": "Nude", "nude ver": "Nude",
+        "bra version": "Bra", "bra": "Bra", "no bra version": "No Bra", "no bra": "No Bra",
+        "b": "Black", "black": "Black", "black version": "Black",
+        "w": "White", "white": "White", "white version": "White",
+        "front angle": "Front Angle", "alternate angle": "Alt Angle", "alt angle": "Alt Angle",
+        "full audio version": "Full Audio", "full audio": "Full Audio", "full version": "Full",
+        "nsfw": "NSFW", "sfw": "SFW", "loop ver": "Loop",
+        "cream version": "Cream", "cream ver": "Cream", "creamy version": "Cream",
+        "creamy ver": "Cream", "creampie": "Creampie", "cream": "Cream",
+    },
+    "negative_descriptor_aliases": ["nopubes", "no pubes", "no pubic hair"],
+    "credit_aliases": {},
+    "preferred_performances": {"global": [], "artists": {}, "characters": {}},
+}
 
 
 @dataclass(frozen=True)
@@ -144,6 +439,7 @@ class Config:
     character_mappings: Dict[str, str]
     canonical_character_aliases: Dict[str, str]
     title_token_replacements: Dict[str, str]
+    filename_overrides: Dict[str, Dict[str, str]]
     content_review_terms: Dict[str, Tuple[str, ...]]
     junk_tokens: Tuple[str, ...]
     preserve_tokens: Tuple[str, ...]
@@ -162,6 +458,7 @@ class Config:
     # New: when packs contain both individual "Cam X" angles and an "All Angles" compilation,
     # quarantine the individual cams to this subfolder inside the source (keep only All Angles for processing).
     angle_variants_folder_name: str
+    variant_policy: Dict[str, Any] = field(default_factory=lambda: json.loads(json.dumps(DEFAULT_VARIANT_POLICY)))
 
 @dataclass
 class NamingStyle:
@@ -255,14 +552,32 @@ def title_case_words(text: str, preserve_tokens: Sequence[str]) -> str:
 
 
 def load_config(path: Path) -> Config:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
     preserve_tokens = tuple(raw.get("preserve_tokens", []))
     character_mappings = {normalize(k): v for k, v in raw.get("character_mappings", {}).items()}
     canonical_character_aliases = {
         normalize(k): v for k, v in raw.get("canonical_character_aliases", {}).items()
     }
+    for alias_norm, canonical in list(canonical_character_aliases.items()):
+        if " " in alias_norm:
+            compact = alias_norm.replace(" ", "")
+            if len(compact) >= 5:
+                canonical_character_aliases.setdefault(compact, canonical)
     for alias_norm in character_mappings:
         canonical_character_aliases.setdefault(alias_norm, title_case_words(alias_norm, preserve_tokens))
+
+    variant_policy = json.loads(json.dumps(DEFAULT_VARIANT_POLICY))
+    supplied_policy = raw.get("variant_policy", {})
+    if isinstance(supplied_policy, dict):
+        for key, value in supplied_policy.items():
+            if key in {"descriptor_aliases", "credit_aliases"} and isinstance(value, dict):
+                variant_policy[key].update(value)
+            elif key == "preferred_performances" and isinstance(value, dict):
+                for scope, entries in value.items():
+                    if isinstance(entries, (dict, list)):
+                        variant_policy[key][scope] = entries
+            else:
+                variant_policy[key] = value
 
     cfg = Config(
         destination_root=Path(raw["destination_root"]),
@@ -278,6 +593,11 @@ def load_config(path: Path) -> Config:
         character_mappings=character_mappings,
         canonical_character_aliases=canonical_character_aliases,
         title_token_replacements={normalize(k): v for k, v in raw.get("title_token_replacements", {}).items()},
+        filename_overrides={
+            normalize(k): {str(kk): str(vv) for kk, vv in (value or {}).items()}
+            for k, value in raw.get("filename_overrides", {}).items()
+            if isinstance(value, dict)
+        },
         content_review_terms={
             str(category): tuple(str(term) for term in terms)
             for category, terms in raw.get("content_review_terms", {}).items()
@@ -295,6 +615,7 @@ def load_config(path: Path) -> Config:
         learned_franchises_file=str(raw.get("learned_franchises_file", "learned_character_franchises.json")),
         extract_embedded_titles=bool(raw.get("extract_embedded_titles", False)),
         angle_variants_folder_name=str(raw.get("angle_variants_folder_name", "_r34_angle_variants")),
+        variant_policy=variant_policy,
     )
     # Attach the path the config was loaded from so key loading and other path-relative
     # features (like r34_xai_key.txt) can resolve correctly relative to the user's chosen config,
@@ -442,7 +763,11 @@ def is_under_review_dir(path: Path, config: Config) -> bool:
         config.review_folder_name,
         config.content_review_folder_name,
         getattr(config, "silent_animations_folder_name", "_r34_silent"),
+        getattr(config, "angle_variants_folder_name", "_r34_angle_variants"),
     }
+    review_folders.update(INTERNAL_ORGANIZER_FOLDER_NAMES)
+    review_folders.add((getattr(config, "variant_policy", {}) or {}).get("superseded_folder_name", "_r34_superseded_variants"))
+    review_folders = {str(folder) for folder in review_folders if str(folder or "")}
     return any(part in review_folders for part in path.parts)
 
 
@@ -567,10 +892,46 @@ def build_reference_data(destination_root: Path, config: Optional[Config] = None
     return ReferenceData(folders, artist_precedent, token_precedent, canonical_character_aliases, naming_style, learned_franchises=ref_learned)
 
 
+def sanitize_character_candidate(candidate: str) -> str:
+    """Remove title/camera descriptors from a candidate character segment.
+
+    This prevents already-bad filenames in the destination library from teaching
+    polluted aliases such as "Kaisa Beach Nude All Angles" or
+    "Power Cowgirl, Power" to future preview runs.
+    """
+    if not candidate:
+        return ""
+    cleaned_parts: List[str] = []
+    seen_norms: Set[str] = set()
+    for raw_part in re.split(r"\s*,\s*|\s+&\s+", candidate):
+        part = raw_part.strip(" -_.,;")
+        if not part:
+            continue
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9']*", part)
+        if not tokens:
+            continue
+        keep_tokens: List[str] = []
+        for token in tokens:
+            token_norm = normalize(token)
+            if token_norm in CHARACTER_DESCRIPTOR_STOP_TOKENS or token_norm in TECHNICAL_CHARACTER_STOP_TOKENS:
+                break
+            if token_norm.isdigit():
+                break
+            keep_tokens.append(token)
+        if not keep_tokens:
+            continue
+        cleaned = " ".join(keep_tokens).strip(" -_.,;")
+        cleaned_norm = normalize(cleaned)
+        if cleaned_norm and cleaned_norm not in seen_norms:
+            cleaned_parts.append(cleaned)
+            seen_norms.add(cleaned_norm)
+    return ", ".join(cleaned_parts)
+
+
 def likely_canonical_character_from_title(title: str) -> str:
     if " - " not in title:
         return ""
-    candidate = title.split(" - ", 1)[0].strip()
+    candidate = sanitize_character_candidate(title.split(" - ", 1)[0].strip())
     normalized = normalize(candidate)
     if not normalized:
         return ""
@@ -643,10 +1004,10 @@ def infer_unmatched_character(text: str, reference: ReferenceData, config: Confi
         return ""
 
     # Collect leading name-like tokens. Stop at clear action/stop words.
-    stop_words = set(PRECEDENT_STOP_TOKENS) | {
+    stop_words = set(PRECEDENT_STOP_TOKENS) | set(CHARACTER_DESCRIPTOR_STOP_TOKENS) | set(TECHNICAL_CHARACTER_STOP_TOKENS) | {
         "with", "and", "getting", "fucked", "pounded", "riding", "sucking",
         "fucking", "creampie", "anal", "pov", "bj", "from", "by", "in", "on",
-        "hard", "deep", "fast", "slow"
+        "hard", "deep", "fast", "slow", "audiodude", "blowjob", "fuk", "fuck"
     }
     name_tokens: List[str] = []
     for t in tokens:
@@ -684,12 +1045,38 @@ def strip_leading_index(stem: str) -> str:
     if DATE_PREFIX_RE.match(value):
         return value
     value = re.sub(r"^\s*\(\s*\d+\s*\)\s*", "", value)
+    value = re.sub(r"^\s*\d+(?:\.\d+)*\.?\s+", "", value)
     value = re.sub(r"^\s*\d+\s*[-_. ]+\s*", "", value)
     return value.strip()
 
 
 def is_generic_source_folder(name: str) -> bool:
     return normalize(name) in GENERIC_SOURCE_FOLDER_NAMES
+
+
+def is_duration_bucket_folder(name: str) -> bool:
+    normalized = normalize(name)
+    if normalized in DURATION_BUCKET_FOLDER_NAMES:
+        return True
+    return bool(re.fullmatch(r"\d+\s+\d+\s+seconds|\d+\s+seconds(?:\s+or\s+less)?", normalized))
+
+
+def is_internal_organizer_folder(name: str, config: Optional[Config] = None) -> bool:
+    raw = str(name or "")
+    normalized = normalize(raw)
+    if raw.startswith("_r34_") or normalized.startswith("r34 "):
+        return True
+    configured = set(INTERNAL_ORGANIZER_FOLDER_NAMES)
+    if config is not None:
+        configured.update({
+            config.review_folder_name,
+            config.content_review_folder_name,
+            getattr(config, "silent_animations_folder_name", "_r34_silent"),
+            getattr(config, "angle_variants_folder_name", "_r34_angle_variants"),
+            (getattr(config, "variant_policy", {}) or {}).get("superseded_folder_name", "_r34_superseded_variants"),
+        })
+    configured_norm = {normalize(item) for item in configured if item}
+    return normalized in configured_norm
 
 
 def strip_source_artist_suffix(name: str) -> str:
@@ -773,8 +1160,6 @@ def source_context_artist(source: Path, config: Config, reference: ReferenceData
             continue
         if norm in config.artist_aliases:
             return config.artist_aliases[norm], 0.96, "artist_from_source_alias"
-        if norm in reference.artist_precedent:
-            return reference.artist_precedent[norm], 0.82, "artist_from_source_precedent"
 
     for candidate in candidates:
         # For collection/uploader folders, we still want the *base artist name* (e.g. "Lazy Procrastinator Collection" → "Lazy Procrastinator").
@@ -794,7 +1179,7 @@ def source_context_artist(source: Path, config: Config, reference: ReferenceData
         if candidate.strip():
             known = known_artist_from_text(candidate, config, reference)
             if known:
-                return known, 0.96, "artist_from_source_collection_alias"
+                return known, 0.96, "artist_from_source_alias_or_precedent"
             return source_artist_display_name(candidate, config), 0.92, "artist_from_source_collection"
 
     source_name = source.name
@@ -918,6 +1303,8 @@ def remove_resolution_text(text: str) -> str:
     value = re.sub(r"(?i)\b(?:full\s*hd|uhd)\s*(?:30|60)?\s*fps?\b", " ", value)
 
     # Remove standalone resolution mentions (keep only for the final [1080P] tag)
+    value = re.sub(r"(?i)(?<=[A-Za-z])(?:480|720|1080|1440|2160|4320)p\b", " ", value)
+    value = re.sub(r"(?i)(?<=[A-Za-z])[48]k\b", " ", value)
     value = re.sub(r"(?i)(?<![A-Za-z0-9])(?:480|720|1080|1440|2160|4320)\s*p\b", " ", value)
     value = re.sub(r"(?i)(?<![A-Za-z0-9])[48]\s*k\b", " ", value)
     value = re.sub(r"(?i)\b(?:full\s*hd|uhd)\b", " ", value)
@@ -938,12 +1325,16 @@ def remove_resolution_text(text: str) -> str:
 def strip_dates_and_years(text: str) -> str:
     """Remove years and date-like patterns from the descriptive title (not from artist prefixes)."""
     value = text
-    # Standalone years
-    value = re.sub(r"\b(?:19|20)\d{2}\b", " ", value)
-
-    # Collector-style compact dates and common date formats in title context
+    # Collector-style compact dates and common date formats in title context.
+    # Handle these before standalone years so month-year values like "06-2024"
+    # do not leave an orphaned "06" in the scene title.
+    value = re.sub(r"\b\d{1,2}[-_.](?:19|20)\d{2}\b", " ", value)
+    value = re.sub(r"\b(?:19|20)\d{2}[-_.]\d{1,2}\b", " ", value)
     value = re.sub(r"\b(?:19|20)?\d{2}[-_.]?\d{1,2}[-_.]?\d{1,2}\b", " ", value)
     value = re.sub(r"\b\d{6,8}\b", " ", value)  # e.g. 210704
+
+    # Standalone years
+    value = re.sub(r"\b(?:19|20)\d{2}\b", " ", value)
 
     # Dates inside brackets/parentheses
     value = re.sub(r"\[[^\]]*?(?:19|20)\d{2}[^\]]*\]", " ", value, flags=re.I)
@@ -951,6 +1342,167 @@ def strip_dates_and_years(text: str) -> str:
 
     value = re.sub(r"\s+", " ", value).strip()
     return value
+
+
+def strip_technical_title_labels(text: str) -> str:
+    """Remove export/quality labels that are not meaningful scene descriptors."""
+    value = text
+    value = re.sub(r"(?i)(?<!\d)4\.0(?!\d)", " ", value)
+    value = re.sub(r"(?i)\b(?:hi|high|low)\s*res(?:olution)?\b", " ", value)
+    value = re.sub(r"(?i)\b(?:long|short)\s+(?:ver(?:sion)?|version)\b", " ", value)
+    value = re.sub(r"(?i)\b(?:ver(?:sion)?|v)\s*\d+\b", " ", value)
+    value = re.sub(r"(?i)\b(?:remake|unwatermarked|unwatermarket|no\s*watermark|nowatermark|no\s*wm|wm)\b", " ", value)
+    value = re.sub(r"(?i)\b\d+(?:\.\d+)?\s*fps\b", " ", value)
+    value = re.sub(r"(?i)\bfinal\b\s*$", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" -_.,;")
+
+
+def expand_compact_scene_descriptor_token(token: str) -> str:
+    """Split compact tokens like Widowbj or Commanderbj into name + descriptor.
+
+    New collection dumps often omit separators in sparse filenames. Splitting
+    only known descriptor suffixes lets the normal character detector infer the
+    character while retaining useful scene descriptors in the final filename.
+    """
+    raw = str(token or "")
+    if not raw or not re.fullmatch(r"[A-Za-z][A-Za-z0-9']*", raw):
+        return raw
+
+    base = re.sub(r"(?i)(?:480|720|1080|1440|2160|4320)p?$", "", raw)
+    base = re.sub(r"(?i)[48]k$", "", base)
+    base_norm = normalize(base)
+    if not base_norm:
+        return raw
+
+    for suffix_norm, suffix_display in COMPACT_SCENE_DESCRIPTOR_SUFFIXES:
+        descriptor_only = re.fullmatch(rf"(?i){re.escape(suffix_norm)}(?P<variant>\d+[a-z]?)?", base_norm)
+        if descriptor_only:
+            variant = descriptor_only.group("variant") or ""
+            return f"{suffix_display} {variant}".strip()
+
+        match = re.fullmatch(
+            rf"(?P<prefix>[a-z0-9]{{3,}}){re.escape(suffix_norm)}(?P<variant>\d+[a-z]?)?",
+            base_norm,
+            flags=re.I,
+        )
+        if not match:
+            continue
+
+        prefix_norm = match.group("prefix")
+        prefix_len = len(prefix_norm)
+        prefix = base[:prefix_len].strip()
+        if not prefix or normalize(prefix) in PRECEDENT_SUPPRESS_TOKENS:
+            return raw
+        variant = match.group("variant") or ""
+        descriptor = f"{suffix_display} {variant}".strip()
+        return f"{prefix} {descriptor}".strip()
+
+    return raw
+
+
+def expand_compact_scene_descriptors(text: str) -> str:
+    if not text:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        return expand_compact_scene_descriptor_token(match.group(0))
+
+    value = re.sub(r"\b[A-Za-z][A-Za-z0-9']*\b", repl, text)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" -_.,;")
+
+
+def expand_known_character_variant_tokens(text: str, reference: ReferenceData) -> str:
+    """Split compact known-character variants like Ahri1A or Ashebob2."""
+    if not text or not reference or not reference.canonical_character_aliases:
+        return text
+
+    aliases = sorted(
+        reference.canonical_character_aliases.items(),
+        key=lambda item: (-len(item[0]), item[0]),
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(0)
+        token_norm = normalize(token)
+        for alias_norm, canonical in aliases:
+            compact_alias = alias_norm.replace(" ", "")
+            if len(compact_alias) < 3 or not token_norm.startswith(compact_alias):
+                continue
+            suffix = token_norm[len(compact_alias):]
+            if not re.fullmatch(r"\d+[a-z]?", suffix):
+                continue
+            suffix_display = suffix[:-1] + suffix[-1:].upper() if suffix[-1:].isalpha() else suffix
+            return f"{canonical} {suffix_display}".strip()
+        return token
+
+    value = re.sub(r"\b[A-Za-z][A-Za-z0-9']*\b", repl, text)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" -_.,;")
+
+
+def normalized_filename_override_keys(path: Path, raw_title: str, file_full_title: str, full_title: str, config: Config) -> Tuple[str, ...]:
+    candidates = [
+        path.stem,
+        strip_leading_index(path.stem),
+        raw_title,
+        file_full_title,
+        full_title,
+    ]
+    keys: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "")
+        if not value:
+            continue
+        variants = [
+            value,
+            strip_technical_title_labels(strip_dates_and_years(remove_resolution_text(value))),
+            clean_title(value, config),
+        ]
+        for variant in variants:
+            key = normalize(variant)
+            if key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return tuple(keys)
+
+
+def find_filename_override(path: Path, raw_title: str, file_full_title: str, full_title: str, config: Config) -> Dict[str, str]:
+    overrides = getattr(config, "filename_overrides", {}) or {}
+    if not overrides:
+        return {}
+    for key in normalized_filename_override_keys(path, raw_title, file_full_title, full_title, config):
+        override = overrides.get(key)
+        if override:
+            return dict(override)
+    return {}
+
+
+def is_variant_only_title(title: str) -> bool:
+    value = normalize(title)
+    return bool(re.fullmatch(r"(?:v\s*)?\d+[a-z]?|part\s+\d+[a-z]?", value))
+
+
+def has_technical_date_or_quality_marker(text: str) -> bool:
+    value = str(text or "")
+    return bool(
+        re.search(r"(?i)\b(?:hi|high|low)\s*res(?:olution)?\b", value)
+        or re.search(r"\b(?:19|20)\d{2}\b", value)
+        or re.search(r"\b\d{1,2}[-_.](?:19|20)\d{2}\b", value)
+        or re.search(r"\b(?:19|20)\d{2}[-_.]\d{1,2}\b", value)
+    )
+
+
+def is_generic_context_variant_title(title: str) -> bool:
+    value = normalize(title)
+    if not value:
+        return True
+    value = re.sub(r"\b(?:v|ver|version|part)\s*\d+[a-z]?\b", " ", value)
+    value = re.sub(r"\b\d+[a-z]?\b", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value in {"fuk", "fuck", "sex", "fucking", "bonk", "bonking"}
 
 
 def strip_leading_artist_tokens(title: str, artist: str) -> str:
@@ -979,35 +1531,60 @@ def clean_position_descriptors(title: str) -> str:
     if not title:
         return title
 
-    # Common sex position words
-    position_words = r"(?i)\b(?:doggy|missionary|cowgirl|reverse.?cowgirl|blowjob|anal|creampie|facial|69|spoon|prone|standing|doggystyle)\b"
-
     value = title
-
-    # Find position words and clean what follows
-    def _clean_after_position(match):
-        pos = match.group(0)
-        rest = title[match.end():].strip()
-
-        # Take only the first number as variant (e.g. "2" in "Doggy 2")
-        variant_match = re.match(r"^(\d+)", rest)
-        variant = f" {variant_match.group(1)}" if variant_match else ""
-
-        # Remove everything after the variant until we hit something that looks like real title or end
-        # Remove Cam tags, extra numbers, etc.
-        cleaned_rest = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d*|\d+)\b.*$", "", rest, count=1)
-
-        return pos + variant + cleaned_rest
-
-    value = re.sub(position_words, _clean_after_position, value)
+    # Blowjob is treated as a generic position marker in the established naming style.
+    value = re.sub(r"(?i)\bblow\s*job\b", " ", value)
+    value = re.sub(r"(?i)\breverse\s*cowgirl\b", "Reverse Cowgirl", value)
 
     # Final aggressive removal of any remaining "Cam" tags and standalone numeric sequences *at the end only*.
     # Do not eat legitimate early numbers like "21 - Riding" (scene/episode style titles) or "Virus 2B MAX".
     # The .* $ was too broad; limit to trailing junk (fixes jessies_mom, max_quality, normalized_dup pre-existing tests).
-    value = re.sub(r"(?i)\s*(?:cam\s*\d+[-\s]?\d*|\d+[-\s]?\d+)\b\s*$", "", value)
+    value = re.sub(r"(?i)\s*cam\s*\d+(?:[-\s]\d+)?\s*$", "", value)
 
     value = re.sub(r"\s+", " ", value).strip(" -_.,;")
     return value
+
+
+def is_technical_residue_title(title: str) -> bool:
+    tokens = normalize(title).split()
+    return bool(tokens) and all(re.fullmatch(r"\d{1,4}[a-z]?", token) for token in tokens)
+
+
+def extract_scene_descriptor_hint(title: str) -> str:
+    """Return a meaningful action/position descriptor from a cleaned title.
+
+    This protects preview names from collapsing to bland numeric variants when
+    the library precedent table has not seen a descriptor yet.
+    """
+    value = str(title or "").strip()
+    if not value:
+        return ""
+    for pattern, canonical in SCENE_DESCRIPTOR_PATTERNS:
+        if pattern.search(value):
+            return canonical
+    return ""
+
+
+def restore_scene_descriptor_hint(cleaned_title: str, original_title: str) -> str:
+    descriptor = extract_scene_descriptor_hint(original_title)
+    if not descriptor:
+        return cleaned_title
+
+    current = str(cleaned_title or "").strip(" -_.,;")
+    descriptor_norm = normalize(descriptor)
+    current_norm = normalize(current)
+    if current_norm and contains_phrase(current_norm, descriptor_norm):
+        return current
+
+    if not current:
+        return descriptor
+
+    # Preserve useful existing variant markers, but attach them to the descriptor
+    # instead of leaving a bare "1"/"V 2"/"Part 02" title.
+    if re.fullmatch(r"(?i)(?:v\s*)?\d+", current) or re.fullmatch(r"(?i)part\s+\d+", current):
+        return f"{current} {descriptor}" if normalize(original_title).startswith(normalize(current)) else f"{descriptor} {current}"
+
+    return f"{current} {descriptor}".strip()
 
 
 def strip_known_franchises_from_title(title: str, reference: ReferenceData, target_folder: str = "", config: Optional[Config] = None) -> str:
@@ -1040,6 +1617,51 @@ def strip_known_franchises_from_title(title: str, reference: ReferenceData, targ
     return value
 
 
+def strip_franchises_preserving_characters(
+    title: str, character_text: str, reference: ReferenceData, target_folder: str, config: Config
+) -> str:
+    value = str(title or "")
+    markers: Dict[str, str] = {}
+    for index, character in enumerate(sorted(character_parts(character_text), key=len, reverse=True)):
+        marker = f"R34PROTECTEDCHAR{index}X"
+        if character and character.lower() in value.lower():
+            value = re.sub(re.escape(character), marker, value, flags=re.I)
+            markers[marker] = character
+    value = strip_known_franchises_from_title(value, reference, target_folder, config)
+    for marker, character in markers.items():
+        value = value.replace(marker, character)
+    return value
+
+
+def normalize_repeated_title_descriptors(title: str) -> str:
+    """Compress repeated descriptor fragments left after character stripping."""
+    if not title:
+        return title
+    value = re.sub(r"\s+", " ", title).strip(" -_.,;")
+    for _ in range(3):
+        previous = value
+        value = re.sub(r"(?i)\b(nude|bj|cam|beach|missionary|doggy|cowgirl|all angles)\s+\1\b", r"\1", value)
+        value = re.sub(
+            r"(?i)\b(?P<phrase>(?:beach|missionary|doggy|cowgirl|cam)?\s*nude)\s+all angles\s+(?P=phrase)\b",
+            r"\g<phrase> All Angles",
+            value,
+        )
+        value = re.sub(
+            r"(?i)\ball angles\s+(?P<phrase>(?:beach|missionary|doggy|cowgirl|cam)?\s*nude)\s+all angles\b",
+            r"\g<phrase> All Angles",
+            value,
+        )
+        value = re.sub(
+            r"(?i)\b(?P<phrase>(?:doggy|missionary|cowgirl)?\s*nude\s+cam)\s+nude\s+cam\s+nude(?P<num>\s+\d+)?\b",
+            lambda m: (m.group("phrase") + (m.group("num") or "")).strip(),
+            value,
+        )
+        value = re.sub(r"\s+", " ", value).strip(" -_.,;")
+        if value == previous:
+            break
+    return value
+
+
 def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: int = 3) -> Tuple[str, List[str], float]:
     """
     Remove tokens from the title that appear very rarely (or never) in the existing library.
@@ -1062,6 +1684,15 @@ def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: i
     for token in tokens:
         token_norm = normalize(token)
         if len(token_norm) < 2:
+            kept.append(token)
+            continue
+        if token_norm in CHARACTER_DESCRIPTOR_STOP_TOKENS and token_norm != "blowjob":
+            kept.append(token)
+            continue
+        if token_norm in SCENE_DESCRIPTOR_TOKEN_NORMS:
+            kept.append(token)
+            continue
+        if token_norm in getattr(reference, "canonical_character_aliases", {}):
             kept.append(token)
             continue
 
@@ -1119,12 +1750,132 @@ def strip_outlier_tokens(title: str, reference: ReferenceData, min_occurrence: i
     return cleaned, real_removed, round(confidence, 2)
 
 
+def _variant_phrase_pattern(value: str) -> str:
+    words = normalize(value).split()
+    return r"(?<![A-Za-z0-9])" + r"[\s_.-]*".join(re.escape(word) for word in words) + r"(?![A-Za-z0-9])"
+
+
+def variant_credit_aliases(config: Config) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    for alias, canonical in (getattr(config, "variant_policy", {}) or {}).get("credit_aliases", {}).items():
+        canonical_text = str(canonical).strip()
+        if canonical_text:
+            aliases[normalize(alias)] = canonical_text
+            aliases[normalize(canonical_text)] = canonical_text
+    return aliases
+
+
+def extract_variant_metadata(texts: Sequence[str], config: Config, character_text: str = "") -> Dict[str, Any]:
+    """Extract configured variant semantics before ordinary title cleanup can discard them."""
+    policy = getattr(config, "variant_policy", {}) or {}
+    sources = [str(text or "") for text in texts if str(text or "")]
+    source = " | ".join(sources)
+    descriptors: List[str] = []
+    for alias, canonical in sorted((policy.get("descriptor_aliases") or {}).items(), key=lambda item: -len(str(item[0]))):
+        if re.search(_variant_phrase_pattern(str(alias)), source, flags=re.I):
+            value = str(canonical).strip()
+            if value and value not in descriptors:
+                descriptors.append(value)
+
+    negative = any(
+        re.search(_variant_phrase_pattern(str(alias)), source, flags=re.I)
+        for alias in policy.get("negative_descriptor_aliases", [])
+    )
+    if negative:
+        descriptors = [item for item in descriptors if normalize(item) != "pubes"]
+    descriptor_norms = {normalize(item) for item in descriptors}
+    for dominant, suppressed in {
+        "no bra": {"bra"}, "alt angle": {"alt"}, "alt angles": {"alt"},
+        "full audio": {"full"}, "nude": {"std"},
+    }.items():
+        if dominant in descriptor_norms:
+            descriptors = [item for item in descriptors if normalize(item) not in suppressed]
+            descriptor_norms = {normalize(item) for item in descriptors}
+
+    sound_variant = re.search(r"(?i)\bsound[\s_.-]*variant[\s_.-]*(\d+)\b", source)
+    if sound_variant:
+        value = f"Sound V{int(sound_variant.group(1))}"
+        if value not in descriptors:
+            descriptors.append(value)
+
+    credits: List[str] = []
+    for alias_norm, canonical in variant_credit_aliases(config).items():
+        if re.search(_variant_phrase_pattern(alias_norm), source, flags=re.I) and canonical not in credits:
+            credits.append(canonical)
+
+    version = ""
+    match = None
+    for candidate_source in sources:
+        candidate_match = re.search(r"(?i)(?<![A-Za-z0-9])(?:scene|version|ver|v)[\s_.-]*0*(\d+)(?![\d.]|\s*fps)", candidate_source)
+        if candidate_match:
+            match = candidate_match
+            break
+    if match:
+        version = f"V{int(match.group(1))}"
+    elif character_text:
+        for character in character_parts(character_text):
+            tokens = [normalize(character), normalize(character).replace(" ", "")]
+            for token in sorted(set(tokens), key=len, reverse=True):
+                if not token:
+                    continue
+                for candidate_source in sources[:2]:
+                    attached = re.search(r"(?i)(?<![A-Za-z0-9])" + re.escape(token) + r"[\s_.-]*0*(\d+)(?!\d|\s*fps)", normalize(candidate_source))
+                    if attached:
+                        version = f"V{int(attached.group(1))}"
+                        break
+                if version:
+                    break
+            if version:
+                break
+    return {"version": version, "descriptors": descriptors, "credits": credits}
+
+
+def strip_variant_terms(title: str, metadata: Dict[str, Any], config: Config) -> str:
+    value = str(title or "")
+    policy = getattr(config, "variant_policy", {}) or {}
+    aliases = list((policy.get("descriptor_aliases") or {}).keys()) + list(policy.get("negative_descriptor_aliases", []))
+    aliases += list(variant_credit_aliases(config).keys())
+    aliases.sort(key=lambda item: -len(str(item)))
+    for alias in aliases:
+        value = re.sub(_variant_phrase_pattern(str(alias)), " ", value, flags=re.I)
+    value = re.sub(r"(?i)\bsound[\s_.-]*variant[\s_.-]*\d+\b", " ", value)
+    value = re.sub(r"(?i)(?<![A-Za-z0-9])(?:scene|version|ver|v)[\s_.-]*\d+(?!\d)", " ", value)
+    value = re.sub(r"\s*-\s*,\s*", " - ", value)
+    value = re.sub(r"\s*,\s*-\s*", " - ", value)
+    value = re.sub(r"(?:\s*-\s*){2,}", " - ", value)
+    return re.sub(r"\s+", " ", value).strip(" -_.,;")
+
+
+def compose_variant_title(base_title: str, metadata: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    base = str(base_title or "").strip(" -_.,;")
+    if base:
+        parts.append(base)
+    version = str(metadata.get("version") or "").strip()
+    if version:
+        parts.append(version)
+    for item in list(metadata.get("descriptors") or []) + list(metadata.get("credits") or []):
+        text = str(item).strip()
+        if text and normalize(text) not in {normalize(existing) for existing in parts}:
+            parts.append(text)
+    if not parts:
+        return ""
+    if base and len(parts) > 1:
+        return base + " - " + ", ".join(parts[1:])
+    return ", ".join(parts)
+
+
 def clean_title(raw_title: str, config: Config) -> str:
     value = raw_title
     value = value.replace("&", " and ")
+    value = value.replace("+", " ")
+    value = re.sub(r"\bw['’]?(?=\s)", "with", value)
+    value = re.sub(r"'{2,}", "", value)
+    value = re.sub(r"-{2,}", " ", value)
+    value = strip_technical_title_labels(value)
     value = remove_resolution_text(value)
     value = strip_dates_and_years(value)
-    value = re.sub(r"(?i)\b(?:unwatermarked|unwatermarket|no\s*watermark|nowatermark)\b", " ", value)
+    value = strip_technical_title_labels(value)
     for junk in config.junk_tokens:
         if normalize(junk) in {"1080p", "720p", "1440p", "2160p", "4k", "8k", "uhd", "full hd"}:
             continue
@@ -1132,11 +1883,15 @@ def clean_title(raw_title: str, config: Config) -> str:
 
     # Remove known audio producer / sound engineer credits (e.g. "audiodude", "evilaudio", "multiaudio")
     # These are common in collector filenames but are not part of the actual clip title or artist.
+    protected_variant_credits = set(variant_credit_aliases(config))
     for credit in getattr(config, "audio_credits", ()):
+        if normalize(credit) in protected_variant_credits:
+            continue
         value = re.sub(r"\b" + re.escape(credit) + r"\b", " ", value, flags=re.I)
 
     value = re.sub(r"[\[\]\{\}\(\)]", " ", value)
     value = value.replace("_", " ")
+    value = re.sub(r"([A-Za-z])(\d+[A-Za-z])\b", r"\1 \2", value)
     value = re.sub(r"([A-Za-z])(\d+)\b", r"\1 \2", value)
     value = apply_title_token_replacements(value, config)
     for token in config.preserve_tokens:
@@ -1151,6 +1906,155 @@ def clean_title(raw_title: str, config: Config) -> str:
     # descriptive token was a stripped audio credit.
     value = title_case_words(value or "", config.preserve_tokens)
     return remove_duplicate_leading_phrase(value)
+
+
+def meaningful_relative_subfolder_parts(path: Path, source: Path, config: Config, *, clean: bool = True) -> List[str]:
+    """Return meaningful subfolder names between source root and file.
+
+    Organizer/runtime folders and duration buckets are library structure, not scene
+    identity. Keeping them out prevents output like "20 Seconds - Riding" and
+    bogus learned characters such as "Seconds".
+    """
+    try:
+        rel_parent = path.parent.relative_to(source)
+    except ValueError:
+        return []
+    if not rel_parent.parts or rel_parent == Path("."):
+        return []
+
+    parts: List[str] = []
+    seen_norms: Set[str] = set()
+    for raw_part in rel_parent.parts:
+        if not raw_part or raw_part.startswith("_"):
+            continue
+        if is_internal_organizer_folder(raw_part, config) or is_duration_bucket_folder(raw_part):
+            continue
+        stripped_source = strip_source_artist_suffix(raw_part)
+        raw_context = strip_leading_index(stripped_source or raw_part)
+        if (
+            is_generic_source_folder(raw_context)
+            or is_duration_bucket_folder(raw_context)
+            or is_internal_organizer_folder(raw_context, config)
+            or normalize(raw_context) in GENERIC_SUBFOLDER_CONTEXT_NAMES
+        ):
+            continue
+        value = clean_title(raw_context, config) if clean else raw_context.strip(" -_.,;")
+        if not value:
+            continue
+        cleaned_norm = normalize(value)
+        if not cleaned_norm or cleaned_norm in seen_norms:
+            continue
+        parts.append(value)
+        seen_norms.add(cleaned_norm)
+    return parts
+
+
+def relative_subfolder_context_title(path: Path, source: Path, config: Config) -> str:
+    return " - ".join(meaningful_relative_subfolder_parts(path, source, config))
+
+
+def format_subfolder_file_title(title: str) -> str:
+    value = re.sub(r"\s+", " ", str(title or "")).strip(" -_.,;")
+    if not value:
+        return ""
+    if re.match(r"(?i)^(?:loop|variant|version|ver|v\s*\d+|short|long)\b", value):
+        value = re.sub(r"(?i)\s+with\s+", ", ", value, count=1)
+    value = re.sub(r"\s*,\s*", ", ", value)
+    return value.strip(" -_.,;")
+
+
+def trim_leading_context_overlap(context_title: str, file_title: str) -> str:
+    title = str(file_title or "").strip(" -_.,;")
+    if not context_title or not title:
+        return title
+
+    context_words = set(normalize(context_title).split())
+    if not context_words:
+        return title
+
+    for _ in range(4):
+        tokens = title.split()
+        if len(tokens) <= 1:
+            break
+        first_norm = normalize(tokens[0])
+        if first_norm not in context_words:
+            break
+        title = " ".join(tokens[1:]).strip(" -_.,;")
+    return title or file_title
+
+
+def semantic_title_token(token: str) -> str:
+    value = normalize(token)
+    aliases = {
+        "fuc": "fuck", "fucked": "fuck", "fucking": "fuck",
+        "gettin": "get", "getting": "get", "havin": "have", "having": "have",
+        "tiktoktrend": "tiktok", "reversecowgirl": "reverse cowgirl",
+        "creampie": "cream", "creamy": "cream", "creamie": "cream",
+        "an": "anal",
+        "version": "ver", "angles": "angle", "secretaries": "secretary",
+    }
+    value = aliases.get(value, value)
+    if value.endswith("s") and len(value) > 4 and value not in {"xmas", "anal"}:
+        value = value[:-1]
+    return value
+
+
+def contextual_title_delta(context_title: str, file_title: str) -> str:
+    """Return only meaningful file-title tokens not already represented by its folder."""
+    context_keys = {semantic_title_token(token) for token in re.findall(r"[A-Za-z0-9']+", context_title)}
+    file_tokens = re.findall(r"[A-Za-z0-9']+", file_title)
+    file_keys = [semantic_title_token(token) for token in file_tokens]
+    if not context_keys or not file_keys or not context_keys.intersection(file_keys):
+        return file_title
+    extras = [token for token, key in zip(file_tokens, file_keys) if key not in context_keys]
+    return " ".join(extras).strip()
+
+
+def merge_contextual_title_parts(context_title: str, file_title: str) -> str:
+    context = re.sub(r"\s+", " ", str(context_title or "")).strip(" -_.,;")
+    title = format_subfolder_file_title(file_title)
+    if not context:
+        return title
+    if not title:
+        return context
+
+    context_norm = normalize(context)
+    title_norm = normalize(title)
+    if context_norm == title_norm or contains_phrase(context_norm, title_norm):
+        return context
+    if contains_phrase(title_norm, context_norm):
+        return title
+    title = trim_leading_context_overlap(context, title)
+    title_norm = normalize(title)
+    if context_norm == title_norm or contains_phrase(context_norm, title_norm):
+        return context
+    delta = contextual_title_delta(context, title)
+    if not delta:
+        return context
+    return f"{context} - {delta}"
+
+
+def title_context_contains_character(context_title: str, detection: "CharacterDetection") -> bool:
+    context_norm = normalize(context_title)
+    if not context_norm or not detection.characters:
+        return False
+    for character in detection.characters:
+        char_norm = normalize(character)
+        if char_norm and contains_phrase(context_norm, char_norm):
+            return True
+    for alias_norm in detection.matched_aliases:
+        if alias_norm and contains_phrase(context_norm, alias_norm):
+            return True
+    return False
+
+
+def title_context_is_exact_character(context_title: str, detection: "CharacterDetection") -> bool:
+    context_norm = normalize(context_title)
+    if not context_norm or not detection.characters:
+        return False
+    if any(context_norm == normalize(character) for character in detection.characters):
+        return True
+    return any(context_norm == alias_norm for alias_norm in detection.matched_aliases)
 
 
 def apply_title_token_replacements(text: str, config: Config) -> str:
@@ -1331,6 +2235,24 @@ def get_video_duration(path: Path, ffprobe_path: str) -> Optional[float]:
         return None
 
 
+def get_video_frame_rate(path: Path, ffprobe_path: str) -> Optional[float]:
+    """Return the first video stream's average frame rate, or None on failure."""
+    cmd = [
+        ffprobe_path, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate", "-of", "json", str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        if proc.returncode != 0:
+            return None
+        value = ((json.loads(proc.stdout or "{}").get("streams") or [{}])[0]).get("avg_frame_rate", "")
+        numerator, denominator = str(value).split("/", 1)
+        denominator_value = float(denominator)
+        return float(numerator) / denominator_value if denominator_value else None
+    except Exception:
+        return None
+
+
 def resolution_bucket(width: int, height: int) -> str:
     long_side = max(width, height)
     short_side = min(width, height)
@@ -1369,7 +2291,13 @@ def detect_characters(title: str, reference: ReferenceData) -> CharacterDetectio
         reference.canonical_character_aliases.items(),
         key=lambda item: (-len(item[0].split()), -len(item[0]), item[0]),
     ):
-        idx = f" {normalized_title} ".find(f" {alias_norm} ")
+        if alias_norm in CHARACTER_ALIAS_DENYLIST:
+            continue
+        match = re.search(
+            r"(?:^|\s)" + re.escape(alias_norm) + (r"(?:s)?" if not alias_norm.endswith("s") else "") + r"(?:\s|$)",
+            normalized_title,
+        )
+        idx = match.start() if match else -1
         if idx >= 0:
             matches.append((idx, alias_norm, canonical))
 
@@ -1378,8 +2306,14 @@ def detect_characters(title: str, reference: ReferenceData) -> CharacterDetectio
     reasons: List[str] = []
     for idx, alias_norm, canonical in sorted(matches, key=lambda item: item[0]):
         if canonical in characters:
+            if alias_norm not in aliases:
+                aliases.append(alias_norm)
             continue
         if any(normalize(existing) == normalize(canonical) for existing in characters):
+            if alias_norm not in aliases:
+                aliases.append(alias_norm)
+            continue
+        if any(contains_phrase(existing_alias, alias_norm) for existing_alias in aliases if existing_alias != alias_norm):
             continue
         if any(existing_alias == alias_norm for existing_alias in aliases):
             continue
@@ -1417,6 +2351,38 @@ def strip_detected_characters_from_title(title: str, detection: CharacterDetecti
     return remove_duplicate_terminal_segment(value)
 
 
+def canonicalize_detected_characters_in_title(title: str, detection: CharacterDetection) -> str:
+    """Replace matched aliases in a scene title with their canonical display names."""
+    value = str(title or "")
+    replacements: List[Tuple[str, str]] = []
+    reason_map = {}
+    for item in str(detection.reason or "").split(";"):
+        if "->" in item:
+            alias, canonical = item.split("->", 1)
+            reason_map[alias] = canonical
+    for alias_norm in detection.matched_aliases:
+        canonical = reason_map.get(alias_norm) or next((
+            character for character in detection.characters
+            if alias_norm in {normalize(candidate) for candidate in character_alias_candidates(character)}
+        ), detection.characters[0] if len(detection.characters) == 1 else "")
+        if canonical:
+            replacements.append((alias_norm, canonical))
+    markers: Dict[str, str] = {}
+    for index, (alias_norm, canonical) in enumerate(sorted(replacements, key=lambda item: (-len(item[0].split()), -len(item[0])))):
+        parts = alias_norm.split()
+        if not parts:
+            continue
+        pattern = r"(?i)(?<![A-Za-z0-9])" + r"[\s._'-]+".join(alias_part_pattern(part) for part in parts) + r"(?:'s|s')?(?![A-Za-z0-9])"
+        marker = f"R34CHARMARKER{index}X"
+        updated = re.sub(pattern, marker, value)
+        if updated != value:
+            markers[marker] = canonical
+            value = updated
+    for marker, canonical in markers.items():
+        value = value.replace(marker, canonical)
+    return re.sub(r"\s+", " ", value).strip(" -_.,;")
+
+
 def alias_part_pattern(part: str) -> str:
     if part.endswith("s") and len(part) > 1:
         return re.escape(part[:-1]) + r"'?s"
@@ -1447,9 +2413,10 @@ def remove_duplicate_terminal_segment(title: str) -> str:
     return title
 
 
-def target_filename_for(artist: str, character_text: str, title: str, resolution: str, extension: str) -> str:
+def target_filename_for(artist: str, character_text: str, title: str, resolution: str, extension: str, *, preserve_variant_versions: bool = False) -> str:
     # Gracefully omit the title segment when it is empty.
     # Prevent artist/character duplication inside the title segment.
+    artist = strip_source_artist_suffix(artist) or str(artist or "").strip()
     parts = [artist]
     if character_text and character_text != artist:
         parts.append(character_text)
@@ -1461,26 +2428,63 @@ def target_filename_for(artist: str, character_text: str, title: str, resolution
         artist_norm = normalize(artist)
         char_norm = normalize(character_text) if character_text else ""
         title_norm = normalize(clean_title_part)
+        character_name_norms = [normalize(part) for part in character_parts(character_text)] if character_text else []
+
+        if title_norm and any(
+            title_norm == char_part
+            or (len(char_part.split()) > 1 and title_norm == char_part.split()[0])
+            or (len(char_part.split()) > 1 and title_norm == char_part.split()[-1])
+            for char_part in character_name_norms
+        ):
+            clean_title_part = ""
+            title_norm = ""
 
         for name_norm in [artist_norm, char_norm]:
             if name_norm and title_norm.startswith(name_norm):
                 # Remove the leading name + following separator
-                clean_title_part = re.sub(r"^" + re.escape(name_norm) + r"[\s\-–—_.,:]+", "", clean_title_part, flags=re.I).strip()
+                name_pattern = r"[\s._'-]*".join(alias_part_pattern(part) for part in name_norm.split())
+                clean_title_part = re.sub(r"(?i)^" + name_pattern + r"(?:'s|s')?[\s\-–—_.,:]+", "", clean_title_part).strip()
+                title_norm = normalize(clean_title_part)
+        for char_part in character_name_norms:
+            words = char_part.split()
+            if len(words) > 1 and title_norm.startswith(words[-1] + " "):
+                clean_title_part = re.sub(r"(?i)^" + re.escape(words[-1]) + r"[\s\-–—_.,:]+", "", clean_title_part).strip()
                 title_norm = normalize(clean_title_part)
 
     if clean_title_part:
         # Final safety net: aggressively strip any remaining FPS or date junk from the title segment
         clean_title_part = remove_resolution_text(clean_title_part)
         clean_title_part = strip_dates_and_years(clean_title_part)
+        if not preserve_variant_versions:
+            clean_title_part = strip_technical_title_labels(clean_title_part)
 
         # Extra pass specifically for orphaned numerical FPS values (30/60/120 etc.)
         clean_title_part = re.sub(r"(?i)\b(?:30|60|120|144|240)\b", " ", clean_title_part)
 
         clean_title_part = clean_title_part.strip(" -_.,;")
         if clean_title_part:
-            parts.append(clean_title_part)
+            if parts and is_variant_only_title(clean_title_part):
+                parts[-1] = f"{parts[-1]} {clean_title_part}".strip()
+            else:
+                parts.append(clean_title_part)
 
     return safe_filename(" - ".join(parts) + f" [{resolution}]{extension.lower()}")
+
+
+def is_suppressed_precedent_token(token: str) -> bool:
+    token_norm = normalize(token)
+    if not token_norm:
+        return True
+    words = token_norm.split()
+    if token_norm in PRECEDENT_SUPPRESS_TOKENS:
+        return True
+    if any(word in PRECEDENT_SUPPRESS_TOKENS for word in words):
+        return True
+    if re.search(r"\bcam\s*\d+\b", token_norm):
+        return True
+    if re.fullmatch(r"(?:v\s*)?\d+", token_norm):
+        return True
+    return False
 
 
 def classify_title(title: str, config: Config, reference: ReferenceData) -> Tuple[str, float, str]:
@@ -1534,7 +2538,7 @@ def classify_title(title: str, config: Config, reference: ReferenceData) -> Tupl
         return folder, folder_scores[folder], ";".join(reasons[:4])
 
     for token in title_tokens(title):
-        if token in PRECEDENT_STOP_TOKENS:
+        if is_suppressed_precedent_token(token):
             continue
         if " " not in token and len(token) < 4:
             continue
@@ -1563,7 +2567,11 @@ def classify_title(title: str, config: Config, reference: ReferenceData) -> Tupl
 
 
 def contains_phrase(normalized_text: str, normalized_phrase: str) -> bool:
-    return f" {normalized_phrase} " in f" {normalized_text} "
+    if f" {normalized_phrase} " in f" {normalized_text} ":
+        return True
+    if normalized_phrase and not normalized_phrase.endswith("s"):
+        return bool(re.search(r"(?:^|\s)" + re.escape(normalized_phrase) + r"s(?:\s|$)", normalized_text))
+    return False
 
 
 def folder_exists(folder: str, reference: ReferenceData) -> bool:
@@ -1908,9 +2916,13 @@ def deduplicate_target_filenames(rows: List[Dict[str, str]]) -> None:
             return f"{base} {var} {res}{ext}"
         return f"{base}{res}{ext}"
 
+    # Recognized variant families already carry explicit decisions. Numbering their
+    # collisions would hide equivalence and pollute names for held/review rows.
+    dedupe_rows = [row for row in rows if not row.get("variant_family")]
+
     # Phase 1: per original-collision-group bump (first claimant in scan order keeps its name)
     filename_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    for row in rows:
+    for row in dedupe_rows:
         fname = row.get("target_filename", "").strip()
         if fname:
             filename_groups[fname].append(row)
@@ -1954,7 +2966,7 @@ def deduplicate_target_filenames(rows: List[Dict[str, str]]) -> None:
 
     # Phase 2: global uniqueness sweep (catches any cross-group collisions created by bumps)
     seen: Dict[str, int] = {}
-    for row in rows:
+    for row in dedupe_rows:
         fname = row.get("target_filename", "").strip()
         if not fname:
             continue
@@ -1994,10 +3006,30 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     stem = strip_leading_index(path.stem)
     artist, raw_title, artist_conf, artist_reason = split_artist_and_title(stem, source, config, reference)
     raw_title = strip_leading_artist_tokens(raw_title, artist)
-    full_title = clean_title(raw_title, config)
-    content_review_matches = detect_content_review((original_name, stem, raw_title, full_title), config)
+    raw_context_parts = meaningful_relative_subfolder_parts(path, source, config, clean=False)
+    variant_metadata = extract_variant_metadata([stem, raw_title, *raw_context_parts], config)
+    subfolder_context_title = relative_subfolder_context_title(path, source, config)
+    file_full_title = clean_title(raw_title, config)
+    file_full_title = expand_compact_scene_descriptors(file_full_title)
+    file_full_title = expand_known_character_variant_tokens(file_full_title, reference)
+    full_title = merge_contextual_title_parts(subfolder_context_title, file_full_title) if subfolder_context_title else file_full_title
+    identity_file_title = strip_variant_terms(file_full_title, variant_metadata, config)
+    identity_context_title = strip_variant_terms(subfolder_context_title, variant_metadata, config)
+    identity_full_title = merge_contextual_title_parts(identity_context_title, identity_file_title) if identity_context_title else identity_file_title
+    filename_override = find_filename_override(path, raw_title, file_full_title, full_title, config)
+    content_review_matches = detect_content_review((original_name, stem, subfolder_context_title, raw_title, file_full_title, full_title), config)
     is_silent = not has_audio_stream(path, config.ffprobe_path)
-    character_detection = detect_characters(full_title, reference)
+    character_detection = detect_characters(identity_full_title, reference)
+
+    override_character = (filename_override.get("character") or filename_override.get("characters") or "").strip()
+    if override_character:
+        add_canonical_character_aliases(reference.canonical_character_aliases, override_character)
+        character_detection = CharacterDetection(
+            tuple(character_parts(override_character)),
+            0.99,
+            "filename_override",
+            tuple(normalize(part) for part in character_parts(override_character)),
+        )
 
     # Define once early: is this a "collector" / generic artist (high-confidence folder-based
     # extraction or names like Megaera)? Used to make both character-folder and Grok/OC
@@ -2012,11 +3044,12 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
     # current preview run treats it consistently (title stripping, etc.).
     # This builds the character database on the fly for previously unseen characters.
     if not character_detection.characters:
-        inferred = infer_unmatched_character(raw_title or full_title, reference, config)
+        inferred_source = identity_file_title or identity_full_title
+        inferred = infer_unmatched_character(inferred_source, reference, config)
         if inferred:
             add_canonical_character_aliases(reference.canonical_character_aliases, inferred)
             # Re-detect so stripping and confidence logic pick it up with the new alias
-            character_detection = detect_characters(full_title, reference)
+            character_detection = detect_characters(identity_full_title, reference)
             if not character_detection.characters:
                 # Final fallback: use the raw inferred name directly
                 character_detection = CharacterDetection(
@@ -2044,16 +3077,35 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             )
 
     character_text = ", ".join(character_detection.characters)
-    # Ensure title-cased form for character output (e.g. "Megaera" not "megaera").
-    # Preserves internal lower norm keys in aliases/learned. Fixes test_learned_character_is_detectable.
     if character_text:
         character_text = title_case_words(character_text, config.preserve_tokens)
-    title = strip_detected_characters_from_title(full_title, character_detection)
+        for canonical in character_detection.characters:
+            if "(" in canonical or re.search(r"[a-z][A-Z]", canonical):
+                character_text = character_text.replace(title_case_words(canonical, config.preserve_tokens), canonical)
+        detailed_variant_metadata = extract_variant_metadata([stem, raw_title, *raw_context_parts], config, character_text)
+        attached_version_candidate = detailed_variant_metadata.get("version", "")
+    else:
+        attached_version_candidate = ""
+    if subfolder_context_title:
+        file_title_without_character = strip_detected_characters_from_title(file_full_title, character_detection)
+        file_title_without_character = strip_known_franchises_from_title(file_title_without_character, reference, config=config)
+        canonical_context_title = canonicalize_detected_characters_in_title(subfolder_context_title, character_detection)
+        context_norm_for_variant = normalize(canonical_context_title)
+        context_already_action = any(token in context_norm_for_variant.split() for token in ("bonk", "bonking", "fuk", "fuck", "sex"))
+        if is_generic_context_variant_title(file_title_without_character) and context_already_action:
+            file_title_without_character = ""
+        if is_variant_only_title(file_title_without_character) and title_context_is_exact_character(canonical_context_title, character_detection):
+            title = f"{canonical_context_title} {file_title_without_character}".strip()
+        else:
+            title = merge_contextual_title_parts(canonical_context_title, file_title_without_character)
+    else:
+        title = strip_detected_characters_from_title(full_title, character_detection)
 
     # Apply additional meta stripping (FPS, dates/years) to the final title segment
     # so that only the resolution tag remains as technical meta-info in the filename.
     title = remove_resolution_text(title)
     title = strip_dates_and_years(title)
+    title = strip_technical_title_labels(title)
 
     # Extra pass for numerical FPS values
     title = re.sub(r"(?i)\b(?:30|60|120|144|240)\b", " ", title)
@@ -2077,15 +3129,30 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
             recovered = strip_dates_and_years(recovered)
             title = recovered.strip(" -_.,;")
 
+    if not subfolder_context_title and is_variant_only_title(title) and has_technical_date_or_quality_marker(raw_title):
+        title = ""
+
+    if "title" in filename_override or "clean_title" in filename_override:
+        title = (filename_override.get("title") if "title" in filename_override else filename_override.get("clean_title", "")).strip(" -_.,;")
+
     # Clean sex position descriptors + trailing artifacts (e.g. "Doggy 2 1 Cam 3")
     title = clean_position_descriptors(title)
+    title = normalize_repeated_title_descriptors(title)
+    if is_technical_residue_title(title):
+        title = ""
 
     # Detect outlier / extra parameters using the existing library as reference
     # (must happen after all title cleaning so we evaluate the final proposed title)
     outlier_removed = []
     outlier_conf = 1.0
-    if reference and title:
+    if reference and title and not subfolder_context_title:
+        descriptor_source_title = title
         title, outlier_removed, outlier_conf = strip_outlier_tokens(title, reference)
+        title = restore_scene_descriptor_hint(title, descriptor_source_title)
+        title = normalize_repeated_title_descriptors(title)
+
+    if not subfolder_context_title and is_variant_only_title(title) and has_technical_date_or_quality_marker(raw_title):
+        title = ""
 
     extract_title = getattr(config, "extract_embedded_titles", False)
     resolution, probe_reason, embedded_title = probe_resolution(path, config.ffprobe_path, extract_title=extract_title)
@@ -2104,7 +3171,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         # sanity: ignore if looks like junk or too long
         if len(embedded_title) > 3 and len(embedded_title) < 80 and not any(j in embedded_title.lower() for j in ["www.", "http", "xxx", "porn"]):
             title = embedded_title.strip()
-    target_folder, folder_conf, folder_reason = classify_title(full_title, config, reference)
+    target_folder, folder_conf, folder_reason = classify_title(identity_full_title, config, reference)
 
     # Artist-driven folder inference (new): when the title is generic (very common for
     # collector clips after artist prefix removal), use the confidently extracted artist
@@ -2160,11 +3227,11 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         ("filename" in artist_reason or "compact_date" in artist_reason)
     )
 
-    if (not target_folder or folder_conf < 0.85) and (character_text or has_good_artist_from_filename):
+    if config.use_ai_for_unknown_characters and (not target_folder or folder_conf < 0.85) and (character_text or has_good_artist_from_filename):
         # Be more aggressive about calling Grok for Megaera-style artists with detected
         # characters but weak folder signals (the most common remaining failure mode).
         name_for_ai = character_text or artist
-        title_for_ai = full_title or raw_title
+        title_for_ai = identity_full_title or identity_file_title
 
         # Make the AI usage visible in the console
         print(f"[Grok AI] Querying for franchise of '{name_for_ai}' (from {'character' if character_text else 'artist filename prefix'}) ...")
@@ -2203,6 +3270,7 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         if primary_char and primary_char.lower() != artist.lower():
             target_folder = f"Original Character / {artist}"
             franchise_conf = 0.78
+            folder_conf = max(folder_conf, 0.88)
             folder_reason = "collector_artist_original_character"
             # Rebuild character_detection to include the primary char so target_filename_for works nicely
             if primary_char not in [c.strip() for c in character_text.split(",")]:
@@ -2222,6 +3290,12 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         target_folder = ""
         folder_conf = 0.0
         folder_reason = "probable_character_prefix;precedent_suppressed"
+
+    override_folder = (filename_override.get("target_folder") or filename_override.get("folder") or "").strip()
+    if override_folder:
+        target_folder = override_folder
+        folder_conf = max(folder_conf, 0.99)
+        folder_reason = (folder_reason + ";filename_override").strip(";")
 
     reasons = [artist_reason]
     if probe_reason:
@@ -2255,6 +3329,15 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         # Much stronger boost for Grok results so they can push generic-title rows over the
         # confidence threshold and produce ready target filenames.
         confidence = max(confidence, min(0.93, artist_conf, 0.88))
+
+    reliable_folder_signal = (
+        folder_conf >= 0.88
+        or "explicit_config_char_mapping_wins" in folder_reason
+        or "collector_artist_original_character" in folder_reason
+        or "filename_override" in folder_reason
+    )
+    if target_folder and resolution and character_text and artist_conf >= 0.90 and char_conf >= 0.90 and reliable_folder_signal:
+        confidence = max(confidence, config.confidence_threshold)
 
     # Strong final fallback for high-confidence "artist from filename prefix" cases
     if not target_folder:
@@ -2320,16 +3403,21 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
 
     # Strip known franchise/folder names from the title (they belong in the folder, not the filename)
     if target_folder or reference:
-        title = strip_known_franchises_from_title(title, reference, target_folder, config)
+        title = strip_franchises_preserving_characters(title, character_text, reference, target_folder, config)
+        title = normalize_repeated_title_descriptors(title)
 
     target_filename = ""
     target_path = ""
     if target_folder and resolution:
-        target_filename = target_filename_for(artist, character_text, title, resolution, path.suffix)
+        filename_character_text = character_text
+        context_contains_folder = bool(target_folder and contains_phrase(normalize(subfolder_context_title), normalize(target_folder)))
+        if subfolder_context_title and not context_contains_folder and title_context_contains_character(subfolder_context_title, character_detection):
+            filename_character_text = ""
+        target_filename = target_filename_for(artist, filename_character_text, title, resolution, path.suffix)
         effective_folder = target_folder
         if target_folder == "Original Character" and getattr(config, "original_character_subfoldering", False) and artist:
             effective_folder = f"Original Character/{artist}"
-        target_path = str(config.destination_root / effective_folder / target_filename)
+        target_path = str(build_target_path(config.destination_root, effective_folder, target_filename))
 
     conf_dict = row_conf.as_dict()
     return {
@@ -2352,10 +3440,297 @@ def analyze_file(path: Path, source: Path, config: Config, reference: ReferenceD
         "title_confidence": f"{conf_dict['title_confidence']:.2f}",
         "resolution_confidence": f"{conf_dict['resolution_confidence']:.2f}",
         "weighted_confidence": f"{conf_dict['confidence']:.2f}",
+        "variant_family": "",
+        "variant_version": str(variant_metadata.get("version") or ""),
+        "variant_descriptors": ", ".join(variant_metadata.get("descriptors") or []),
+        "variant_credits": ", ".join(variant_metadata.get("credits") or []),
+        "variant_decision": "",
+        "variant_reason": "",
+        "variant_rank": "",
         "status": status,
         "reason": ";".join(reasons),
         "notes": notes,
+        "_variant_duration": get_video_duration(path, config.ffprobe_path),
+        "_variant_frame_rate": get_video_frame_rate(path, config.ffprobe_path),
+        "_variant_subfolder": normalize(" ".join(raw_context_parts)),
+        "_variant_candidate_version": attached_version_candidate,
     }
+
+
+def _split_variant_values(value: str) -> List[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _resolution_rank(label: str) -> int:
+    norm = normalize(label)
+    if "8k" in norm:
+        return 600
+    if "4k" in norm or "2160" in norm or "1440" in norm:
+        return 500
+    for token, rank in (("1080", 400), ("720", 300), ("480", 200)):
+        if token in norm:
+            return rank
+    return 0
+
+
+def _performance_signature(credits: Sequence[str]) -> str:
+    canonical = sorted({str(item).strip() for item in credits if str(item).strip()}, key=normalize)
+    return " + ".join(canonical)
+
+
+def _preferred_performances(policy: Dict[str, Any], artist: str, character: str) -> List[str]:
+    prefs = policy.get("preferred_performances") or {}
+    candidates: Any = None
+    artist_map = prefs.get("artists") or {}
+    character_map = prefs.get("characters") or {}
+    for key in (f"{artist}|{character}", character):
+        for actual, value in character_map.items():
+            if normalize(actual) == normalize(key):
+                candidates = value
+                break
+        if candidates is not None:
+            break
+    if candidates is None:
+        for actual, value in artist_map.items():
+            if normalize(actual) == normalize(artist):
+                candidates = value
+                break
+    if candidates is None:
+        candidates = prefs.get("global") or []
+    output: List[str] = []
+    for entry in candidates or []:
+        if isinstance(entry, str):
+            values = re.split(r"\s*(?:\+|,|&|\band\b)\s*", entry, flags=re.I)
+        elif isinstance(entry, (list, tuple)):
+            values = [str(item) for item in entry]
+        else:
+            continue
+        signature = _performance_signature(values)
+        if signature and normalize(signature) not in {normalize(item) for item in output}:
+            output.append(signature)
+    return output
+
+
+def _durations_equivalent(left: Dict[str, Any], right: Dict[str, Any], policy: Dict[str, Any]) -> bool:
+    a = left.get("_variant_duration")
+    b = right.get("_variant_duration")
+    if a is None or b is None:
+        left_stem = normalize(re.sub(r"\s*\(\d+\)\s*$", "", Path(left.get("original_name", "")).stem))
+        right_stem = normalize(re.sub(r"\s*\(\d+\)\s*$", "", Path(right.get("original_name", "")).stem))
+        return bool(left_stem and left_stem == right_stem)
+    tolerance = max(
+        float(policy.get("duration_tolerance_seconds", 0.5)),
+        max(float(a), float(b)) * float(policy.get("duration_tolerance_percent", 2.0)) / 100.0,
+    )
+    return abs(float(a) - float(b)) <= tolerance
+
+
+def _variant_core(row: Dict[str, Any], config: Config) -> str:
+    metadata = {
+        "version": row.get("variant_version", ""),
+        "descriptors": _split_variant_values(row.get("variant_descriptors", "")),
+        "credits": _split_variant_values(row.get("variant_credits", "")),
+    }
+    core = strip_variant_terms(row.get("clean_title", ""), metadata, config)
+    core = re.sub(r"(?i)(?:^|[\s,;-])V\d+(?=$|[\s,;-])", " ", core)
+    candidate = str(row.get("_variant_candidate_version") or "")
+    if candidate:
+        core = re.sub(r"(?i)(?:^|[\s,;-])" + re.escape(candidate[1:]) + r"(?=$|[\s,;-])", " ", core)
+    return normalize(core)
+
+
+def _variant_core_display(row: Dict[str, Any], config: Config) -> str:
+    metadata = {
+        "version": row.get("variant_version", ""),
+        "descriptors": _split_variant_values(row.get("variant_descriptors", "")),
+        "credits": _split_variant_values(row.get("variant_credits", "")),
+    }
+    core = strip_variant_terms(row.get("clean_title", ""), metadata, config)
+    core = re.sub(r"(?i)(?:^|[\s,;-])V\d+(?=$|[\s,;-])", " ", core)
+    return re.sub(r"\s+", " ", core).strip(" -_.,;")
+
+
+def _refresh_variant_filename(row: Dict[str, Any], config: Config) -> None:
+    metadata = {
+        "version": row.get("variant_version", ""),
+        "descriptors": _split_variant_values(row.get("variant_descriptors", "")),
+        "credits": _split_variant_values(row.get("variant_credits", "")),
+    }
+    base = _variant_core_display(row, config)
+    title = compose_variant_title(base, metadata)
+    row["clean_title"] = title
+    if row.get("target_folder") and row.get("resolution"):
+        suffix = Path(row.get("source_path", "")).suffix or Path(row.get("original_name", "")).suffix or ".mp4"
+        character_text = row.get("character", "")
+        title_norm = normalize(title)
+        embeds_character = any(contains_phrase(title_norm, normalize(part)) for part in character_parts(character_text))
+        filename_character = "" if embeds_character else character_text
+        filename = target_filename_for(row.get("artist", ""), filename_character, title, row.get("resolution", ""), suffix, preserve_variant_versions=True)
+        row["target_filename"] = filename
+        row["target_path"] = str(build_target_path(config.destination_root, row.get("target_folder", ""), filename))
+
+
+def apply_variant_policy(rows: List[Dict[str, Any]], config: Config, enabled: Optional[bool] = None) -> Dict[str, int]:
+    """Compare analyzed rows collection-wide and assign conservative retention decisions."""
+    policy = getattr(config, "variant_policy", {}) or {}
+    active = bool(policy.get("enabled", True)) if enabled is None else bool(enabled)
+    stats = {"families": 0, "retained": 0, "review": 0, "superseded": 0}
+    if not active:
+        return stats
+
+    groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        core = _variant_core(row, config)
+        subfolder = normalize(row.get("_variant_subfolder", ""))
+        key = (normalize(row.get("artist", "")), normalize(row.get("character", "")), core, subfolder)
+        groups.setdefault(key, []).append(row)
+
+    optional = {normalize(item) for item in ("POV", "Alt Angles", "Alt Angle", "Front Angle", "Loop", "Bonus", "Barelegs", "No Hat", "No X-Ray", "Facesit", "Pubes", "SFW", "NSFW")}
+    appearance = {"std", "nude", "bra", "no bra"}
+    max_performances = max(0, int(policy.get("max_preferred_performances", 2)))
+
+    for key, family in groups.items():
+        if len(family) < 2:
+            row = family[0]
+            descriptors = {normalize(item) for item in _split_variant_values(row.get("variant_descriptors", ""))}
+            is_optional = bool(descriptors.intersection(optional))
+            row["variant_decision"] = "variant_review" if is_optional else "retained"
+            row["variant_reason"] = "standalone optional variant" if is_optional else "standalone scene"
+            row["variant_rank"] = "1"
+            _refresh_variant_filename(row, config)
+            if is_optional and row.get("status") not in {"content_review", "silent"}:
+                row["status"] = "variant_review"
+                row["approved"] = "no"
+                stats["review"] += 1
+            else:
+                stats["retained"] += 1
+            continue
+
+        family_id = hashlib.sha1("|".join(key).encode("utf-8")).hexdigest()[:10]
+        stats["families"] += 1
+        family_max_resolution = max((_resolution_rank(row.get("resolution", "")) for row in family), default=0)
+        for row in family:
+            row["variant_family"] = family_id
+
+        candidate_versions = {row.get("_variant_candidate_version") for row in family if row.get("_variant_candidate_version")}
+        if candidate_versions and any(not row.get("_variant_candidate_version") and not row.get("variant_version") for row in family):
+            for row in family:
+                if not row.get("variant_version") and row.get("_variant_candidate_version"):
+                    row["variant_version"] = row.get("_variant_candidate_version")
+        explicit_versions = {row.get("variant_version") for row in family if row.get("variant_version")}
+        if explicit_versions:
+            for row in family:
+                if not row.get("variant_version"):
+                    row["variant_version"] = "V1"
+
+        for version in {row.get("variant_version", "") for row in family}:
+            subset = [row for row in family if row.get("variant_version", "") == version]
+            has_nude = any("nude" in {normalize(x) for x in _split_variant_values(row.get("variant_descriptors", ""))} for row in subset)
+            for row in subset:
+                desc = _split_variant_values(row.get("variant_descriptors", ""))
+                norms = {normalize(item) for item in desc}
+                if (version or has_nude) and not norms.intersection(appearance) and not norms.intersection(optional):
+                    desc.insert(0, "Std")
+                    row["variant_descriptors"] = ", ".join(desc)
+
+        preferred = _preferred_performances(policy, family[0].get("artist", ""), family[0].get("character", ""))
+        preferred_norms = [normalize(item) for item in preferred[:max_performances]]
+        exact: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        for row in family:
+            desc = _split_variant_values(row.get("variant_descriptors", ""))
+            desc_without_nma = tuple(sorted(normalize(item) for item in desc if normalize(item) != "nma"))
+            credits = _split_variant_values(row.get("variant_credits", ""))
+            signature = (
+                row.get("variant_version", ""), desc_without_nma,
+                normalize(_performance_signature(credits)),
+                "nma" in {normalize(item) for item in desc},
+            )
+            exact.setdefault(signature, []).append(row)
+
+        for row in family:
+            row["variant_decision"] = "retained"
+            row["variant_reason"] = "selected policy winner"
+
+        for signature, candidates in exact.items():
+            ranked = sorted(candidates, key=lambda row: (
+                _resolution_rank(row.get("resolution", "")),
+                float(row.get("_variant_frame_rate") or 0),
+                float(row.get("_variant_duration") or 0),
+            ), reverse=True)
+            winner = ranked[0]
+            for loser in ranked[1:]:
+                if _durations_equivalent(winner, loser, policy):
+                    loser["variant_decision"] = "superseded_variant"
+                    loser["variant_reason"] = f"equivalent lower-resolution encode; kept {winner.get('resolution', '')}"
+                else:
+                    loser["variant_decision"] = "variant_review"
+                    loser["variant_reason"] = "distinct-duration lower-resolution variant"
+
+        # NMA only supersedes regular audio for the same version, visuals, credits and duration.
+        for row in family:
+            if row.get("variant_decision") == "superseded_variant":
+                continue
+            desc = _split_variant_values(row.get("variant_descriptors", ""))
+            norms = {normalize(item) for item in desc}
+            if "nma" in norms:
+                continue
+            visual = tuple(sorted(norms))
+            credit_sig = normalize(_performance_signature(_split_variant_values(row.get("variant_credits", ""))))
+            for nma_row in family:
+                nma_desc = {normalize(item) for item in _split_variant_values(nma_row.get("variant_descriptors", ""))}
+                if "nma" not in nma_desc:
+                    continue
+                if row.get("variant_version", "") != nma_row.get("variant_version", ""):
+                    continue
+                if visual != tuple(sorted(nma_desc - {"nma"})):
+                    continue
+                if credit_sig != normalize(_performance_signature(_split_variant_values(nma_row.get("variant_credits", "")))):
+                    continue
+                if _durations_equivalent(row, nma_row, policy):
+                    row["variant_decision"] = "superseded_variant"
+                    row["variant_reason"] = "equivalent NMA variant preferred"
+                    break
+
+        for row in family:
+            if row.get("variant_decision") == "superseded_variant":
+                continue
+            descriptors = {normalize(item) for item in _split_variant_values(row.get("variant_descriptors", ""))}
+            if descriptors.intersection(optional):
+                row["variant_decision"] = "variant_review"
+                row["variant_reason"] = "optional visual/audio variant"
+                continue
+            if _resolution_rank(row.get("resolution", "")) < family_max_resolution:
+                row["variant_decision"] = "variant_review"
+                row["variant_reason"] = "unique lower-resolution variant"
+                continue
+            credit_sig = normalize(_performance_signature(_split_variant_values(row.get("variant_credits", ""))))
+            if credit_sig and (not preferred_norms or credit_sig not in preferred_norms):
+                row["variant_decision"] = "variant_review"
+                row["variant_reason"] = "unranked or excess performance signature"
+
+        ordered = sorted(family, key=lambda row: (
+            0 if row.get("variant_decision") == "retained" else 1 if row.get("variant_decision") == "variant_review" else 2,
+            -_resolution_rank(row.get("resolution", "")),
+            row.get("original_name", "").lower(),
+        ))
+        for rank, row in enumerate(ordered, 1):
+            row["variant_rank"] = str(rank)
+            _refresh_variant_filename(row, config)
+            if row.get("status") in {"content_review", "silent"}:
+                row["variant_reason"] = f"{row.get('status')} takes precedence; " + row.get("variant_reason", "")
+                continue
+            if row.get("variant_decision") == "superseded_variant":
+                row["status"] = "superseded_variant"
+                row["approved"] = "no"
+                stats["superseded"] += 1
+            elif row.get("variant_decision") == "variant_review":
+                row["status"] = "variant_review"
+                row["approved"] = "no"
+                stats["review"] += 1
+            else:
+                stats["retained"] += 1
+
+    return stats
 
 
 def write_csv(path: Path, rows: Sequence[Dict[str, str]]) -> None:
@@ -2399,6 +3774,7 @@ def write_preview_summary(
     rows: Sequence[Dict[str, str]],
     reference: ReferenceData,
     angle_quarantine_report: Optional[Dict[str, Any]] = None,
+    variant_stats: Optional[Dict[str, int]] = None,
 ) -> None:
     total = len(rows)
     ready = sum(1 for row in rows if row["status"] == "ready")
@@ -2418,6 +3794,10 @@ def write_preview_summary(
         f"- Ready/approved: {ready}",
         f"- Held for content review: {content_review}",
         f"- Needs review: {unmatched}",
+        f"- Variant families: {(variant_stats or {}).get('families', 0)}",
+        f"- Variant winners retained: {(variant_stats or {}).get('retained', 0)}",
+        f"- Variants requiring review: {(variant_stats or {}).get('review', 0)}",
+        f"- Superseded variants held on apply: {(variant_stats or {}).get('superseded', 0)}",
         f"- Reference filename samples: {reference.naming_style.sample_count}",
         f"- Output resolution labels: {naming_style_resolution_summary(reference)}",
         "",
@@ -2506,6 +3886,9 @@ def command_preview(args: argparse.Namespace) -> int:
                 last_percent = percent
         print()  # Finish the progress line
 
+    variant_enabled = not getattr(args, "no_variant_analysis", False)
+    variant_stats = apply_variant_policy(rows, config, enabled=variant_enabled)
+
     # Post-process angle variant suggestions (Priority 1 repair) via helper.
     # Ensures explicit visibility in CSV (status/notes) without omitting files.
     mark_angle_variants_for_review(rows, angle_quarantine_report)
@@ -2532,11 +3915,12 @@ def command_preview(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path, md_path = unique_plan_paths(output_dir, run_id())
     write_csv(csv_path, rows)
-    write_preview_summary(md_path, source, config.destination_root, rows, reference, angle_quarantine_report)
+    write_preview_summary(md_path, source, config.destination_root, rows, reference, angle_quarantine_report, variant_stats)
 
     print(f"Preview complete: {len(rows)} video(s)")
     print(f"Reference filename samples: {reference.naming_style.sample_count}")
     print(f"Output resolution labels: {naming_style_resolution_summary(reference)}")
+    print(f"Variant analysis: {variant_stats['families']} families, {variant_stats['retained']} retained, {variant_stats['review']} review, {variant_stats['superseded']} superseded")
     print(f"CSV plan: {csv_path}")
     print(f"Summary:  {md_path}")
     print("Edit the CSV approved/status/target columns, then run apply.")
@@ -2710,9 +4094,11 @@ def mark_angle_variants_for_review(rows: list, angle_report: Dict[str, Any]) -> 
             suggested.add(nm)
     for row in rows:
         if row.get("original_name") in suggested:
-            row["status"] = "angle_variant_review"
+            row["status"] = "variant_review"
             row["approved"] = "no"
-            note = "Suggested angle variant quarantine; not moved during preview."
+            row["variant_decision"] = "variant_review"
+            row["variant_reason"] = "individual angle variant"
+            note = "Individual angle variant requires review; not moved during preview."
             existing = (row.get("notes") or "").strip()
             row["notes"] = f"{existing}; {note}".strip("; ").strip() if existing else note
             rsn = (row.get("reason") or "").strip()
@@ -2735,6 +4121,7 @@ def replace_config(config: Config, **updates: object) -> Config:
         "character_mappings": config.character_mappings,
         "canonical_character_aliases": config.canonical_character_aliases,
         "title_token_replacements": config.title_token_replacements,
+        "filename_overrides": getattr(config, "filename_overrides", {}),
         "content_review_terms": config.content_review_terms,
         "junk_tokens": config.junk_tokens,
         "preserve_tokens": config.preserve_tokens,
@@ -2749,6 +4136,7 @@ def replace_config(config: Config, **updates: object) -> Config:
         "learned_franchises_file": getattr(config, "learned_franchises_file", "learned_character_franchises.json"),
         "extract_embedded_titles": getattr(config, "extract_embedded_titles", False),
         "angle_variants_folder_name": getattr(config, "angle_variants_folder_name", "_r34_angle_variants"),
+        "variant_policy": getattr(config, "variant_policy", DEFAULT_VARIANT_POLICY),
     }
     data.update(updates)
     new_cfg = Config(**data)
@@ -2828,6 +4216,28 @@ def content_review_path(source: Path, source_root: Path, content_review_folder_n
         idx += 1
 
 
+def path_is_inside(path: Path, root: Path) -> bool:
+    """Return True when path resolves inside root, without requiring the file to exist."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def clean_relative_folder_parts(folder: str) -> List[str]:
+    """Split a CSV/UI folder value into clean relative path components."""
+    parts = re.split(r"[\\/]+", str(folder or ""))
+    return [part.strip(" .\t\r\n") for part in parts if part.strip(" .\t\r\n")]
+
+
+def build_target_path(destination_root: Path, target_folder: str, target_filename: str) -> Path:
+    target = Path(destination_root)
+    for part in clean_relative_folder_parts(target_folder):
+        target = target / part
+    return target / target_filename
+
+
 def apply_row(
     row: Dict[str, str],
     source_root: Path,
@@ -2838,6 +4248,8 @@ def apply_row(
     silent_animations_folder_name: str = "_r34_silent",
     angle_variants_folder_name: str = "_r34_angle_variants",
     review_items_folder_name: str = None,  # for "review" status outliers
+    destination_root: Path | None = None,
+    superseded_folder_name: str = "_r34_superseded_variants",
 ) -> Dict[str, str]:
     result = dict(row)
     source = Path(row.get("source_path", ""))
@@ -2848,6 +4260,8 @@ def apply_row(
 
     result["apply_result"] = ""
     result["apply_message"] = ""
+    result["original_path"] = str(source)
+    result["held_path"] = ""
 
     if status_raw == "content_review" or status == "content review":
         if not source.exists():
@@ -2860,6 +4274,29 @@ def apply_row(
         result["apply_message"] = str(dest)
         return result
 
+    if status_raw == "superseded_variant" or status == "superseded variant":
+        if not source.exists():
+            result["apply_result"] = "missing_source"
+            result["apply_message"] = str(source)
+            return result
+        dest = content_review_path(source, source_root, superseded_folder_name, run)
+        _safe_shutil_move(source, dest)
+        result["apply_result"] = "held_superseded_variant"
+        result["apply_message"] = str(dest)
+        result["held_path"] = str(dest)
+        return result
+
+    if not approved:
+        if quarantine_unapproved and source.exists():
+            dest = quarantine_path(source, source_root, review_folder_name, run)
+            _safe_shutil_move(source, dest)
+            result["apply_result"] = "quarantined_unapproved"
+            result["apply_message"] = str(dest)
+        else:
+            result["apply_result"] = "skipped_unapproved"
+            result["apply_message"] = "approved is not true/yes"
+        return result
+
     if status_raw == "silent" or status == "silent":
         if not source.exists():
             result["apply_result"] = "missing_source"
@@ -2869,6 +4306,7 @@ def apply_row(
         _safe_shutil_move(source, dest)
         result["apply_result"] = "held_silent"
         result["apply_message"] = str(dest)
+        result["held_path"] = str(dest)
         return result
 
     if status_raw == "review" or status == "review":
@@ -2881,17 +4319,6 @@ def apply_row(
         _safe_shutil_move(source, dest)
         result["apply_result"] = "held_for_review"
         result["apply_message"] = str(dest)
-        return result
-
-    if not approved:
-        if quarantine_unapproved and source.exists():
-            dest = quarantine_path(source, source_root, review_folder_name, run)
-            _safe_shutil_move(source, dest)
-            result["apply_result"] = "quarantined_unapproved"
-            result["apply_message"] = str(dest)
-        else:
-            result["apply_result"] = "skipped_unapproved"
-            result["apply_message"] = "approved is not true/yes"
         return result
 
     if status_raw in BLOCKED_STATUSES or status in BLOCKED_STATUSES or status.startswith("blocked"):
@@ -2909,7 +4336,15 @@ def apply_row(
         result["apply_message"] = "target_path is empty"
         return result
 
-    target = Path(target_text)
+    if destination_root is not None and row.get("target_folder") and row.get("target_filename"):
+        target = build_target_path(Path(destination_root), row.get("target_folder", ""), row.get("target_filename", ""))
+    else:
+        target = Path(target_text)
+    if destination_root is not None and not path_is_inside(target, Path(destination_root)):
+        result["apply_result"] = "invalid_target"
+        result["apply_message"] = f"target_path is outside destination_root: {target}"
+        return result
+
     if target.exists():
         dest = quarantine_path(source, source_root, review_folder_name, run)
         _safe_shutil_move(source, dest)
@@ -2960,6 +4395,8 @@ def write_apply_log(plan: Path, rows: Sequence[Dict[str, str]], run: str) -> Pat
     fieldnames = CSV_COLUMNS + [
         "apply_result",
         "apply_message",
+        "original_path",
+        "held_path",
         "learned_character",
         "learned_franchise",
         "pre_learned_franchise",
@@ -3023,7 +4460,9 @@ def command_apply(args: argparse.Namespace) -> int:
                 args.quarantine_unapproved,
                 config.content_review_folder_name,
                 getattr(config, "silent_animations_folder_name", "_r34_silent"),
-                config.review_folder_name,  # folder for "review" status outlier items
+                review_items_folder_name=config.review_folder_name,
+                destination_root=config.destination_root,
+                superseded_folder_name=(getattr(config, "variant_policy", {}) or {}).get("superseded_folder_name", "_r34_superseded_variants"),
             )
         except Exception as ex:
             # Never let one locked/missing file kill the entire apply batch.
@@ -3097,13 +4536,14 @@ def undo_row(
     apply_result = row.get("apply_result", "")
     apply_message = row.get("apply_message", "")
 
-    if apply_result != "moved":
+    reversible_results = {"moved", "held_superseded_variant"}
+    if apply_result not in reversible_results:
         result["undo_result"] = "skipped_non_move"
         result["undo_message"] = f"apply_result was {apply_result}"
         return result
 
     # The file is currently at the target location recorded in apply_message
-    current_location = Path(apply_message) if apply_message else Path(row.get("target_path", ""))
+    current_location = Path(row.get("held_path") or apply_message) if apply_message or row.get("held_path") else Path(row.get("target_path", ""))
 
     if not current_location.exists():
         result["undo_result"] = "missing_at_target"
@@ -3347,10 +4787,15 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--ffprobe", help="Override ffprobe executable path.")
     preview.add_argument("--output-dir", help="Where to write preview CSV/Markdown. Defaults to source folder.")
     preview.add_argument(
+        "--no-variant-analysis",
+        action="store_true",
+        help="Disable collection-level variant naming and retention analysis for this preview.",
+    )
+    preview.add_argument(
         "--quarantine-angle-variants",
         action="store_true",
         default=False,
-        help="Detect individual camera-angle variants when an All Angles compilation exists and report suggested quarantines in the preview output / CSV. This does not move files during preview (normal preview is always read-only).",
+        help="Detect individual camera-angle variants when an All Angles compilation exists and route them to variant review. This does not move files during preview.",
     )
     preview.add_argument(
         "--no-quarantine-angle-variants",
