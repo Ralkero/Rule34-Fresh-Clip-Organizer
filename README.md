@@ -3,7 +3,7 @@
 
 # Rule34 Fresh Clip Organizer
 
-Local Python CLI for previewing and applying safe renames/moves for freshly downloaded Rule34 clips.
+Local Python CLI and Windows GUI for previewing and applying safe renames/moves for freshly downloaded Rule34 clips.
 
 The tool is intentionally two-step:
 
@@ -11,7 +11,7 @@ The tool is intentionally two-step:
 
 2. `apply` reads the reviewed CSV and moves only approved rows, except `content_review` safety holds.
 
-It does not talk to Stash. After files are moved, rescan/import in Stash separately.
+The core Preview -> Apply workflow is local and file-based. The GUI also includes an optional Stash Import Preview surface for Known Values Manager cleanup: Stash queries are read-only, no Stash data is mutated, and imported values are only staged in the local manager until you explicitly save local config changes.
 
 The complete product, naming, variant-policy, and safety baseline is documented in
 [`docs/ORGANIZER_DESIGN_BASELINE.md`](docs/ORGANIZER_DESIGN_BASELINE.md).
@@ -28,10 +28,10 @@ Never put keys (xAI/Grok) in `r34_config.json`. Instead use:
 - `r34_xai_key.txt` placed next to your config file.
 The file is listed in `.gitignore` and is never included in source or built releases.
 
-Default destination root:
+For a new install, copy `r34_config.example.json` to `r34_config.json`, then edit `destination_root` to point at your curated library folder. For example:
 
 ```text
-E:\James' Stuff\Rule34
+D:\Media\Rule34
 ```
 
 ## Usage
@@ -75,7 +75,7 @@ Preview a fresh download folder:
 python r34_organizer.py preview --source "C:\path\to\fresh batch"
 ```
 
-During preview, the script samples the existing destination library at `E:\James' Stuff\Rule34` and mimics its established filename structure. When a strong character match is found, the target pattern is:
+During preview, the script samples the configured `destination_root` library and mimics its established filename structure. When a strong character match is found, the target pattern is:
 
 ```text
 Artist - Canonical Character - Clean Descriptive Title [Resolution].mp4
@@ -165,13 +165,17 @@ This gives you the requested behavior: Apply teaches the system; Undo can roll i
 Run tests:
 
 ```powershell
-python -m unittest discover -s tests
+python -m unittest tests.test_r34_organizer
 ```
 
-Run syntax check:
+Run the same local checks used by CI:
 
 ```powershell
-python -m py_compile r34_organizer.py
+python -m json.tool r34_config.json
+python -m json.tool r34_config.example.json
+python -m py_compile r34_organizer.py r34_gui.py
+python -m unittest tests.test_r34_organizer
+git diff --check
 ```
 
 ## GUI (Windows)
@@ -190,8 +194,19 @@ The GUI lets you:
 - Automatically offers to open the generated CSV + MD after preview
 - Select a reviewed CSV
 - Run Apply (live output + opens the apply log)
+- Open the Known Values Manager, including optional read-only Stash import preview tools
 
 All operations invoke the exact same `r34_organizer.py` CLI commands used by the existing PowerShell/.cmd launchers.
+
+### Optional Stash Import Preview
+
+The GUI can query a Stash GraphQL endpoint to preview performers, groups, and tags that may be useful for the local Known Values Manager. This integration is intentionally conservative:
+
+- Stash access is read-only.
+- No Stash scenes, tags, performers, groups, or metadata are created or modified.
+- Imported values are staged only in the local Known Values Manager.
+- Local config changes are written only when you click **Save Changes**, using the manager's normal backup-first save path.
+- The offline sample loader can be used to inspect the workflow without connecting to Stash.
 
 ### Building a Portable GUI (PyInstaller)
 
